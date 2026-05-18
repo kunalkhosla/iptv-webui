@@ -1,0 +1,27 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+<defs><radialGradient id="bg" cx="50%" cy="42%" r="74%"><stop offset="0%" stop-color="#c43c3c"/><stop offset="100%" stop-color="#3a1018"/></radialGradient></defs>
+<rect width="100" height="100" fill="url(#bg)"/>
+<path d="M 10,100 Q 22,72 38,70 L 62,70 Q 78,72 90,100 Z" fill="#a8261e"/>
+<polygon points="38,70 50,80 50,100 32,100" fill="#1a1320"/>
+<polygon points="62,70 50,80 50,100 68,100" fill="#1a1320"/>
+<circle cx="50" cy="86" r="1.6" fill="#d4a544"/>
+<circle cx="50" cy="93" r="1.6" fill="#d4a544"/>
+<path d="M 36 80 l 1.2 -3.4 l 1.2 3.4 l 3.4 1.2 l -3.4 1.2 l -1.2 3.4 l -1.2 -3.4 l -3.4 -1.2 z" fill="#d4a544"/>
+<polygon points="42,72 50,76 58,72 56,80 44,80" fill="#d4a544"/>
+<rect x="44" y="60" width="12" height="12" fill="#f0d2ad"/>
+<ellipse cx="50" cy="44" rx="14" ry="17" fill="#f0d2ad"/>
+<ellipse cx="50" cy="30" rx="20" ry="2.6" fill="#1a1320"/>
+<rect x="38" y="6" width="24" height="24" fill="#1a1320"/>
+<path d="M 34,16 Q 50,12 66,16 L 66,22 Q 50,18 34,22 Z" fill="#ebe7df"/>
+<path d="M 34,16 L 32,22" stroke="#ebe7df" stroke-width="1.5"/>
+<path d="M 66,16 L 68,22" stroke="#ebe7df" stroke-width="1.5"/>
+<text x="50" y="21" text-anchor="middle" font-family="Bebas Neue, Impact, sans-serif" font-size="6.4" fill="#1a1320" letter-spacing="0.5">MARQUEE</text>
+<rect x="40" y="38" width="7" height="1.6" fill="#5a2818" rx="0.8"/>
+<rect x="53" y="38" width="7" height="1.6" fill="#5a2818" rx="0.8"/>
+<circle cx="43.5" cy="44" r="1.4" fill="#1a1320"/>
+<circle cx="56.5" cy="44" r="1.4" fill="#1a1320"/>
+<path d="M 38,53 Q 44,52 50,52 Q 56,52 62,53 Q 58,58 52,55 Q 50,54 48,55 Q 42,58 38,53 Z" fill="#5a2818"/>
+<path d="M 38,53 Q 34,52 33,49" stroke="#5a2818" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+<path d="M 62,53 Q 66,52 67,49" stroke="#5a2818" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+<path d="M 46,58 Q 50,60 54,58" stroke="#5a2818" stroke-width="0.9" fill="none" stroke-linecap="round"/>
+</svg>
