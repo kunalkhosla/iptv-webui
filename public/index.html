@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<title>Khouch Potato</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Karla:wght@400;500;600;700&display=swap" />
+<link rel="stylesheet" href="/style.css" />
+<script defer src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/hls.js@1.5.18/dist/hls.min.js"></script>
+<script defer src="/theatre-portraits.js"></script>
+<script defer src="/app.js"></script>
+</head>
+<body>
+<div id="error-banner" hidden role="alert"></div>
+<header>
+  <div class="brand" title="Khouch Potato">
+    <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+      <!-- Antenna potato. Body in the warm cyc-light orange (--accent);
+           rabbit-ear antennas in brass (--accent-2); eyes + smile in
+           the dark navy (--bg) so they read as negative space against
+           the body, matching the Marquee palette across both clients. -->
+      <line x1="13" y1="12" x2="9" y2="4" stroke="#d4a544" stroke-width="1.4" stroke-linecap="round"/>
+      <line x1="19" y1="12" x2="23" y2="4" stroke="#d4a544" stroke-width="1.4" stroke-linecap="round"/>
+      <circle cx="9"  cy="4" r="1.4" fill="#d4a544"/>
+      <circle cx="23" cy="4" r="1.4" fill="#d4a544"/>
+      <path d="M 9,21 Q 7,15 11,12 Q 15,9 19,11 Q 24,12 25,17 Q 26,23 22,26 Q 17,28 12,26 Q 8,25 9,21 Z" fill="#f08245"/>
+      <ellipse cx="13" cy="14.5" rx="2.4" ry="0.9" fill="#fbb27a" opacity="0.55"/>
+      <circle cx="13" cy="19" r="0.7" fill="#0d1124"/>
+      <circle cx="19" cy="19" r="0.7" fill="#0d1124"/>
+      <path d="M 14,22.5 Q 16,24 18,22.5" stroke="#0d1124" stroke-width="0.9" fill="none" stroke-linecap="round"/>
+    </svg>
+    <!-- Wordmark was removed (the antenna-potato mark stands alone
+         in the header). Title tooltip on the wrapper still surfaces
+         the name on hover for anyone who's curious. -->
+  </div>
+  <nav id="modes">
+    <button class="mode active" data-mode="live" aria-label="Live">
+      <span class="mode-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/>
+          <path d="M7 7a7 7 0 0 0 0 10 M17 7a7 7 0 0 1 0 10"/>
+        </svg>
+      </span>
+      <span class="mode-label">Live</span>
+    </button>
+    <button class="mode" data-mode="movie" aria-label="Movies">
+      <span class="mode-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+          <path d="M3 5l3.5 3H10L6.5 5zM11 5l3.5 3H18L14.5 5zM3 9h18v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/>
+        </svg>
+      </span>
+      <span class="mode-label">Movies</span>
+    </button>
+    <button class="mode" data-mode="series" aria-label="Series">
+      <span class="mode-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+          <rect x="3" y="7" width="18" height="13" rx="1"/>
+          <path d="M8 4l4 3 4-3" stroke-linecap="round"/>
+        </svg>
+      </span>
+      <span class="mode-label">Series</span>
+    </button>
+  </nav>
+  <span class="header-spacer"></span>
+  <span class="search-wrap">
+    <span class="search-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="7"/>
+        <line x1="16.5" y1="16.5" x2="21" y2="21"/>
+      </svg>
+    </span>
+    <input id="search" autocomplete="off" spellcheck="false" aria-label="Search" />
+    <button id="search-clear" type="button" title="Clear search" aria-label="Clear search" hidden>×</button>
+  </span>
+  <span id="conns" title="Active panel connections / max allowed by your subscription" hidden></span>
+  <span class="panel-wrap"><button id="panel-switch" title="Switch panel host" hidden></button></span>
+  <button id="refresh" title="Refresh library (rescans the panel)" aria-label="Refresh" hidden>↻</button>
+  <span class="profile-chip-wrap">
+    <button id="profile-chip" title="Switch profile" aria-label="Switch profile" hidden></button>
+    <div id="profile-popup" hidden></div>
+  </span>
+  <span class="settings-wrap">
+    <button id="settings-btn" title="Settings" aria-label="Settings">⚙</button>
+    <div id="settings-menu" hidden>
+      <div class="settings-section-title">Library</div>
+      <button class="settings-item" data-action="filter">
+        <span>Region / language filter…</span>
+      </button>
+      <button class="settings-item" data-action="refresh">
+        <span>Refresh from panel</span>
+        <span class="settings-hint" id="settings-refresh-hint"></span>
+      </button>
+      <div id="settings-panel-section" hidden>
+        <div class="settings-section-title">Panel host</div>
+        <div id="settings-panel-list"></div>
+      </div>
+      <button class="settings-item" data-action="panel-config">
+        <span>Edit panel credentials…</span>
+      </button>
+      <button class="settings-item" data-action="toggle-remote">
+        <span>Show channel remote</span>
+        <span class="settings-toggle" id="settings-remote-toggle">off</span>
+      </button>
+      <div class="settings-section-title">TV Guide</div>
+      <button class="settings-item" type="button" data-action="cycle-epg-window">
+        <span>Forward window</span>
+        <span class="settings-pill" id="settings-epg-window-label">3h</span>
+      </button>
+      <div class="settings-item settings-readonly" id="settings-panel-expiry" hidden>
+        <span>Panel expires</span>
+        <span class="settings-hint" id="settings-panel-expiry-hint"></span>
+      </div>
+      <div class="settings-divider"></div>
+      <div class="settings-item settings-readonly settings-attribution">
+        This product uses the TMDB API but is not endorsed or certified by TMDB.
+      </div>
+      <div class="settings-divider"></div>
+      <div class="settings-section-title">Profile</div>
+      <button class="settings-item" data-action="switch-profile">
+        <span>Switch profile…</span>
+        <span class="settings-hint" id="settings-profile-hint"></span>
+      </button>
+      <button class="settings-item" data-action="logout">
+        <span>Sign out</span>
+      </button>
+    </div>
+  </span>
+  <button id="show-all-btn" type="button" title="Bypass filter — show every category for this session" hidden>Show all</button>
+  <google-cast-launcher id="cast"></google-cast-launcher>
+</header>
+
+<main>
+  <section id="home" aria-label="Home">
+    <div id="hero" hidden></div>
+    <div id="rails"></div>
+    <div id="guide" hidden>
+      <div class="guide-toolbar">
+        <h2>TV Guide</h2>
+        <span class="guide-meta" id="guide-meta"></span>
+        <button id="guide-top-btn" type="button" title="Scroll to top">↑ Top</button>
+      </div>
+      <div class="guide-tabs" id="guide-tabs" role="tablist"></div>
+      <div class="guide-scroll" id="guide-scroll">
+        <div class="guide-times">
+          <div class="guide-times-spacer"></div>
+          <div class="guide-times-track" id="guide-times"></div>
+        </div>
+        <div class="guide-rows" id="guide-rows"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="grid-view" hidden>
+    <div id="grid-toolbar">
+      <button id="grid-back" type="button" aria-label="Back to home">‹ Back</button>
+      <span id="grid-title"></span>
+      <span id="grid-count"></span>
+      <span class="sort-controls">
+        <label for="sort-field">Sort</label>
+        <select id="sort-field">
+          <option value="name">Name</option>
+          <option value="added">Added</option>
+          <option value="lastPlayed">Last played</option>
+          <option value="rating">Rating</option>
+          <option value="year">Year</option>
+        </select>
+        <button id="sort-dir" type="button" title="Ascending — click to flip" aria-label="Toggle sort direction">↑</button>
+      </span>
+    </div>
+    <div id="grid" aria-label="Items"></div>
+  </section>
+
+  <section id="search-all-view" hidden>
+    <div id="search-all-header">
+      <button id="search-all-back" type="button">‹ Back</button>
+      <span id="search-all-title"></span>
+    </div>
+    <div id="search-all-results"></div>
+  </section>
+
+  <div id="player" hidden>
+    <video id="video" autoplay playsinline referrerpolicy="no-referrer"></video>
+    <div id="player-overlay">
+      <div id="player-scrim"></div>
+      <div id="player-scrub-wrap">
+        <div id="player-scrub-track">
+          <div id="player-scrub-buffered"></div>
+          <div id="player-scrub-fill"></div>
+          <div id="player-scrub-thumb"></div>
+        </div>
+        <span id="player-time"></span>
+        <span id="player-live-badge" hidden>● LIVE</span>
+      </div>
+      <div class="player-bar">
+        <button id="player-playpause" aria-label="Play/Pause">▶</button>
+        <span id="player-title"></span>
+        <button id="player-favorite" title="Favorite this item" aria-label="Favorite">★</button>
+        <button id="player-mylist" title="Add to My List" aria-label="My List">+</button>
+        <button id="player-cc" title="Subtitles" hidden>CC</button>
+        <button id="player-remote" title="Channel remote (↑/↓)" hidden>Remote</button>
+        <button id="player-quality" title="Video quality">Auto</button>
+        <button id="player-alt" title="Try HLS variant">HLS</button>
+        <button id="cast-here">Cast</button>
+        <button id="player-theater" title="Theater (large)" aria-label="Theater mode">⤢</button>
+        <button id="player-mini" title="Minimize" aria-label="Minimize">⤡</button>
+        <button id="player-fullscreen" title="Fullscreen" aria-label="Fullscreen">⛶</button>
+        <button id="player-close" aria-label="Close">✕</button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<div id="series-panel" hidden>
+  <!-- "Bill of Particulars" layout: two-column stage. Left is the
+       cinematic showcard (backdrop + poster + title + actions);
+       right is a tabbed verso containing rails / cast / episodes.
+       data-mode on .modal-stage toggles series-only chrome via CSS. -->
+  <div class="modal-stage" id="modal-stage" data-mode="movie">
+    <aside class="modal-showcard">
+      <div class="showcard-backdrop series-bg"></div>
+      <div class="showcard-grain" aria-hidden="true"></div>
+      <button id="series-close" aria-label="Close">✕</button>
+      <div class="showcard-body">
+        <div class="showcard-poster series-poster" id="series-poster" aria-hidden="true"></div>
+        <div class="showcard-text">
+          <div class="showcard-cert-strip series-meta" id="series-meta"></div>
+          <h1 class="showcard-title" id="series-title"></h1>
+          <p class="showcard-tagline series-tagline" id="series-tagline" hidden></p>
+          <p class="showcard-plot series-plot" id="series-plot"></p>
+          <div class="showcard-actions series-actions">
+            <button id="series-play-btn" type="button" class="act-primary series-play-btn">▸ Play</button>
+            <button id="series-trailer-btn" type="button" class="act-ghost series-trailer-btn" hidden>▸ Trailer</button>
+            <button id="series-mylist-btn" type="button" class="act-ghost series-mylist-btn" title="Add to My List">+ My List</button>
+            <span class="series-poster-menu-wrap">
+              <button id="series-poster-menu" type="button" class="act-icon series-poster-menu" title="Poster options" aria-label="Poster options">⋮</button>
+              <div id="series-poster-menu-dropdown" hidden></div>
+            </span>
+          </div>
+          <dl class="showcard-credits">
+            <div class="series-creators" id="series-creators" hidden></div>
+            <div class="series-cat-row"  id="series-cat-row"  hidden></div>
+            <div class="series-genres"   id="series-genres"   hidden></div>
+          </dl>
+        </div>
+      </div>
+    </aside>
+
+    <section class="modal-verso">
+      <!-- Tab order: Episodes first for series (the primary thing
+           users come for); hidden for movies, so movies naturally
+           lead with More Like This. Cast is always last. -->
+      <nav class="verso-tabs" role="tablist">
+        <button class="verso-tab"           data-pane="episodes" role="tab" aria-selected="false" data-series-only>Episodes</button>
+        <button class="verso-tab is-active" data-pane="similar"  role="tab" aria-selected="true">More Like This</button>
+        <button class="verso-tab"           data-pane="cast"     role="tab" aria-selected="false">Cast</button>
+      </nav>
+      <div class="verso-content">
+        <section class="verso-pane" data-pane="similar">
+          <div id="series-similar" class="series-similar" hidden></div>
+          <div class="verso-empty" id="series-similar-empty" hidden>No similar titles found in your catalog.</div>
+        </section>
+        <section class="verso-pane" data-pane="cast" hidden>
+          <div class="series-cast" id="series-cast" hidden>
+            <div class="series-cast-strip cast-grid" id="series-cast-strip"></div>
+          </div>
+          <div class="series-keywords kw-row" id="series-keywords" hidden></div>
+        </section>
+        <section class="verso-pane series-episodes-section" data-pane="episodes" data-series-only hidden>
+          <!-- Series-only. The episode list + season picker live in
+               their own tab so they don't compete with cast / similar
+               for vertical space. -->
+          <div class="series-season-bar">
+            <h2>Episodes</h2>
+            <select id="series-season-select" aria-label="Season"></select>
+          </div>
+          <div id="series-episodes"></div>
+        </section>
+      </div>
+    </section>
+  </div>
+  <!-- Inline YouTube trailer overlay. Opened by the ▸ Trailer button
+       on the detail page. Closed via the ✕ button or by clicking
+       outside the iframe. The iframe src is set/cleared in JS so a
+       closed modal doesn't keep the video playing in the background. -->
+  <div id="trailer-modal" hidden>
+    <div class="trailer-modal-backdrop"></div>
+    <div class="trailer-modal-card">
+      <button id="trailer-close" class="trailer-close" aria-label="Close trailer">✕</button>
+      <div class="trailer-frame-wrap">
+        <iframe id="trailer-iframe" allow="autoplay; encrypted-media" allowfullscreen></iframe>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="filter-modal" hidden>
+  <div class="filter-card">
+    <div class="filter-head">
+      <h2>Pick what you watch</h2>
+      <p>Only the regions / languages you tick will show up in the homepage. You can change this any time from <span aria-hidden="true">⚙</span> Settings.</p>
+      <button id="filter-close" aria-label="Close" hidden>✕</button>
+    </div>
+    <div class="filter-tabs" role="tablist">
+      <button class="filter-tab active" data-tab="live"   role="tab">Live</button>
+      <button class="filter-tab"        data-tab="movie"  role="tab">Movies</button>
+      <button class="filter-tab"        data-tab="series" role="tab">Series</button>
+    </div>
+    <div id="filter-body"></div>
+    <div class="filter-foot">
+      <button id="filter-clear" type="button" class="filter-link">Clear all</button>
+      <button id="filter-all"   type="button" class="filter-link">Select all</button>
+      <span class="filter-spacer"></span>
+      <button id="filter-done"  type="button" class="filter-primary">Done</button>
+    </div>
+  </div>
+</div>
+
+<div id="panel-config-modal" hidden>
+  <div class="filter-card">
+    <div class="filter-head">
+      <h2>Panel credentials</h2>
+      <p>The upstream Xtream IPTV account that streams come from. Leave password blank to keep the current one. The primary host gets probed before saving — if it doesn't authenticate, the change is rejected and the existing setup keeps running.</p>
+      <button id="panel-config-close" aria-label="Close">✕</button>
+    </div>
+    <form id="panel-config-form" autocomplete="off">
+      <label class="pc-field">
+        <span>Primary host</span>
+        <input type="url" name="host" required placeholder="http://your-panel.example:8080" />
+      </label>
+      <label class="pc-field">
+        <span>Fallback hosts (comma-separated, optional)</span>
+        <input type="text" name="host_fallback" placeholder="http://backup1.example,http://backup2.example" />
+      </label>
+      <label class="pc-field">
+        <span>Username</span>
+        <input type="text" name="user" required autocomplete="off" />
+      </label>
+      <label class="pc-field">
+        <span>Password</span>
+        <input type="password" name="pass" placeholder="leave blank to keep current" autocomplete="new-password" />
+      </label>
+      <div id="panel-config-status" class="pc-status" hidden></div>
+    </form>
+    <div class="filter-foot">
+      <button id="panel-config-test" type="button" class="filter-link">Test connection</button>
+      <span class="filter-spacer"></span>
+      <button id="panel-config-save" type="button" class="filter-primary">Save &amp; switch</button>
+    </div>
+  </div>
+</div>
+
+<div id="scrim"></div>
+<div id="toast" hidden></div>
+<button id="live-remote-toggle" class="lr-toggle" type="button" hidden aria-label="Open channel remote">📺</button>
+<div id="live-remote" hidden></div>
+</body>
+</html>
