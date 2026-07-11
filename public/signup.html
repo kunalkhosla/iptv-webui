@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<title>Create account · Khouch Potato</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+<style>
+  :root {
+    --bg: #0b0b0c;
+    --bg-2: #16161a;
+    --bg-3: #1f1f24;
+    --line: #2a2a2f;
+    --fg: #f5f5f7;
+    --fg-dim: #8a8a92;
+    --accent: #e50914;
+    --accent-rgb: 229, 9, 20;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background:
+      radial-gradient(circle at 30% 20%, rgba(var(--accent-rgb), 0.12), transparent 60%),
+      radial-gradient(circle at 75% 90%, rgba(var(--accent-rgb), 0.08), transparent 60%),
+      var(--bg);
+    color: var(--fg);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    min-height: 100vh;
+  }
+  .card {
+    width: min(520px, 100%);
+    background: rgba(20, 20, 24, 0.85);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 36px 32px 28px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.02) inset;
+    backdrop-filter: blur(20px);
+  }
+  h1 { margin: 0 0 6px; font-size: 22px; font-weight: 700; }
+  .subtitle { margin: 0 0 20px; color: var(--fg-dim); font-size: 13.5px; }
+  form { display: flex; flex-direction: column; gap: 12px; }
+  .section-title {
+    margin-top: 14px;
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+    font-weight: 700;
+  }
+  label {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 11.5px;
+    color: var(--fg-dim);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-weight: 600;
+  }
+  input {
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    color: var(--fg);
+    border-radius: 8px;
+    padding: 11px 13px;
+    font: inherit;
+    font-size: 15px;
+    outline: none;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  input:focus {
+    border-color: var(--accent);
+    background: rgba(var(--accent-rgb), 0.04);
+  }
+  button[type="submit"] {
+    margin-top: 14px;
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    padding: 13px 18px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: filter 0.12s;
+  }
+  button[type="submit"]:hover { filter: brightness(1.08); }
+  button[type="submit"][disabled] { opacity: 0.5; cursor: not-allowed; }
+  .err {
+    background: rgba(229, 9, 20, 0.12);
+    border: 1px solid rgba(229, 9, 20, 0.45);
+    color: #ffd7d7;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    margin-bottom: 14px;
+  }
+  .ok {
+    background: rgba(60, 200, 120, 0.12);
+    border: 1px solid rgba(60, 200, 120, 0.45);
+    color: #d4f7e0;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    margin-bottom: 14px;
+  }
+  .invalid {
+    text-align: center;
+    color: var(--fg-dim);
+    padding: 40px 12px;
+  }
+  .footer {
+    margin-top: 18px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--fg-dim);
+  }
+  .footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Create your account</h1>
+    <p class="subtitle">You've been invited to Khouch. Bring your own IPTV panel credentials — they stay sealed on the server.</p>
+    <div id="status"></div>
+    <form id="signup-form" hidden>
+      <label>Pick a username
+        <input type="text" name="username" required pattern="[a-z0-9_-]{3,32}" autocomplete="username">
+      </label>
+      <label>Password (min 8 chars)
+        <input type="password" name="password" required minlength="8" autocomplete="new-password">
+      </label>
+      <label>Profile nickname (optional)
+        <input type="text" name="nick" placeholder="What should we call you on home?">
+      </label>
+      <div class="section-title">Your IPTV panel</div>
+      <label>Panel host URL
+        <input type="text" name="host" required placeholder="http://your-panel.example.com:8080">
+      </label>
+      <label>Panel username
+        <input type="text" name="panelUser" required autocomplete="off">
+      </label>
+      <label>Panel password
+        <input type="password" name="panelPass" required autocomplete="off">
+      </label>
+      <button type="submit">Create account</button>
+    </form>
+    <div class="footer">
+      Already have an account? <a href="/login">Sign in</a>
+    </div>
+  </div>
+<script>
+(async () => {
+  const params = new URLSearchParams(location.search);
+  const token = params.get("token") || "";
+  const status = document.getElementById("status");
+  const form = document.getElementById("signup-form");
+  if (!token) {
+    status.innerHTML = '<div class="invalid">This page needs an invite token. Ask the person who invited you for a fresh link.</div>';
+    return;
+  }
+  // Token sanity-check.
+  try {
+    const r = await fetch(`/api/signup/check?token=${encodeURIComponent(token)}`);
+    const j = await r.json();
+    if (!j.valid) {
+      status.innerHTML = `<div class="invalid">Invite invalid: ${j.reason || "unknown"}. Ask for a fresh link.</div>`;
+      return;
+    }
+  } catch (e) {
+    status.innerHTML = `<div class="invalid">Couldn't validate invite (${e.message}). Reload to retry.</div>`;
+    return;
+  }
+  form.hidden = false;
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = form.querySelector("button[type=submit]");
+    btn.disabled = true;
+    btn.textContent = "Probing panel…";
+    status.innerHTML = "";
+    const fd = new FormData(form);
+    const body = {
+      token,
+      username: fd.get("username"),
+      password: fd.get("password"),
+      nick: fd.get("nick") || undefined,
+      panel: {
+        host: fd.get("host"),
+        user: fd.get("panelUser"),
+        pass: fd.get("panelPass"),
+      },
+    };
+    try {
+      const r = await fetch("/api/signup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (!r.ok || !j.ok) {
+        status.innerHTML = `<div class="err">${j.reason || ("HTTP " + r.status)}</div>`;
+        btn.disabled = false;
+        btn.textContent = "Create account";
+        return;
+      }
+      status.innerHTML = '<div class="ok">Account created. Loading your home…</div>';
+      setTimeout(() => { location.href = j.next || "/"; }, 600);
+    } catch (e) {
+      status.innerHTML = `<div class="err">Signup failed: ${e.message}</div>`;
+      btn.disabled = false;
+      btn.textContent = "Create account";
+    }
+  });
+})();
+</script>
+</body>
+</html>

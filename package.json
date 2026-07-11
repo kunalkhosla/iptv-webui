@@ -1,0 +1,21 @@
+{
+  "name": "iptv-webui",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "author": "Kunal Khosla",
+  "description": "Khouch Potato — a self-hosted Netflix-style web UI for an Xtream Codes IPTV panel, with TV guide, Chromecast, TMDB enrichment.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.109.1",
+    "express": "^4.21.2"
+  }
+}

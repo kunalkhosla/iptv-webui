@@ -1,0 +1,600 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<title>Profiles · Khouch Potato</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Karla:wght@400;500;600;700&display=swap" />
+<script defer src="/branding.local.js"></script>
+<style>
+  :root {
+    --bg:           #0d1124;
+    --bg-2:         #161b34;
+    --bg-3:         #1e2444;
+    --line:         #262c4d;
+    --fg:           #ebe7df;
+    --fg-dim:       #8a92ac;
+    --accent:       #f08245;
+    --accent-rgb:   240, 130, 69;
+    --accent-2:     #d4a544;
+    --font-display: "Bebas Neue", "Impact", "Arial Narrow", sans-serif;
+    --font-body:    "Karla", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.45 var(--font-body);
+    -webkit-font-smoothing: antialiased;
+    display: grid;
+    place-items: center;
+    padding: 32px 24px;
+    min-height: 100vh;
+  }
+  .wrap {
+    width: min(880px, 100%);
+    text-align: center;
+  }
+
+  /* Brand strip — small, centered above the heading. Same antenna-
+     potato mark + wordmark used in the main app, just stacked. */
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--accent);
+    user-select: none;
+    margin-bottom: 36px;
+  }
+  .brand-mark { width: 28px; height: 28px; display: block; flex-shrink: 0; }
+  .brand-text { display: inline-flex; flex-direction: column; gap: 3px; line-height: 1; }
+  .brand-name {
+    font-family: var(--font-display);
+    font-weight: 400;
+    font-size: 19px;
+    letter-spacing: 0.02em;
+    color: var(--fg);
+  }
+  .brand-name span { font-weight: 500; color: var(--accent); margin-left: 2px; }
+  .brand-tag {
+    font-size: 9px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+    font-weight: 500;
+  }
+
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(34px, 4vw, 48px);
+    font-weight: 400;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin: 0 0 6px;
+    color: var(--fg);
+  }
+  .subtitle {
+    color: var(--fg-dim);
+    margin: 0 0 40px;
+    font-size: 13px;
+    letter-spacing: 0.02em;
+  }
+
+  .profile-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 140px));
+    gap: 18px;
+    justify-content: center;
+    margin: 0 auto;
+  }
+  .profile {
+    background: transparent;
+    border: 0;
+    color: var(--fg-dim);
+    cursor: pointer;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    font-family: inherit;
+    position: relative;
+    transition: color 0.15s, transform 0.15s;
+  }
+  .profile:hover { color: var(--fg); transform: translateY(-1px); }
+  .profile .avatar {
+    width: 110px;
+    height: 110px;
+    border-radius: 14px;
+    background:
+      radial-gradient(120% 90% at 50% 0%, rgba(212,165,68,0.05), transparent 60%),
+      var(--bg-2);
+    border: 1px solid var(--line);
+    display: grid;
+    place-items: center;
+    padding: 8px;
+    line-height: 1;
+    transition: border-color 0.18s, transform 0.18s, box-shadow 0.18s;
+    overflow: hidden;
+  }
+  .profile:hover .avatar {
+    border-color: rgba(212, 165, 68, 0.45);
+    box-shadow: 0 6px 22px rgba(0,0,0,0.45),
+                0 0 0 4px rgba(212,165,68,0.06);
+    transform: translateY(-1px);
+  }
+  .profile .nick {
+    font-family: var(--font-display);
+    font-size: 18px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--fg);
+  }
+  .profile.add .avatar {
+    color: var(--fg-dim);
+    font-size: 44px;
+    font-weight: 200;
+    border-style: dashed;
+    background: transparent;
+  }
+  .profile.add:hover .avatar { color: var(--accent); border-color: var(--accent); }
+
+  /* Portrait wrapper — the SVG fills it, the rounded-rectangle
+     clip in `.profile .avatar` shapes the corner. */
+  .tp-avatar { display: block; width: 100%; height: 100%; }
+  .tp-avatar svg { display: block; width: 100%; height: 100%; }
+
+  /* Edit pencil — appears on hover; always visible on touch devices. */
+  .profile .edit {
+    position: absolute;
+    top: 6px; right: 6px;
+    width: 26px; height: 26px;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.6);
+    color: var(--fg);
+    border: 1px solid rgba(255,255,255,0.12);
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    font-size: 12px;
+    opacity: 0;
+    transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .profile:hover .edit { opacity: 1; }
+  .profile .edit:hover { color: var(--accent); border-color: var(--accent); }
+  @media (hover: none) {
+    .profile .edit { opacity: 1; }
+  }
+
+  /* Kid tag — sits below the nick, low contrast. */
+  .profile .kid-badge {
+    position: absolute;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(var(--accent-rgb), 0.14);
+    color: var(--accent);
+    border: 1px solid rgba(var(--accent-rgb), 0.4);
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    font-weight: 600;
+  }
+
+  .footer {
+    margin-top: 48px;
+    font-size: 11.5px;
+    color: var(--fg-dim);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .footer a { color: var(--fg-dim); text-decoration: none; }
+  .footer a:hover { color: var(--accent); }
+
+  /* Add / edit profile modal */
+  #add-modal {
+    position: fixed; inset: 0;
+    z-index: 30;
+    display: grid; place-items: center;
+    padding: 20px;
+  }
+  #add-modal[hidden] { display: none; }
+  #add-modal::before {
+    content: "";
+    position: absolute; inset: 0;
+    background: rgba(0,0,0,0.75);
+    backdrop-filter: blur(6px);
+  }
+  .add-card {
+    position: relative;
+    width: min(460px, 100%);
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 26px;
+    box-shadow: 0 16px 48px rgba(0,0,0,0.6);
+  }
+  .add-card h2 {
+    margin: 0 0 6px;
+    font-family: var(--font-display);
+    font-size: 24px;
+    font-weight: 400;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+  .add-card p {
+    margin: 0 0 20px;
+    color: var(--fg-dim);
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .add-card label {
+    display: block;
+    font-size: 10.5px;
+    color: var(--fg-dim);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  .add-card input[type="text"], .add-card input[type="number"] {
+    width: 100%;
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    color: var(--fg);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font: inherit;
+    font-size: 14px;
+    outline: none;
+    margin-bottom: 16px;
+    transition: border-color 0.12s;
+  }
+  .add-card input:focus { border-color: var(--accent); }
+
+  /* Portrait-picker grid inside the add/edit modal. Each tile
+     is an illustrated theatre character — same SVGs the picker
+     page itself renders, just at a smaller scale. */
+  .portrait-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+  .portrait-grid button {
+    background: transparent;
+    border: 1.5px solid transparent;
+    border-radius: 12px;
+    padding: 3px;
+    cursor: pointer;
+    transition: border-color 0.15s, transform 0.15s;
+    overflow: hidden;
+    aspect-ratio: 1;
+  }
+  .portrait-grid button:hover {
+    border-color: rgba(212, 165, 68, 0.4);
+    transform: translateY(-1px);
+  }
+  .portrait-grid button.on {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(240, 130, 69, 0.18);
+  }
+  .portrait-grid button .tp-avatar {
+    border-radius: 9px;
+    overflow: hidden;
+    width: 100%;
+    height: 100%;
+  }
+
+  .kids-row {
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center;
+    gap: 10px;
+    text-transform: none !important;
+    letter-spacing: 0 !important;
+    font-size: 13px !important;
+    color: var(--fg) !important;
+    margin-bottom: 0 !important;
+    cursor: pointer;
+    font-weight: 400;
+  }
+  .kids-row input[type="checkbox"] {
+    width: 16px; height: 16px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  #kids-age-row { margin-top: 14px; }
+  .kids-hint {
+    margin: 8px 0 0;
+    font-size: 11.5px;
+    color: var(--fg-dim);
+    line-height: 1.5;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  .add-foot {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    margin-top: 6px;
+  }
+  .add-foot button {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--fg);
+    border-radius: 6px;
+    padding: 9px 16px;
+    font: inherit;
+    font-size: 12.5px;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+    transition: border-color 0.12s, background 0.12s, color 0.12s;
+  }
+  .add-foot button:hover { border-color: var(--accent); color: var(--fg); }
+  .add-foot button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    font-weight: 600;
+  }
+  .add-foot button.primary:hover { filter: brightness(1.08); }
+  .add-foot button.danger {
+    border-color: rgba(248, 113, 113, 0.4);
+    color: rgba(255, 215, 215, 0.95);
+  }
+  .add-foot button.danger:hover {
+    background: rgba(248, 113, 113, 0.12);
+    border-color: rgba(248, 113, 113, 0.7);
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <line x1="13" y1="12" x2="9" y2="4" stroke="#d4a544" stroke-width="1.4" stroke-linecap="round"/>
+        <line x1="19" y1="12" x2="23" y2="4" stroke="#d4a544" stroke-width="1.4" stroke-linecap="round"/>
+        <circle cx="9"  cy="4" r="1.4" fill="#d4a544"/>
+        <circle cx="23" cy="4" r="1.4" fill="#d4a544"/>
+        <path d="M 9,21 Q 7,15 11,12 Q 15,9 19,11 Q 24,12 25,17 Q 26,23 22,26 Q 17,28 12,26 Q 8,25 9,21 Z" fill="#f08245"/>
+        <ellipse cx="13" cy="14.5" rx="2.4" ry="0.9" fill="#fbb27a" opacity="0.55"/>
+        <circle cx="13" cy="19" r="0.7" fill="#0d1124"/>
+        <circle cx="19" cy="19" r="0.7" fill="#0d1124"/>
+        <path d="M 14,22.5 Q 16,24 18,22.5" stroke="#0d1124" stroke-width="0.9" fill="none" stroke-linecap="round"/>
+      </svg>
+      <span class="brand-text">
+        <span class="brand-name">Khouch <span>Potato</span></span>
+        <span class="brand-tag">self-hosted IPTV</span>
+      </span>
+    </div>
+
+    <h1>Select a profile</h1>
+    <p class="subtitle">Your favorites, watch progress, and filters travel with the profile.</p>
+    <div class="profile-grid" id="grid"></div>
+    <div class="footer"><a href="/api/logout" id="signout-link">Sign out</a></div>
+  </div>
+
+  <div id="add-modal" hidden>
+    <div class="add-card">
+      <h2 id="modal-title">Add profile</h2>
+      <p id="modal-subtitle">Profiles are not password-protected.</p>
+      <label>Nickname</label>
+      <input type="text" id="new-nick" maxlength="32" autocomplete="off" placeholder="Your name" />
+      <label>Pick a portrait</label>
+      <div class="portrait-grid" id="portrait-grid"></div>
+      <label class="kids-row">
+        <input type="checkbox" id="kids-on" />
+        <span>Kid profile — filter age-inappropriate content</span>
+      </label>
+      <div id="kids-age-row" hidden>
+        <label>Birth year</label>
+        <input type="number" id="kids-birth-year" min="1980" placeholder="e.g. 2017" />
+        <p class="kids-hint">Birth year is stored so the rating bucket adjusts automatically as the child grows up. Movies and series with US ratings above the current age are hidden (G, PG, PG-13, etc., via TMDB). Items without a TMDB rating are also hidden.</p>
+      </div>
+      <div class="add-foot">
+        <button id="add-delete" type="button" class="danger" hidden>Delete profile</button>
+        <span style="flex:1"></span>
+        <button id="add-cancel" type="button">Cancel</button>
+        <button id="add-save" type="button" class="primary">Create profile</button>
+      </div>
+    </div>
+  </div>
+
+<script src="/theatre-portraits.js"></script>
+<script>
+let totalProfiles = 0;
+let editingId = null; // null = add mode; "p2" etc = edit mode
+let selectedPortrait = null; // portrait id chosen in the add/edit modal
+
+const CURRENT_YEAR = new Date().getFullYear();
+document.getElementById("kids-birth-year").max = String(CURRENT_YEAR);
+
+function ageFromBirthYear(year) {
+  if (!Number.isFinite(year)) return null;
+  return Math.max(0, CURRENT_YEAR - year);
+}
+
+async function loadProfiles() {
+  const r = await fetch("/api/profiles");
+  const d = await r.json();
+  totalProfiles = (d.profiles || []).length;
+  const grid = document.getElementById("grid");
+  grid.innerHTML = "";
+  for (const p of d.profiles) {
+    const tile = document.createElement("div");
+    tile.className = "profile";
+    const kidAge = ageFromBirthYear(p.kidsBirthYear);
+    const kidBadge = kidAge != null ? `<div class="kid-badge">Kid · ${kidAge}</div>` : "";
+    // Picker grid: each profile gets its illustrated portrait.
+    // If the profile data has no avatar field (old install, or
+    // someone created via the API without picking), fall back
+    // to the deterministic pick-from-nick — so the same person
+    // always sees the same face.
+    const portraitId = TheatrePortraits.resolve(p);
+    tile.innerHTML = `
+      <div class="avatar"><div class="tp-avatar">${TheatrePortraits.svg(portraitId)}</div></div>
+      ${kidBadge}
+      <div class="nick">${escapeHtml(p.nick)}</div>
+      <button class="edit" type="button" aria-label="Edit ${escapeHtml(p.nick)}" title="Edit">✎</button>
+    `;
+    tile.onclick = (e) => {
+      if (e.target.closest(".edit")) return;
+      pickProfile(p.id);
+    };
+    tile.querySelector(".edit").onclick = (e) => {
+      e.stopPropagation();
+      openEditModal(p);
+    };
+    grid.appendChild(tile);
+  }
+  const add = document.createElement("button");
+  add.className = "profile add";
+  add.innerHTML = `<div class="avatar">+</div><div class="nick">Add profile</div>`;
+  add.onclick = openAddModal;
+  grid.appendChild(add);
+}
+
+async function pickProfile(id) {
+  const r = await fetch("/api/profile/select", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify({ id }),
+  });
+  if (r.ok) {
+    // Wipe per-profile localStorage so the next bootstrap starts clean.
+    // Without this, app.js's loadPersisted() rehydrates the previous
+    // profile's favorites / recents / watched / lastEpisode, and then
+    // bootstrap's "server-empty → keep-local-and-seed" branch silently
+    // pushes the old data UP to the new profile — corrupting it.
+    for (const m of ["live", "movie", "series"]) {
+      localStorage.removeItem("favs:" + m);
+      localStorage.removeItem("myList:" + m);
+      localStorage.removeItem("recents:" + m);
+      localStorage.removeItem("sort:" + m);
+    }
+    localStorage.removeItem("lastEpisode");
+    localStorage.removeItem("watched");
+    const from = new URLSearchParams(location.search).get("from");
+    location.href = (from && ["live","movie","series"].includes(from)) ? `/${from}/` : "/";
+  }
+}
+
+function paintPortraitGrid() {
+  const g = document.getElementById("portrait-grid");
+  g.innerHTML = "";
+  for (const id of TheatrePortraits.IDS) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.title = TheatrePortraits.label(id);
+    b.innerHTML = `<div class="tp-avatar">${TheatrePortraits.svg(id)}</div>`;
+    if (id === selectedPortrait) b.classList.add("on");
+    b.onclick = () => {
+      selectedPortrait = id;
+      for (const c of g.children) c.classList.remove("on");
+      b.classList.add("on");
+    };
+    g.appendChild(b);
+  }
+}
+
+function syncKidsAgeRow() {
+  const on = document.getElementById("kids-on").checked;
+  document.getElementById("kids-age-row").hidden = !on;
+}
+document.getElementById("kids-on").onchange = syncKidsAgeRow;
+
+function openAddModal() {
+  editingId = null;
+  document.getElementById("modal-title").textContent = "Add profile";
+  document.getElementById("modal-subtitle").textContent =
+    "Pick a character. Profiles are not password-protected.";
+  document.getElementById("new-nick").value = "";
+  document.getElementById("add-save").textContent = "Create profile";
+  document.getElementById("add-delete").hidden = true;
+  document.getElementById("kids-on").checked = false;
+  document.getElementById("kids-birth-year").value = "";
+  syncKidsAgeRow();
+  // Start on the first portrait — the typed nickname will re-seed
+  // it deterministically below if the user hasn't picked manually.
+  selectedPortrait = TheatrePortraits.IDS[0];
+  paintPortraitGrid();
+  document.getElementById("add-modal").hidden = false;
+  document.getElementById("new-nick").focus();
+}
+
+function openEditModal(profile) {
+  editingId = profile.id;
+  document.getElementById("modal-title").textContent = "Edit profile";
+  document.getElementById("modal-subtitle").textContent =
+    "Rename, swap the portrait, or toggle kids mode. Deleting a profile also wipes its favorites, recents, and watch history — there is no undo.";
+  document.getElementById("new-nick").value = profile.nick || "";
+  document.getElementById("add-save").textContent = "Save";
+  document.getElementById("add-delete").hidden = totalProfiles <= 1;
+  const isKid = Number.isFinite(profile.kidsBirthYear);
+  document.getElementById("kids-on").checked = isKid;
+  document.getElementById("kids-birth-year").value = isKid ? profile.kidsBirthYear : "";
+  syncKidsAgeRow();
+  selectedPortrait = TheatrePortraits.resolve(profile);
+  paintPortraitGrid();
+  document.getElementById("add-modal").hidden = false;
+  document.getElementById("new-nick").focus();
+}
+
+document.getElementById("add-cancel").onclick = () => {
+  document.getElementById("add-modal").hidden = true;
+};
+document.getElementById("add-save").onclick = async () => {
+  const nick = document.getElementById("new-nick").value.trim();
+  if (!nick) return;
+  const kidsOn = document.getElementById("kids-on").checked;
+  const yearRaw = parseInt(document.getElementById("kids-birth-year").value, 10);
+  const validYear = kidsOn && Number.isFinite(yearRaw) && yearRaw >= 1980 && yearRaw <= CURRENT_YEAR;
+  const kidsBirthYear = validYear ? yearRaw : (editingId ? null : undefined);
+  const payload = { nick, avatar: selectedPortrait };
+  if (kidsBirthYear !== undefined) payload.kidsBirthYear = kidsBirthYear;
+  const url = editingId ? `/api/profiles/${encodeURIComponent(editingId)}` : "/api/profiles";
+  const method = editingId ? "PATCH" : "POST";
+  const r = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (r.ok) {
+    document.getElementById("add-modal").hidden = true;
+    loadProfiles();
+  }
+};
+document.getElementById("add-delete").onclick = async () => {
+  if (!editingId) return;
+  if (!confirm("Delete this profile and all its history? This can't be undone.")) return;
+  const r = await fetch(`/api/profiles/${encodeURIComponent(editingId)}`, { method: "DELETE" });
+  if (r.ok) {
+    document.getElementById("add-modal").hidden = true;
+    loadProfiles();
+  } else {
+    alert("Couldn't delete that profile.");
+  }
+};
+document.getElementById("signout-link").onclick = async (e) => {
+  e.preventDefault();
+  await fetch("/api/logout", { method: "POST", keepalive: true });
+  location.href = "/login";
+};
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+loadProfiles();
+</script>
+</body>
+</html>

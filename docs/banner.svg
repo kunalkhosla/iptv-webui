@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" role="img" aria-label="Khouch Potato">
+  <defs>
+    <radialGradient id="vignette" cx="50%" cy="50%" r="75%">
+      <stop offset="0%"  stop-color="#161b34" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#0d1124" stop-opacity="0.7"/>
+    </radialGradient>
+    <pattern id="grain" patternUnits="userSpaceOnUse" width="160" height="160">
+      <filter id="n">
+        <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2"/>
+      </filter>
+      <rect width="100%" height="100%" filter="url(#n)" opacity="0.18"/>
+    </pattern>
+  </defs>
+
+  <!-- Background — Marquee blue-black with vignette + film grain -->
+  <rect width="1200" height="320" fill="#0d1124"/>
+  <rect width="1200" height="320" fill="url(#vignette)"/>
+  <rect width="1200" height="320" fill="url(#grain)" opacity="0.35"/>
+
+  <!-- Top + bottom faux-sprocket strips, like 35mm film -->
+  <g fill="#161b34">
+    <rect x="0" y="0"   width="1200" height="22"/>
+    <rect x="0" y="298" width="1200" height="22"/>
+  </g>
+  <g fill="#0d1124">
+    <!-- 24 sprocket holes top + bottom -->
+    <g>
+      <rect x="20"   y="6"  width="22" height="10" rx="2"/>
+      <rect x="70"   y="6"  width="22" height="10" rx="2"/>
+      <rect x="120"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="170"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="220"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="270"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="320"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="370"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="420"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="470"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="520"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="570"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="620"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="670"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="720"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="770"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="820"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="870"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="920"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="970"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="1020" y="6"  width="22" height="10" rx="2"/>
+      <rect x="1070" y="6"  width="22" height="10" rx="2"/>
+      <rect x="1120" y="6"  width="22" height="10" rx="2"/>
+      <rect x="1170" y="6"  width="22" height="10" rx="2"/>
+    </g>
+    <g transform="translate(0,298)">
+      <rect x="20"   y="6"  width="22" height="10" rx="2"/>
+      <rect x="70"   y="6"  width="22" height="10" rx="2"/>
+      <rect x="120"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="170"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="220"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="270"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="320"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="370"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="420"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="470"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="520"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="570"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="620"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="670"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="720"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="770"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="820"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="870"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="920"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="970"  y="6"  width="22" height="10" rx="2"/>
+      <rect x="1020" y="6"  width="22" height="10" rx="2"/>
+      <rect x="1070" y="6"  width="22" height="10" rx="2"/>
+      <rect x="1120" y="6"  width="22" height="10" rx="2"/>
+      <rect x="1170" y="6"  width="22" height="10" rx="2"/>
+    </g>
+  </g>
+
+  <!-- Antenna potato mark, scaled up from public/favicon.svg -->
+  <g transform="translate(110,80) scale(5)">
+    <!-- antennas -->
+    <line x1="13" y1="14" x2="9"  y2="6" stroke="#d4a544" stroke-width="1.4" stroke-linecap="round"/>
+    <line x1="19" y1="14" x2="23" y2="6" stroke="#d4a544" stroke-width="1.4" stroke-linecap="round"/>
+    <circle cx="9"  cy="6" r="1.4" fill="#d4a544"/>
+    <circle cx="23" cy="6" r="1.4" fill="#d4a544"/>
+    <!-- potato body -->
+    <path d="M 9,23 Q 7,17 11,14 Q 15,11 19,13 Q 24,14 25,19 Q 26,25 22,28 Q 17,30 12,28 Q 8,27 9,23 Z" fill="#f08245"/>
+    <!-- highlight -->
+    <ellipse cx="13" cy="16.5" rx="2.4" ry="0.9" fill="#fbb27a" opacity="0.55"/>
+    <!-- eyes + smile -->
+    <circle cx="13" cy="21" r="0.7" fill="#0d1124"/>
+    <circle cx="19" cy="21" r="0.7" fill="#0d1124"/>
+    <path d="M 14,24.5 Q 16,26 18,24.5" stroke="#0d1124" stroke-width="0.9" fill="none" stroke-linecap="round"/>
+  </g>
+
+  <!-- Wordmark: KHOUCH POTATO with brass offset like marquee letters -->
+  <g font-family="Impact, 'Bebas Neue', Oswald, 'Arial Narrow', sans-serif" font-weight="400" letter-spacing="4">
+    <!-- offset brass shadow -->
+    <text x="312" y="180" font-size="108" fill="#d4a544">KHOUCH POTATO</text>
+    <!-- foreground -->
+    <text x="308" y="176" font-size="108" fill="#ebe7df">KHOUCH POTATO</text>
+  </g>
+
+  <!-- Tagline strip — small caps with bullet separators -->
+  <g font-family="Helvetica, Arial, sans-serif" font-weight="700" font-size="14" letter-spacing="3" fill="#8a92ac">
+    <text x="312" y="220">SELF-HOSTED  ·  IPTV  ·  XTREAM CODES  ·  TMDB  ·  CHROMECAST</text>
+  </g>
+
+  <!-- "Now Playing" plate, like a marquee badge -->
+  <g transform="translate(312,238)">
+    <rect width="160" height="28" rx="2" fill="none" stroke="#f08245" stroke-width="1.5"/>
+    <text x="80" y="19" text-anchor="middle"
+          font-family="Helvetica, Arial, sans-serif" font-weight="700" font-size="11" letter-spacing="4" fill="#f08245">
+      NOW PLAYING
+    </text>
+  </g>
+</svg>

@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+.idea/
+.vscode/
+dist/
+data/
+data.bak.*/
+.claude/
+# Per-deployment infra override — keep private hostnames out of source.
+docker-compose.override.yml
