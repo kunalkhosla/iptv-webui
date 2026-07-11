@@ -12,3 +12,6 @@ data.bak.*/
 .claude/
 # Per-deployment infra override — keep private hostnames out of source.
 docker-compose.override.yml
+
+# Local dev notes — never published
+CLAUDE.md
