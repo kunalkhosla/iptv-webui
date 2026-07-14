@@ -4028,6 +4028,7 @@ const CHANNEL_GROUPS = [
   { key: "bengali", patterns: [/\bbangla\b/i, /bengali/i, /jalsha/i] },
   { key: "urdu",    patterns: [/\burdu\b/i] },
   { key: "arabic",  patterns: [/arabic/i, /\bbein\b/i, /\bmbc\b/i] },
+  { key: "turkish", patterns: [/turkish/i, /\bturkiye\b/i, /\btrt\b/i] },
   // Countries
   { key: "us",      patterns: [/\busa?\b/i, /america/i, /\bnfl\b/i, /\bmlb\b/i, /\bnba\b/i, /\bmls\b/i, /\bnhl\b/i, /netflix/i, /\bhbo\b/i, /amazon prime/i, /\bdisney\b/i, /starz/i, /\bhulu\b/i, /\bpeacock\b/i] },
   { key: "india",   patterns: [/\bindia\b/i, /\bindian\b/i, /\bipl\b/i, /\bhub premier\b/i, /cricket/i] },
@@ -4060,7 +4061,7 @@ const NON_ENTERTAINMENT_KEYS = new Set(["sports", "news", "kids", "music", "movi
 // appears in the title to indicate exclusion.
 const LANGUAGE_GROUP_KEYS = [
   "english", "hindi", "tamil", "telugu", "malayalam", "kannada",
-  "marathi", "gujarati", "bengali", "urdu", "punjabi", "arabic",
+  "marathi", "gujarati", "bengali", "urdu", "punjabi", "arabic", "turkish",
 ];
 const LANGUAGE_GROUP_KEYS_SET = new Set(LANGUAGE_GROUP_KEYS);
 
@@ -4073,7 +4074,7 @@ const LANGUAGE_GROUP_KEYS_SET = new Set(LANGUAGE_GROUP_KEYS);
 const LANG_TAG_TO_ISO = {
   english: "en", hindi: "hi", tamil: "ta", telugu: "te", malayalam: "ml",
   kannada: "kn", marathi: "mr", gujarati: "gu", bengali: "bn", urdu: "ur",
-  punjabi: "pa", arabic: "ar",
+  punjabi: "pa", arabic: "ar", turkish: "tr",
 };
 // First language-tag → ISO for an index item (null when none / unknown).
 function isoLangForItem(item) {
@@ -4181,7 +4182,7 @@ const CHANNEL_PREFIX_RE = /(?:^|\|\s*)([A-Za-z]{1,5})\s*:\s/;
 const CHIP_LABELS = {
   english: "English", hindi: "Hindi", punjabi: "Punjabi", tamil: "Tamil",
   telugu: "Telugu", malayalam: "Malayalam", kannada: "Kannada", marathi: "Marathi",
-  gujarati: "Gujarati", bengali: "Bengali", urdu: "Urdu", arabic: "Arabic",
+  gujarati: "Gujarati", bengali: "Bengali", urdu: "Urdu", arabic: "Arabic", turkish: "Turkish",
   us: "USA", india: "India", pakistan: "Pakistan", uk: "UK",
   canada: "Canada", australia: "Australia",
   sports: "Sports", kids: "Kids", news: "News", music: "Music",
@@ -4189,7 +4190,7 @@ const CHIP_LABELS = {
 const CHIP_KINDS = {
   english: "language", hindi: "language", punjabi: "language", tamil: "language",
   telugu: "language", malayalam: "language", kannada: "language", marathi: "language",
-  gujarati: "language", bengali: "language", urdu: "language", arabic: "language",
+  gujarati: "language", bengali: "language", urdu: "language", arabic: "language", turkish: "language",
   us: "country", india: "country", pakistan: "country", uk: "country",
   canada: "country", australia: "country",
   sports: "genre", kids: "genre", news: "genre", music: "genre",
@@ -5051,10 +5052,20 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // Watching rail still surfaces them; the hero is for "what's
   // new I haven't tried yet".
   //
-  // Skim 5 items per filtered category (up to 40), then shuffle
-  // with a per-day, per-profile, per-mode seed. Same all day so
-  // caching/intra-day re-renders are stable; different next day,
-  // and different across members of the same household.
+  // Skim up to 5 items per filtered category — EVERY eligible category,
+  // not just the first ones walked — then shuffle the whole thing with
+  // a per-day, per-profile, per-mode seed. Same all day so caching/
+  // intra-day re-renders are stable; different next day, and different
+  // across members of the same household.
+  //
+  // A prior version capped the total pool at 40 and broke out of the
+  // category walk as soon as it filled — since `byCat` iterates in a
+  // fixed category order, that meant only the first ~8 categories ever
+  // contributed a single candidate, and the same few dozen titles from
+  // those categories rotated forever while every other category (often
+  // the bulk of the catalog) never got a chance. Skimming everything
+  // first and shuffling after fixes that; the per-category cap of 5
+  // still keeps any one huge category from dominating the pool.
   const seen = new Set();
   // Exclude in-progress titles from candidates so they never sneak
   // back in via the category skim.
@@ -5065,12 +5076,11 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     }
   }
   const heroPool = [];
-  outer: for (const items of byCat.values()) {
+  for (const items of byCat.values()) {
     for (const s of items.slice(0, 5)) {
       if (seen.has(s.id) || !s.icon) continue;
       if (isAdultForHero(s)) { seen.add(s.id); continue; }
       heroPool.push(s); seen.add(s.id);
-      if (heroPool.length >= 40) break outer;
     }
   }
   // Seed = today's date + active profile id + mode. Mulberry32 is
