@@ -6720,7 +6720,11 @@ for (const t of el.refineTabs) {
 el.castHere.onclick = () => {
   if (!state.playing) return;
   if (state.castSession) castMedia(state.playing);
-  else cast.framework.CastContext.getInstance().requestSession();
+  else cast.framework.CastContext.getInstance().requestSession().catch((err) => {
+    const code = (err && err.code) || err;
+    if (code === "cancel") return; // user dismissed the device picker
+    toast(`Cast failed: ${code}`, 4000);
+  });
 };
 
 document.addEventListener("keydown", (e) => {
