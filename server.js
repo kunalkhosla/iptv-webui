@@ -5075,12 +5075,21 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       seen.add(parseInt(k.split(":", 2)[1], 10));
     }
   }
+  // Dedup by tmdb_id too, not just stream id — the same film is often
+  // cross-listed under several categories with different stream ids
+  // ("Action", "New Releases", "2024 Movies"), and now that every
+  // category gets a chance to contribute, a cross-listed film would
+  // otherwise land in the pool once per category and unfairly dominate
+  // the shuffle. Mirrors the seenTmdb pattern rails already use above.
+  const seenTmdb = new Set();
   const heroPool = [];
   for (const items of byCat.values()) {
     for (const s of items.slice(0, 5)) {
       if (seen.has(s.id) || !s.icon) continue;
+      if (s.tmdb_id && seenTmdb.has(s.tmdb_id)) continue;
       if (isAdultForHero(s)) { seen.add(s.id); continue; }
       heroPool.push(s); seen.add(s.id);
+      if (s.tmdb_id) seenTmdb.add(s.tmdb_id);
     }
   }
   // Seed = today's date + active profile id + mode. Mulberry32 is
