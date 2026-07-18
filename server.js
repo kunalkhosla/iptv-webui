@@ -3900,7 +3900,7 @@ function sendSpaShell(res) {
 // off disk (same staleness bug this whole shell exists to avoid, just
 // reachable via a second URL — a bookmark, browser history, or a typed
 // full filename).
-app.get(["/", "/index.html"], sendSpaShell);
+app.get(["/", "/index.html"], (_req, res) => sendSpaShell(res));
 
 app.use(express.static(path.join(__dirname, "public"), {
   setHeaders: (res) => {
