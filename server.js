@@ -4575,14 +4575,54 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // Replaces the old separate "Continue Watching" + "Recently Played"
   // rails — users think "where was I last," not "did I save a position."
   if (mode !== "live") {
+    // Series Continue Watching entries must key everything (progress,
+    // recents, lastPlayed) by the PARENT series id — that's what
+    // ix.byId is keyed by for series mode. In practice individual
+    // clients haven't been consistent about which id (series vs.
+    // specific episode) they send to pushRecent/play-event/progress,
+    // which silently broke recency sorting (and could drop a series
+    // from the rail entirely). Rather than trust every client to get
+    // this right, normalize any episode id we recognize back to its
+    // parent series id here — using the episode_id → series id reverse
+    // map baked from lastEpisode, which every client already writes
+    // correctly on episode playback.
+    const toSeriesId = (id) => id;
+    let normalizeId = toSeriesId;
+    if (mode === "series") {
+      const episodeToSeries = new Map();
+      for (const [seriesId, le] of Object.entries(userState.lastEpisode || {})) {
+        if (le?.episode_id != null) episodeToSeries.set(String(le.episode_id), parseInt(seriesId, 10));
+      }
+      // Only remap when the raw id ISN'T already a valid series id in
+      // the index — an id that already resolves in ix.byId is trusted
+      // as-is, so a coincidental collision between a series id and an
+      // unrelated series' episode_id (panel ids aren't guaranteed
+      // disjoint) can never hijack an already-correct entry.
+      normalizeId = (id) => ix.byId.has(id) ? id : (episodeToSeries.get(String(id)) ?? id);
+    }
     const progressEntries = Object.entries(userState.progress || {})
       .filter(([k]) => k.startsWith(mode + ":"));
-    const progressById = new Map(
-      progressEntries.map(([k, v]) => [parseInt(k.split(":", 2)[1], 10), v])
-    );
-    const recentIds = Array.isArray(userState.recents?.[mode])
-      ? userState.recents[mode] : [];
-    const lpForMode = getLastPlayedFor(currentAccount())[mode] || {};
+    // Two raw keys can normalize onto the same series id (e.g. stale
+    // progress under an old episode id alongside fresh progress under
+    // the series id); keep whichever has the more recent timestamp,
+    // not just whichever comes last in object insertion order.
+    const progressById = new Map();
+    for (const [k, v] of progressEntries) {
+      const id = normalizeId(parseInt(k.split(":", 2)[1], 10));
+      const cur = progressById.get(id);
+      if (!cur || (v?.t || 0) > (cur?.t || 0)) progressById.set(id, v);
+    }
+    const recentIds = (Array.isArray(userState.recents?.[mode])
+      ? userState.recents[mode] : []).map(normalizeId);
+    const lpRaw = getLastPlayedFor(currentAccount())[mode] || {};
+    // Same normalization for lastPlayed — a raw entry may be stamped
+    // under an episode id from a play-event call; fold it onto its
+    // series id, keeping the most recent timestamp per series.
+    const lpForMode = {};
+    for (const [rawId, ts] of Object.entries(lpRaw)) {
+      const key = String(normalizeId(parseInt(rawId, 10)));
+      if (!lpForMode[key] || ts > lpForMode[key]) lpForMode[key] = ts;
+    }
     const unionIds = new Set([...progressById.keys(), ...recentIds]);
     const idsByRecency = [...unionIds]
       .map((id) => {
@@ -9339,15 +9379,25 @@ app.post("/api/refresh", async (_req, res) => {
   // Panel modes only — "Refresh from panel" must NOT wipe the local disk
   // library (it isn't panel-derived; buildAllIndexes won't rebuild it).
   // This was the bug that made the Disk tab vanish after a refresh.
+  //
+  // Skip any mode whose build is already running (`ix.running`, set by
+  // buildIndex). A second concurrent refresh used to reset ix.total/done/
+  // byId unconditionally, out from under the first build's still-running
+  // loop — which keeps incrementing ix.done and writing into whatever
+  // `ix.byId` currently is, but never re-sets ix.total after the stomp.
+  // End state: ix.total stuck at 0 forever with ix.ready eventually true
+  // — the TV Guide's permanent empty "Indexing the channel list…" state.
+  const skipped = [];
   for (const m of PANEL_MODES) {
     const ix = getIndexesFor(actx)[m];
+    if (ix.running) { skipped.push(m); continue; }
     ix.ready = false;
     ix.byId = new Map();
     ix.done = 0;
     ix.total = 0;
   }
   buildAllIndexes(actx);
-  res.json({ ok: true, active_host: picked.active });
+  res.json({ ok: true, active_host: picked.active, ...(skipped.length ? { alreadyRefreshing: skipped } : {}) });
 });
 
 // Inventory of currently-tracked panel-touching streams. Useful for
