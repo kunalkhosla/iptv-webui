@@ -3877,6 +3877,31 @@ app.get("/branding.local.js", (_req, res) => {
   );
 });
 
+// Cache-busted SPA shell. index.html itself is always served fresh
+// (no-cache, must-revalidate below) — but Cloudflare has been observed
+// silently overriding that SAME header on the *referenced* assets
+// (app.js, style.css) with its own default browser-cache TTL
+// (max-age=14400 seen in practice, vs. the no-cache this app sends),
+// so a deploy can silently NOT reach a browser tab for up to 4 hours
+// even though the HTML shell polling for a new version always would.
+// Query-string versioning sidesteps the problem entirely regardless of
+// what any CDN/browser does with Cache-Control — a new deploy is a
+// genuinely new URL every client has to fetch fresh, no revalidation
+// negotiation involved.
+const SPA_ASSET_VERSION = process.env.GIT_SHA || "dev";
+const SPA_HTML = fs.readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
+  .replace(/(href|src)="\/(style\.css|app\.js|theatre-portraits\.js)"/g,
+    (_m, attr, file) => `${attr}="/${file}?v=${SPA_ASSET_VERSION}"`);
+function sendSpaShell(res) {
+  res.type("html").setHeader("Cache-Control", "no-cache, must-revalidate").send(SPA_HTML);
+}
+// /index.html explicitly too — otherwise it falls through to
+// express.static below and serves the raw, unversioned file straight
+// off disk (same staleness bug this whole shell exists to avoid, just
+// reachable via a second URL — a bookmark, browser history, or a typed
+// full filename).
+app.get(["/", "/index.html"], sendSpaShell);
+
 app.use(express.static(path.join(__dirname, "public"), {
   setHeaders: (res) => {
     res.setHeader("Cache-Control", "no-cache, must-revalidate");
@@ -9520,7 +9545,7 @@ app.put("/api/panel/config", express.json(), async (req, res) => {
 });
 
 app.get(/^\/(live|movie|series|disk|hindi)(\/.*)?$/, (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+  sendSpaShell(res);
 });
 
 app.use((err, _req, res, _next) => {
