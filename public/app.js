@@ -2136,16 +2136,33 @@ function buildGuideRow(ch, { noEpg = false } = {}) {
 
   const left = document.createElement("div");
   left.className = "guide-channel";
-  const fav = state.favorites.live.has(ch.id) ? `<span class="ch-fav" title="Favorite">★</span>` : "";
   const offAir = renderOffAirMarker(ch.id);
   left.innerHTML = `
     <div class="ch-logo"></div>
     <span class="ch-name">${escapeHtml(ch.name)}</span>
     ${offAir}
-    ${fav}
   `;
   left.title = ch.name;
   left.onclick = () => play("live", ch);
+
+  // Own click handler + stopPropagation — matches the card-grid star
+  // (~line 3145). Without this the star was inert markup inside
+  // left.innerHTML, so any click on it bubbled into left.onclick and
+  // started playback instead of toggling the favorite — dangerous
+  // given cap=1 concurrency (an accidental click could kill whatever
+  // the family is actually watching).
+  if (state.favorites.live.has(ch.id)) {
+    const fav = document.createElement("span");
+    fav.className = "ch-fav";
+    fav.title = "Favorite";
+    fav.textContent = "★";
+    fav.onclick = (e) => {
+      e.stopPropagation();
+      toggleFav("live", ch.id);
+      fav.remove();
+    };
+    left.appendChild(fav);
+  }
 
   const track = document.createElement("div");
   track.className = "guide-track";
@@ -3788,6 +3805,15 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
     // server so it can switch the audio track or burn in an image sub.
     diskSel: diskSel || null,
   };
+  // Identity token for the staleness check after resolveStreamUrl below —
+  // a rapid double/triple click (or click-then-immediately-click-a-
+  // different-title) fires play() again before the first call's await
+  // settles. Each call gets its own state.playing object, so if a newer
+  // call has replaced it by the time this one's fetch resolves, this one
+  // is stale and must bail rather than attach a player on top of the
+  // newer request's — that's what produced overlapping play/pause/load
+  // calls and an uncaught AbortError. The newest click always wins.
+  const myPlaying = state.playing;
   // Fire-and-forget — by the time the first second of video is
   // playing, this has almost certainly resolved. updateScrubBar
   // gracefully falls back to el.video.duration if it hasn't.
@@ -3809,10 +3835,20 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
       }
     });
   }
-  if (mode !== "series" && !isHiddenFromRecents(mode, item)) {
-    pushRecent(mode, item.id);
-  }
-  recordPlayEvent(mode, item.id);
+  // Continue Watching / lastPlayed should only record a title once we
+  // know the server actually has a stream for it — not the instant the
+  // user clicks play. Firing these before resolveStreamUrl meant a
+  // title that immediately 404/410/502'd (dead source, displaced slot)
+  // still showed up as "Last played just now" in Continue Watching even
+  // though not a single frame ever rendered. Cast bypasses the normal
+  // player entirely (castMedia hands the URL straight to the receiver),
+  // so it still records here, before the early return.
+  const recordAsPlayed = () => {
+    if (mode !== "series" && !isHiddenFromRecents(mode, item)) {
+      pushRecent(mode, item.id);
+    }
+    recordPlayEvent(mode, item.id);
+  };
   updateUrl({ push: !useTranscode });
   refreshLiveRemoteVisibility();
   refreshPlayerFavorite();
@@ -3820,7 +3856,7 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
   // Up-Next card; clears the card from any prior item.
   refreshNextEpisode();
 
-  if (state.castSession) { castMedia(state.playing); return; }
+  if (state.castSession) { recordAsPlayed(); castMedia(state.playing); return; }
 
   el.player.hidden = false;
   setPlayerMode(mode === "live" ? "mini" : "theater");
@@ -3833,7 +3869,27 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
   // hides it once frames are flowing.
   if (el.spinner) el.spinner.hidden = false;
 
-  const resolved = await resolveStreamUrl(mode, item.id, ext, resumeAnchorSecs, diskSel);
+  let resolved;
+  try {
+    resolved = await resolveStreamUrl(mode, item.id, ext, resumeAnchorSecs, diskSel);
+  } catch (e) {
+    // Previously unhandled — resolveStreamUrl throws on any non-OK
+    // /api/stream response (dead source, displaced cap=1 slot, bad id)
+    // and this await had no try/catch, so the rejection was silent: no
+    // toast, no console message a user would ever see, spinner stuck
+    // forever. Surface it and put the UI back in a clean state.
+    if (el.spinner) el.spinner.hidden = true;
+    toast(
+      e && /^HTTP 410/.test(e.message)
+        ? "Another device started watching — try again in a moment."
+        : "Couldn't start playback — this title may be unavailable.",
+      4500,
+    );
+    closePlayer();
+    return;
+  }
+  if (state.playing !== myPlaying) return; // superseded by a newer play() call meanwhile — let it own the player
+  recordAsPlayed();
   // Disk: stash the probed track list + the signed VTT subtitle URLs so
   // the player's Audio/Subtitles menu can render them.
   if (mode === "disk") {
@@ -5132,7 +5188,20 @@ function closeDetail() {
 
 async function castMedia(p) {
   const ext = p.ext || pickExt(p.mode, p.item);
-  const stream = await resolveStreamUrl(p.mode, p.item.id, ext);
+  let stream;
+  try {
+    stream = await resolveStreamUrl(p.mode, p.item.id, ext);
+  } catch (e) {
+    // Same unhandled-rejection gap as the direct-play path (see play()) —
+    // a dead source or a displaced cap=1 slot failed completely silently.
+    toast(
+      e && /^HTTP 410/.test(e.message)
+        ? "Another device started watching — try again in a moment."
+        : "Couldn't start casting — this title may be unavailable.",
+      4500,
+    );
+    return;
+  }
   // Live channels often serve MPEG-2 which the Default Media Receiver
   // cannot decode; route them through the transcoder by default. Movies
   // and series cast the direct panel URL — fast and CPU-free.
