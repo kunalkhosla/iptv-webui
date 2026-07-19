@@ -5,6 +5,7 @@ const os = require("os");
 const crypto = require("crypto");
 const { spawn, spawnSync } = require("child_process");
 const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
 const { AsyncLocalStorage } = require("async_hooks");
 
 // Request-scoped account context. The auth middleware wraps `next()` in
@@ -2815,6 +2816,223 @@ async function buildDiskIndex(actx, rootPath) {
   }
 }
 
+// ===========================================================================
+// DISK DOWNLOAD — "save to disk" for a movie or series episode, at the
+// highest available quality: a stream COPY (no re-encode, no downscale —
+// unlike /api/download's client-facing 720p CRF22 re-encode meant for a
+// phone's limited storage). Runs as a background job queue, ONE AT A
+// TIME, and shares the SAME admitStream() concurrency slot as a real
+// viewer via a synthetic owner key — so a family member pressing play
+// always displaces an in-progress download (never the reverse); the job
+// just waits for the slot to free and resumes via HTTP Range from
+// wherever it left off. Disk is owner-only (see userDiskPath), so this
+// whole subsystem only ever targets the owner's disk root.
+// ===========================================================================
+
+const DISK_DOWNLOAD_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB headroom
+const DISK_DOWNLOAD_DISPLACED_RETRY_MS = 30_000;
+const DISK_DOWNLOAD_MAX_ERROR_RETRIES = 8;
+
+const diskDownloadJobs = new Map(); // jobId -> job
+let diskDownloadQueueRunning = false;
+
+function diskDownloadFreeBytes(rootPath) {
+  try {
+    const s = fs.statfsSync(rootPath);
+    return s.bavail * s.bsize;
+  } catch (e) {
+    console.warn(`[disk-download] statfs failed for ${rootPath}: ${e.message}`);
+    return null;
+  }
+}
+
+function diskDownloadSafeName(s) {
+  return String(s).replace(/[/\\:*?"<>|]/g, "").replace(/\s+/g, " ").trim();
+}
+
+// Downloads land in a dedicated "Downloads" subfolder of the disk root —
+// buildDiskIndex categorizes by top-level folder, so these show up as
+// their own "Downloads" rail rather than mixing into whatever other
+// folders the owner has organized. Filenames follow the same
+// `Title (YYYY)` shape parseTitleYear() expects, so a rescan indexes them
+// exactly like any manually-placed file. Series episodes have no
+// season/episode grouping in Disk mode (it's a flat movie-style library —
+// see the DISK MEDIA comment above), so each downloaded episode becomes
+// its own standalone Disk entry named "Series Name SxxEyy - Title (Year)".
+function diskDownloadDestPath(rootPath, job) {
+  const dir = path.join(rootPath, "Downloads");
+  fs.mkdirSync(dir, { recursive: true });
+  let filename;
+  if (job.mode === "movie") {
+    filename = diskDownloadSafeName(job.title) + (job.year ? ` (${job.year})` : "");
+  } else {
+    const season = String(job.season || 0).padStart(2, "0");
+    const ep = String(job.episodeNum || 0).padStart(2, "0");
+    filename = `${diskDownloadSafeName(job.seriesTitle)} S${season}E${ep}`
+      + (job.episodeTitle ? ` - ${diskDownloadSafeName(job.episodeTitle)}` : "")
+      + (job.year ? ` (${job.year})` : "");
+  }
+  return path.join(dir, `${filename}.${job.ext}`);
+}
+
+// job: { mode, id, title, year, seriesTitle?, season?, episodeNum?,
+//        episodeTitle? } — enough to resolve the source URL and name the
+// destination file. Returns the new job's id.
+function enqueueDiskDownload(job) {
+  const id = crypto.randomUUID();
+  diskDownloadJobs.set(id, {
+    id,
+    status: "queued",
+    createdAt: Date.now(),
+    bytesWritten: 0,
+    retries: 0,
+    error: null,
+    ...job,
+  });
+  processDiskDownloadQueue().catch((e) => console.warn(`[disk-download] queue error: ${e.message}`));
+  return id;
+}
+
+async function processDiskDownloadQueue() {
+  if (diskDownloadQueueRunning) return;
+  diskDownloadQueueRunning = true;
+  try {
+    while (true) {
+      const job = [...diskDownloadJobs.values()].find((j) => j.status === "queued");
+      if (!job) break;
+      await runDiskDownloadJob(job);
+    }
+  } finally {
+    diskDownloadQueueRunning = false;
+  }
+}
+
+async function runDiskDownloadJob(job) {
+  const user = ownerUser();
+  const rootPath = userDiskPath(user);
+  if (!rootPath || !userDiskEnabled(user)) {
+    job.status = "failed";
+    job.error = "disk not configured";
+    return;
+  }
+
+  const free = diskDownloadFreeBytes(rootPath);
+  if (free != null && free < DISK_DOWNLOAD_MIN_FREE_BYTES) {
+    job.status = "failed";
+    job.error = `disk almost full (${(free / 1024 / 1024 / 1024).toFixed(1)} GB free, need ${DISK_DOWNLOAD_MIN_FREE_BYTES / 1024 / 1024 / 1024} GB headroom)`;
+    console.warn(`[disk-download] ${job.id} refused: ${job.error}`);
+    return;
+  }
+
+  job.status = "downloading";
+  const { sourceUrl, ext, error: probeErr } = await resolveDownloadSourceUrl(job.mode, job.id);
+  if (!sourceUrl) {
+    job.status = "failed";
+    job.error = `source unavailable: ${probeErr}`;
+    return;
+  }
+  job.ext = ext;
+  const destPath = diskDownloadDestPath(rootPath, job);
+  const tmpPath = `${destPath}.part`;
+
+  const owner = `disk-download:${job.id}`;
+  const accountKey = accountKeyOf(ownerAccount);
+
+  while (true) {
+    let ac = new AbortController();
+    const killer = (reason) => {
+      job.pausedReason = reason;
+      ac.abort();
+    };
+    const admission = admitStream(owner, job.mode, job.id, killer, accountKey);
+    if (!admission.ok) {
+      // Displaced before we even started this attempt (shouldn't happen —
+      // we just registered — but handle it the same way as a mid-transfer
+      // displacement: back off and retry).
+      await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS));
+      continue;
+    }
+
+    let startByte = 0;
+    try { startByte = fs.statSync(tmpPath).size; } catch {}
+
+    try {
+      const resp = await fetch(sourceUrl, {
+        method: "GET",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Linux; Android 12; Smart TV)",
+          ...(startByte > 0 ? { Range: `bytes=${startByte}-` } : {}),
+        },
+        redirect: "follow",
+        signal: ac.signal,
+      });
+      if (!resp.ok && resp.status !== 206) throw new Error(`HTTP ${resp.status}`);
+      const resumed = resp.status === 206;
+      const out = fs.createWriteStream(tmpPath, { flags: resumed ? "a" : "w" });
+      if (!resumed) job.bytesWritten = 0;
+      // Expected total size, for verifying the transfer actually completed
+      // rather than silently truncating — the same CDN-drop failure mode
+      // /api/download had (closes the connection cleanly mid-transfer;
+      // pipeline() sees a normal stream end, not an error). A 206's
+      // Content-Range carries the total after the "/"; a fresh 200's
+      // Content-Length IS the total. Missing/malformed header (some CDN
+      // responses omit it) → can't verify, proceed on trust same as
+      // /api/download does today.
+      const expectedTotal = resumed
+        ? Number(resp.headers.get("content-range")?.split("/")?.[1]) || null
+        : Number(resp.headers.get("content-length")) || null;
+      const source = Readable.fromWeb(resp.body);
+      source.on("data", (chunk) => { job.bytesWritten += chunk.length; });
+      await pipeline(source, out);
+
+      if (expectedTotal != null) {
+        const actual = fs.statSync(tmpPath).size;
+        if (actual < expectedTotal) {
+          throw new Error(`truncated transfer: got ${actual} of ${expectedTotal} bytes`);
+        }
+      }
+
+      // Completed without abort, size verified — success.
+      fs.renameSync(tmpPath, destPath);
+      job.status = "done";
+      job.finishedAt = Date.now();
+      dropStreamKiller(owner, killer);
+      streams.delete(owner);
+      console.log(`[disk-download] ${job.id} done → ${destPath} (${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB)`);
+      try {
+        await buildDiskIndex(ownerAccount, rootPath);
+        prewarmTmdbCache("disk", ownerAccount).catch(() => {});
+      } catch (e) {
+        console.warn(`[disk-download] post-download rescan failed: ${e.message}`);
+      }
+      return;
+    } catch (e) {
+      if (ac.signal.aborted) {
+        // Displaced by a real viewer — this is expected, not an error.
+        // Loop back: re-admit once the slot frees (streams' idle reaper
+        // or the viewer's own session ending clears it), resuming via
+        // Range from whatever this attempt already wrote.
+        console.log(`[disk-download] ${job.id} paused (${job.pausedReason || "displaced"}) at ${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB — will resume`);
+        job.status = "paused";
+        await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS));
+        job.status = "downloading";
+        continue;
+      }
+      job.retries += 1;
+      job.error = e.message;
+      streams.delete(owner);
+      if (job.retries > DISK_DOWNLOAD_MAX_ERROR_RETRIES) {
+        job.status = "failed";
+        console.warn(`[disk-download] ${job.id} gave up after ${job.retries} attempts: ${e.message}`);
+        try { fs.rmSync(tmpPath, { force: true }); } catch {}
+        return;
+      }
+      console.warn(`[disk-download] ${job.id} retry ${job.retries}/${DISK_DOWNLOAD_MAX_ERROR_RETRIES}: ${e.message}`);
+      await new Promise((r) => setTimeout(r, Math.min(5000 * job.retries, 60_000)));
+    }
+  }
+}
+
 // ---- account-bound signing for the unauthenticated disk media routes ----
 // We embed the owning userId in the URL and HMAC over `${kind}:${userId}:${id}`
 // so a signed URL minted for tenant A can't be replayed to read tenant B's
@@ -3219,25 +3437,19 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/seg_:n.ts", (req, res)
 // be handed to a non-auth'd client like DownloadManager. Lives
 // BEFORE the auth middleware below for that reason — see the
 // session-auth middleware at the next section.
-app.get("/api/download/:mode(movie|series)/:id.mp4", async (req, res) => {
-  const { mode, id } = req.params;
-  const expected = crypto.createHmac("sha256", PROXY_SECRET)
-    .update(`download:${mode}:${id}`).digest("hex").slice(0, 16);
-  if (req.query.s !== expected) return res.status(403).end("bad signature");
-
-  // The output is always MP4 (ffmpeg transcodes regardless), but the
-  // panel-side URL MUST use the source's actual container. The panel
-  // stores each title as either .mp4 or .mkv (or rarely .avi) and
-  // requesting the wrong extension returns 200 OK + text/html + 0
-  // bytes — same pattern as a missing file.
-  //
-  // For movies the index lookup is authoritative (movies.byId is
-  // keyed by movie id). For series the index is keyed by series id,
-  // NOT episode id, so any per-episode container lookup misses and
-  // falls back to mp4 — which fails for the (very common) panels
-  // that store episodes as mkv. Rather than fetching get_series_info
-  // for every download request, probe the candidate containers in
-  // order and use the first that returns real bytes.
+// The panel stores each title as either .mp4, .mkv, or (rarely) .avi and
+// requesting the wrong extension returns 200 OK + text/html + 0 bytes —
+// same pattern as a missing file. For movies the index lookup is
+// authoritative (movies.byId is keyed by movie id). For series the index
+// is keyed by series id, NOT episode id, so any per-episode container
+// lookup misses and falls back to mp4 — which fails for the (very
+// common) panels that store episodes as mkv. Rather than fetching
+// get_series_info for every request, probe the candidate containers in
+// order and use the first that returns real bytes. Shared by
+// /api/download (client-side download) and the disk-download job queue
+// (server-side save to the Disk library) — both hit this exact panel
+// flakiness.
+async function resolveDownloadSourceUrl(mode, id) {
   const indexExt = (mode === "movie"
     ? indexes.movie.byId.get(parseInt(id, 10))?.container
     : null);
@@ -3245,13 +3457,10 @@ app.get("/api/download/:mode(movie|series)/:id.mp4", async (req, res) => {
     ? [indexExt, ...["mp4", "mkv", "avi"].filter(x => x !== indexExt)]
     : ["mp4", "mkv", "avi"];
 
-  // Pre-flight check: panel returns 200 OK with Content-Type
-  // text/html and an empty body for the wrong container as well as
-  // for files no longer on the reseller's CDN. Without this probe
-  // we spawn ffmpeg which immediately fails, then pipe 0 bytes
-  // back to the client; DownloadManager calls that "SUCCESSFUL"
-  // and we get an empty file.
-  let sourceUrl = null;
+  // Pre-flight check: panel returns 200 OK with Content-Type text/html
+  // and an empty body for the wrong container as well as for files no
+  // longer on the reseller's CDN. Without this probe a downstream
+  // consumer (ffmpeg, or a raw fetch) would "succeed" with 0 real bytes.
   let lastProbeErr = "no candidates";
   for (const ext of candidates) {
     const url = streamUrl(mode, id, ext);
@@ -3269,14 +3478,23 @@ app.get("/api/download/:mode(movie|series)/:id.mp4", async (req, res) => {
       const ct = probe.headers.get("content-type") || "";
       const buf = Buffer.from(await probe.arrayBuffer());
       if (!ct.startsWith("text/") && buf.length > 0) {
-        sourceUrl = url;
-        break;
+        return { sourceUrl: url, ext };
       }
       lastProbeErr = `${ext}: ct=${ct} bytes=${buf.length}`;
     } catch (e) {
       lastProbeErr = `${ext}: ${e.message}`;
     }
   }
+  return { sourceUrl: null, ext: null, error: lastProbeErr };
+}
+
+app.get("/api/download/:mode(movie|series)/:id.mp4", async (req, res) => {
+  const { mode, id } = req.params;
+  const expected = crypto.createHmac("sha256", PROXY_SECRET)
+    .update(`download:${mode}:${id}`).digest("hex").slice(0, 16);
+  if (req.query.s !== expected) return res.status(403).end("bad signature");
+
+  const { sourceUrl, error: lastProbeErr } = await resolveDownloadSourceUrl(mode, id);
   if (!sourceUrl) {
     return res.status(502).type("text/plain")
       .end(`panel says this file isn't available on the active CDN — try again later or pick a different title (${lastProbeErr})`);
@@ -8257,6 +8475,69 @@ app.post("/api/admin/disk-config", express.json(), async (req, res) => {
     ix.byId = new Map(); ix.meta = new Map(); ix.ready = true; ix.total = 0; ix.done = 0;
   }
   res.json({ ok: true, path: resolved || "", enabled: userDiskEnabled(req.user), count });
+});
+
+// Client-safe projection of a job — omits internal fields (pausedReason
+// is informative enough without exposing the raw killer/abort plumbing).
+function projectDiskDownloadJob(j) {
+  return {
+    id: j.id, mode: j.mode, sourceId: j.id, status: j.status,
+    title: j.mode === "movie" ? j.title : j.episodeTitle,
+    seriesTitle: j.seriesTitle || null, season: j.season || null, episodeNum: j.episodeNum || null,
+    bytesWritten: j.bytesWritten, error: j.error, createdAt: j.createdAt, finishedAt: j.finishedAt || null,
+  };
+}
+
+// Owner-only: queue one or more highest-quality (stream-copy, no
+// re-encode) saves to the Disk library. Body is either
+// `{ mode: "movie", id, title, year }` or
+// `{ mode: "series", episodes: [{ id, seriesTitle, season, episodeNum,
+// episodeTitle, year }, …] }` — the client already has this metadata
+// from the detail page / season picker, so it's passed through rather
+// than re-fetched server-side. Each episode becomes its own queued job
+// (see runDiskDownloadJob — Disk mode has no season/episode grouping).
+app.post("/api/disk-download", express.json(), (req, res) => {
+  if (!requireOwner(req, res)) return;
+  const user = req.user;
+  if (!userDiskPath(user) || !userDiskEnabled(user)) {
+    return res.status(400).json({ ok: false, error: "disk not configured" });
+  }
+  const body = req.body || {};
+  const ids = [];
+  if (body.mode === "movie") {
+    const id = parseInt(body.id, 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ ok: false, error: "invalid movie id" });
+    ids.push(enqueueDiskDownload({ mode: "movie", id, title: String(body.title || `Movie ${id}`), year: body.year || null }));
+  } else if (body.mode === "series" && Array.isArray(body.episodes)) {
+    for (const ep of body.episodes) {
+      const id = parseInt(ep.id, 10);
+      if (!Number.isFinite(id)) continue;
+      ids.push(enqueueDiskDownload({
+        mode: "series", id,
+        seriesTitle: String(ep.seriesTitle || "Series"),
+        season: parseInt(ep.season, 10) || 0,
+        episodeNum: parseInt(ep.episodeNum, 10) || 0,
+        episodeTitle: ep.episodeTitle || null,
+        year: ep.year || null,
+      }));
+    }
+    if (!ids.length) return res.status(400).json({ ok: false, error: "no valid episodes" });
+  } else {
+    return res.status(400).json({ ok: false, error: "mode must be movie or series" });
+  }
+  res.json({ ok: true, jobIds: ids });
+});
+
+// Owner-only: poll job status for the "downloading…" badge on tiles/
+// detail pages. Newest first, capped at 100 so a long download history
+// doesn't grow the response unbounded.
+app.get("/api/disk-download/jobs", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  const jobs = [...diskDownloadJobs.values()]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 100)
+    .map(projectDiskDownloadJob);
+  res.json({ jobs });
 });
 
 app.post("/api/admin/rescan-disk", async (req, res) => {

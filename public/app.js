@@ -253,6 +253,9 @@ const el = {
   seriesThumbDownBtn: document.getElementById("series-thumb-down-btn"),
   seriesPosterMenuBtn: document.getElementById("series-poster-menu"),
   seriesPosterMenuDropdown: document.getElementById("series-poster-menu-dropdown"),
+  seriesDiskBtnWrap: document.getElementById("series-disk-btn-wrap"),
+  seriesDiskBtn: document.getElementById("series-disk-btn"),
+  seriesDiskDropdown: document.getElementById("series-disk-menu-dropdown"),
   seriesTagline:     document.getElementById("series-tagline"),
   seriesTrailerBtn:  document.getElementById("series-trailer-btn"),
   seriesCreators:    document.getElementById("series-creators"),
@@ -4436,6 +4439,7 @@ async function openMovie(s, mode = "movie") {
   setMoviePlayButton(s);
   refreshSeriesMyListBtn();
   refreshSeriesThumbBtns();
+  refreshSeriesDiskBtn();
   updateUrl({ push: true });
   // Kick off TMDB enrichment in parallel with the panel info fetch —
   // either can finish first, the helper merges into state.openMovie.
@@ -4546,6 +4550,18 @@ function refreshSeriesThumbBtns() {
   el.seriesThumbDownBtn.classList.toggle("on", state.feedback.down[target.mode].has(target.id));
 }
 
+// Save-to-Disk button is owner-only (matches the Disk feature itself —
+// see server.js's userDiskPath) and only makes sense for movie/series
+// (never live). Hidden entirely for non-owner accounts rather than
+// disabled, since a non-owner can never have a configured disk to save to.
+function refreshSeriesDiskBtn() {
+  if (!el.seriesDiskBtnWrap) return;
+  const target = openItemTarget();
+  const canShow = !!target && !!state.diskConfig?.isOwner && !!state.diskConfig?.enabled;
+  el.seriesDiskBtnWrap.hidden = !canShow;
+  if (canShow) renderDiskMenu();
+}
+
 function closeMovie() {
   el.seriesPanel.hidden = true;
   el.seriesPanel.removeAttribute("data-mode");
@@ -4588,6 +4604,7 @@ async function openSeries(s) {
   el.seriesEpisodes.innerHTML = `<div class="empty">Loading episodes…</div>`;
   refreshSeriesMyListBtn();
   refreshSeriesThumbBtns();
+  refreshSeriesDiskBtn();
   updateUrl({ push: true });
   // Kick off TMDB enrichment in parallel with the panel info fetch.
   applyTmdbToDetail("series", s);
@@ -4599,6 +4616,7 @@ async function openSeries(s) {
     const r = await fetch(`/api/series/info/${s.id}`);
     const d = await r.json();
     state.openSeriesData = d;
+    refreshSeriesDiskBtn();
     const backdrop = (d.info && (d.info.backdrop_path?.[0] || d.info.movie_image)) || s.icon;
     const poster = (d.info && (d.info.cover || d.info.cover_big)) || s.icon;
     setSeriesHeroBackdrop(backdrop, poster);
@@ -4976,6 +4994,132 @@ function openPosterMenu() {
 }
 function closePosterMenu() {
   if (el.seriesPosterMenuDropdown) el.seriesPosterMenuDropdown.hidden = true;
+}
+
+// Save-to-Disk picker. Movie: a single confirm button (no picker needed —
+// one file). Series: pick a season + episode from the already-fetched
+// state.openSeriesData season/episode tree (no extra round-trip), with
+// "this episode" / "this season" / "whole series" actions. Disk mode has
+// no season/episode grouping (see the DISK MEDIA comment in server.js —
+// it's a flat movie-style library), so a season/series download queues
+// one job per episode; each becomes its own standalone Disk entry.
+function renderDiskMenu() {
+  const dd = el.seriesDiskDropdown;
+  if (!dd) return;
+  if (state.openMovie) {
+    const m = state.openMovie;
+    dd.innerHTML = `
+      <div class="pm-info">SAVE TO DISK<br><b>Highest quality — no re-encode</b></div>
+      <button type="button" data-action="go">⬇ Save this movie</button>
+    `;
+    dd.querySelector('[data-action="go"]').onclick = () => {
+      closeDiskMenu();
+      triggerDiskDownload({ mode: "movie", id: m.id, title: m.name, year: (m.year || "").slice(0, 4) || null });
+    };
+    return;
+  }
+  if (!state.openSeries || !state.openSeriesData) { dd.innerHTML = ""; return; }
+  const s = state.openSeries;
+  const episodesByS = state.openSeriesData.episodes || {};
+  const seasonNums = Object.keys(episodesByS).sort((a, b) => Number(a) - Number(b));
+  if (!seasonNums.length) {
+    dd.innerHTML = `<div class="pm-info">SAVE TO DISK<br><b>No episodes found</b></div>`;
+    return;
+  }
+  const defaultSeason = (el.seriesSeasonSelect?.value && episodesByS[el.seriesSeasonSelect.value])
+    ? el.seriesSeasonSelect.value : seasonNums[0];
+  const totalEpisodes = Object.values(episodesByS).reduce((n, eps) => n + eps.length, 0);
+
+  dd.innerHTML = `
+    <div class="pm-info">SAVE TO DISK<br><b>Highest quality — no re-encode</b></div>
+    <div class="disk-menu-row">
+      <select class="disk-menu-season"></select>
+      <select class="disk-menu-episode"></select>
+    </div>
+    <button type="button" data-action="episode">⬇ This episode</button>
+    <button type="button" data-action="season">⬇ This whole season</button>
+    <button type="button" data-action="series">⬇ Whole series (${totalEpisodes} episodes)</button>
+  `;
+  const seasonSel = dd.querySelector(".disk-menu-season");
+  const epSel = dd.querySelector(".disk-menu-episode");
+  for (const sn of seasonNums) {
+    const opt = document.createElement("option");
+    opt.value = sn;
+    opt.textContent = `Season ${sn}`;
+    seasonSel.appendChild(opt);
+  }
+  seasonSel.value = defaultSeason;
+  const fillEpisodes = () => {
+    epSel.innerHTML = "";
+    for (const ep of episodesByS[seasonSel.value] || []) {
+      const opt = document.createElement("option");
+      opt.value = ep.id;
+      opt.textContent = `E${ep.episode_num} — ${ep.title || ep.info?.name || `Episode ${ep.episode_num}`}`;
+      epSel.appendChild(opt);
+    }
+  };
+  fillEpisodes();
+  seasonSel.onchange = fillEpisodes;
+
+  const episodePayload = (ep, sn) => ({
+    id: ep.id,
+    seriesTitle: s.name,
+    season: Number(sn),
+    episodeNum: ep.episode_num,
+    episodeTitle: ep.title || ep.info?.name || null,
+    year: (s.year || "").slice(0, 4) || null,
+  });
+
+  dd.querySelector('[data-action="episode"]').onclick = () => {
+    const sn = seasonSel.value;
+    const ep = (episodesByS[sn] || []).find((e) => String(e.id) === epSel.value);
+    if (!ep) return;
+    closeDiskMenu();
+    triggerDiskDownload({ mode: "series", episodes: [episodePayload(ep, sn)] });
+  };
+  dd.querySelector('[data-action="season"]').onclick = () => {
+    const sn = seasonSel.value;
+    const eps = episodesByS[sn] || [];
+    closeDiskMenu();
+    triggerDiskDownload({ mode: "series", episodes: eps.map((ep) => episodePayload(ep, sn)) });
+  };
+  dd.querySelector('[data-action="series"]').onclick = () => {
+    const all = [];
+    for (const sn of seasonNums) for (const ep of episodesByS[sn] || []) all.push(episodePayload(ep, sn));
+    closeDiskMenu();
+    triggerDiskDownload({ mode: "series", episodes: all });
+  };
+}
+function openDiskMenu() {
+  if (!el.seriesDiskDropdown) return;
+  renderDiskMenu();
+  el.seriesDiskDropdown.hidden = false;
+  setTimeout(() => {
+    document.addEventListener("click", function onDoc(e) {
+      if (el.seriesDiskDropdown && !el.seriesDiskDropdown.contains(e.target) && e.target !== el.seriesDiskBtn) {
+        closeDiskMenu();
+        document.removeEventListener("click", onDoc);
+      }
+    });
+  }, 0);
+}
+function closeDiskMenu() {
+  if (el.seriesDiskDropdown) el.seriesDiskDropdown.hidden = true;
+}
+async function triggerDiskDownload(payload) {
+  try {
+    const r = await fetch("/api/disk-download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) { toast(`Download failed to queue: ${d.error || r.status}`, 4000); return; }
+    const n = (d.jobIds || []).length;
+    toast(n > 1 ? `Queued ${n} downloads — check Disk later` : "Queued for download — will show up in Disk when done", 3500);
+  } catch (e) {
+    toast(`Download request failed: ${e.message}`, 4000);
+  }
 }
 
 function setSeriesHeroBackdrop(backdropUrl, posterUrl) {
@@ -6336,6 +6480,11 @@ el.seriesPosterMenuBtn.onclick = (e) => {
   e.stopPropagation();
   if (el.seriesPosterMenuDropdown.hidden) openPosterMenu();
   else closePosterMenu();
+};
+el.seriesDiskBtn.onclick = (e) => {
+  e.stopPropagation();
+  if (el.seriesDiskDropdown.hidden) openDiskMenu();
+  else closeDiskMenu();
 };
 
 // Player-bar ★ — toggles favorite for the currently-playing item (or

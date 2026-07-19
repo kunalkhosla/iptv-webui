@@ -2378,7 +2378,8 @@ body.player-theater #search-all-view { display: none; }
   font-weight: 600;
 }
 .series-poster-menu:hover { background: rgba(0,0,0,0.7); border-color: var(--accent); color: var(--accent); }
-#series-poster-menu-dropdown {
+#series-poster-menu-dropdown,
+#series-disk-menu-dropdown {
   position: absolute;
   /* Open UPWARD so the menu always lives inside the hero region.
      The ⋮ button sits near the bottom of the hero — a downward
@@ -2394,14 +2395,16 @@ body.player-theater #search-all-view { display: none; }
   box-shadow: var(--shadow);
   z-index: 30;
 }
-#series-poster-menu-dropdown .pm-info {
+#series-poster-menu-dropdown .pm-info,
+#series-disk-menu-dropdown .pm-info {
   padding: 8px 10px 6px;
   font-size: 11px;
   color: var(--fg-dim);
   letter-spacing: 0.04em;
   border-bottom: 1px solid var(--line);
 }
-#series-poster-menu-dropdown .pm-info b {
+#series-poster-menu-dropdown .pm-info b,
+#series-disk-menu-dropdown .pm-info b {
   display: block;
   color: var(--fg);
   font-size: 12.5px;
@@ -2410,7 +2413,8 @@ body.player-theater #search-all-view { display: none; }
   margin-top: 2px;
   word-break: break-word;
 }
-#series-poster-menu-dropdown button {
+#series-poster-menu-dropdown button,
+#series-disk-menu-dropdown button {
   display: block;
   width: 100%;
   text-align: left;
@@ -2424,7 +2428,25 @@ body.player-theater #search-all-view { display: none; }
   font-family: inherit;
   cursor: pointer;
 }
-#series-poster-menu-dropdown button:hover { background: var(--bg-2); color: var(--accent); }
+#series-poster-menu-dropdown button:hover,
+#series-disk-menu-dropdown button:hover { background: var(--bg-2); color: var(--accent); }
+.series-disk-btn:disabled { opacity: 0.55; cursor: default; }
+#series-disk-menu-dropdown .disk-menu-row {
+  display: flex;
+  gap: 6px;
+  padding: 6px 6px 2px;
+}
+#series-disk-menu-dropdown .disk-menu-row select {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 5px 6px;
+  font-size: 12px;
+  font-family: inherit;
+}
 .series-play-btn {
   background: var(--fg);
   color: #000;
