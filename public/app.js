@@ -4093,7 +4093,7 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
           }, 1500);
         } else {
           _manifestRetries.delete(id);
-          toast("Channel offline or unreachable.", 4000);
+          toast(cur && cur.mode === "live" ? "Channel offline or unreachable." : "This title is unavailable right now.", 4000);
         }
       } else {
         toast(`Stream error: ${data.details}`, 4000);
