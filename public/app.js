@@ -1387,8 +1387,8 @@ function renderHero() {
       <p class="hero-plot"></p>
       <div class="hero-actions">
         <button type="button" class="hero-play">Play</button>
-        <button type="button" class="hero-thumb up" title="More like this" aria-label="More like this">👍</button>
-        <button type="button" class="hero-thumb down" title="Not for me" aria-label="Not for me">👎</button>
+        <button type="button" class="act-icon hero-thumb up" title="More like this" aria-label="More like this">👍</button>
+        <button type="button" class="act-icon hero-thumb down" title="Not for me" aria-label="Not for me">👎</button>
       </div>
     </div>
     <div class="hero-dots"></div>`;
@@ -1535,8 +1535,10 @@ function paintHero(pick) {
     else play(state.mode, pick);
   };
 
-  // Thumbs — hero is always movie/series (renderHero bails on live),
-  // so no cardMode gate needed here like channelCard() has.
+  // Thumbs — renderHero() only bails on live mode (movie/series/disk
+  // all reach here), and state.mode is used directly rather than a
+  // hardcoded mode, so no cardMode gate is needed here like
+  // channelCard() has.
   const heroUp = el.hero.querySelector(".hero-thumb.up");
   const heroDown = el.hero.querySelector(".hero-thumb.down");
   const syncHeroThumbs = () => {
@@ -1544,8 +1546,8 @@ function paintHero(pick) {
     heroDown.classList.toggle("on", state.feedback.down[state.mode].has(pick.id));
   };
   syncHeroThumbs();
-  heroUp.onclick = (e) => { e.stopPropagation(); toggleFeedback(state.mode, pick.id, "up"); syncHeroThumbs(); };
-  heroDown.onclick = (e) => { e.stopPropagation(); toggleFeedback(state.mode, pick.id, "down"); syncHeroThumbs(); };
+  heroUp.onclick = (e) => { e.stopPropagation(); toggleFeedbackFromHero(state.mode, pick.id, "up"); syncHeroThumbs(); };
+  heroDown.onclick = (e) => { e.stopPropagation(); toggleFeedbackFromHero(state.mode, pick.id, "down"); syncHeroThumbs(); };
 }
 
 function renderRails() {
@@ -3260,6 +3262,24 @@ function toggleFeedback(mode, id, dir) {
   pushUserState();
 }
 
+// Same mutation as toggleFeedback(), but for the Hero's own thumbs.
+// Calls renderRails() instead of refreshView()/renderHome() — same
+// reason the chip-strip click handler avoids refreshView() (see its
+// comment above): rebuilding the hero here would reset _heroIdx to 0
+// and discard whatever slide the user was looking at when they rated
+// it. renderHero() is only ever called alongside renderRails() when
+// state.view === "home" (never from renderCollection()), and the Hero
+// itself is only visible in that view, so skipping the hero rebuild
+// here is always correct.
+function toggleFeedbackFromHero(mode, id, dir) {
+  const on = state.feedback[dir][mode];
+  const off = state.feedback[dir === "up" ? "down" : "up"][mode];
+  if (on.has(id)) on.delete(id);
+  else { on.add(id); off.delete(id); }
+  renderRails();
+  pushUserState();
+}
+
 function pushRecent(mode, id) {
   state.recents[mode] = [id, ...state.recents[mode].filter(x => x !== id)].slice(0, 24);
   localStorage.setItem(`recents:${mode}`, JSON.stringify(state.recents[mode]));
@@ -4486,16 +4506,26 @@ function setMoviePlayButton(s) {
   }
 }
 
+// Resolves {mode, id} for whichever item the shared detail modal has
+// open, or null. Single source of truth for every button in the modal
+// that needs to know its target — mode uses state.openMovieMode
+// ("movie" | "disk", set by openMovie()) rather than hardcoding
+// "movie", so Disk-library items record My List / thumbs feedback
+// under the right mode instead of colliding with the movie index.
+function openItemTarget() {
+  return state.openMovie
+    ? { mode: state.openMovieMode || "movie", id: state.openMovie.id }
+    : state.openSeries
+      ? { mode: "series", id: state.openSeries.id }
+      : null;
+}
+
 // Sync the detail-modal "+ My List" button to whichever item is open
 // (movie or series). Called every time the modal opens AND every time
 // the user toggles the button.
 function refreshSeriesMyListBtn() {
   if (!el.seriesMyListBtn) return;
-  const target = state.openMovie
-    ? { mode: "movie", id: state.openMovie.id }
-    : state.openSeries
-      ? { mode: "series", id: state.openSeries.id }
-      : null;
+  const target = openItemTarget();
   if (!target) { el.seriesMyListBtn.hidden = true; return; }
   el.seriesMyListBtn.hidden = false;
   const inList = state.myList[target.mode].has(target.id);
@@ -4504,16 +4534,11 @@ function refreshSeriesMyListBtn() {
   el.seriesMyListBtn.title = inList ? "Remove from Watch Later" : "Add to Watch Later";
 }
 
-// Sync the detail-modal thumbs to whichever item is open. Same
-// target-resolution shape as refreshSeriesMyListBtn(); called from the
-// same spots. Live has no detail modal, so no cardMode gate needed.
+// Sync the detail-modal thumbs to whichever item is open. Live has no
+// detail modal, so no cardMode gate needed.
 function refreshSeriesThumbBtns() {
   if (!el.seriesThumbUpBtn || !el.seriesThumbDownBtn) return;
-  const target = state.openMovie
-    ? { mode: "movie", id: state.openMovie.id }
-    : state.openSeries
-      ? { mode: "series", id: state.openSeries.id }
-      : null;
+  const target = openItemTarget();
   if (!target) { el.seriesThumbUpBtn.hidden = true; el.seriesThumbDownBtn.hidden = true; return; }
   el.seriesThumbUpBtn.hidden = false;
   el.seriesThumbDownBtn.hidden = false;
@@ -6331,33 +6356,22 @@ el.playerMylist.onclick = (e) => {
 };
 el.seriesMyListBtn.onclick = (e) => {
   e.stopPropagation();
-  const target = state.openMovie
-    ? { mode: "movie", id: state.openMovie.id }
-    : state.openSeries
-      ? { mode: "series", id: state.openSeries.id }
-      : null;
+  const target = openItemTarget();
   if (!target) return;
   toggleMyList(target.mode, target.id);
   refreshSeriesMyListBtn();
   refreshSeriesThumbBtns();
 };
-function seriesThumbTarget() {
-  return state.openMovie
-    ? { mode: "movie", id: state.openMovie.id }
-    : state.openSeries
-      ? { mode: "series", id: state.openSeries.id }
-      : null;
-}
 el.seriesThumbUpBtn.onclick = (e) => {
   e.stopPropagation();
-  const target = seriesThumbTarget();
+  const target = openItemTarget();
   if (!target) return;
   toggleFeedback(target.mode, target.id, "up");
   refreshSeriesThumbBtns();
 };
 el.seriesThumbDownBtn.onclick = (e) => {
   e.stopPropagation();
-  const target = seriesThumbTarget();
+  const target = openItemTarget();
   if (!target) return;
   toggleFeedback(target.mode, target.id, "down");
   refreshSeriesThumbBtns();

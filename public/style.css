@@ -528,18 +528,21 @@ main {
   gap: 8px;
 }
 #hero .hero-play:hover { background: var(--accent); color: #fff; }
+/* Box model (width/height/border/color/padding) comes from the shared
+   .act-icon class (see the showcard-actions section) — this block only
+   adds what the hero's dark image background needs on top of it: a
+   translucent fill for legibility, rounded corners to match .hero-play,
+   and glyph centering (the modal's .act-icon buttons get that for free
+   from .series-actions' flex row; the hero has no equivalent ambient
+   rule). */
 #hero .hero-thumb {
-  width: 44px; height: 44px;
   border-radius: 6px;
   background: rgba(0,0,0,0.35);
-  border: 1px solid rgba(255,255,255,0.22);
-  color: var(--fg);
   font-size: 17px;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 0;
 }
 #hero .hero-thumb:hover { border-color: var(--accent); }
 #hero .hero-thumb.on {
