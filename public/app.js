@@ -1234,7 +1234,7 @@ async function selectCategory(id, opts = {}) {
 function gridTitleFor(id) {
   if (id === PSEUDO.RECENTS) return "Recent";
   if (id === PSEUDO.FAVS) return "Favorites";
-  if (id === PSEUDO.MY_LIST) return "My List";
+  if (id === PSEUDO.MY_LIST) return "Watch Later";
   if (id === PSEUDO.ALL) {
     return state.mode === "live" ? "All channels" : state.mode === "movie" ? "All movies" : "All series";
   }
@@ -1617,7 +1617,7 @@ function renderRails() {
   // the highest-intent action on the homepage.
   const mlRaw = myListItems(mode);
   const ml = gate(mlRaw);
-  if (ml.length) rails.push({ title: "My List", items: ml.slice(0, 25), navId: PSEUDO.MY_LIST, total: mlRaw.length });
+  if (ml.length) rails.push({ title: "Watch Later", items: ml.slice(0, 25), navId: PSEUDO.MY_LIST, total: mlRaw.length });
 
   // Favorites
   const favsRaw = favoriteItems(mode);
@@ -2532,8 +2532,8 @@ function refreshPlayerFavorite() {
     el.playerMylist.classList.toggle("on", inList);
     el.playerMylist.textContent = inList ? "✓" : "+";
     el.playerMylist.title = inList
-      ? `Remove from My List (this ${target.label})`
-      : `Add to My List (this ${target.label})`;
+      ? `Remove from Watch Later (this ${target.label})`
+      : `Add to Watch Later (this ${target.label})`;
   }
 }
 
@@ -2893,7 +2893,7 @@ function renderGrid() {
     ? `Search: "${state.query}"`
     : ctxId === PSEUDO.RECENTS ? "Recently Played"
     : ctxId === PSEUDO.FAVS ? "Favorites"
-    : ctxId === PSEUDO.MY_LIST ? "My List"
+    : ctxId === PSEUDO.MY_LIST ? "Watch Later"
     : ctxId === PSEUDO.ALL ? `All ${state.mode === "movie" ? "movies" : state.mode === "series" ? "series" : "channels"}`
     : (ms().categories.find(c => String(c.category_id) === String(ctxId))?.category_name || null);
   const frag = document.createDocumentFragment();
@@ -4483,8 +4483,8 @@ function refreshSeriesMyListBtn() {
   el.seriesMyListBtn.hidden = false;
   const inList = state.myList[target.mode].has(target.id);
   el.seriesMyListBtn.classList.toggle("on", inList);
-  el.seriesMyListBtn.textContent = inList ? "✓ My List" : "+ My List";
-  el.seriesMyListBtn.title = inList ? "Remove from My List" : "Add to My List";
+  el.seriesMyListBtn.textContent = inList ? "✓ Watch Later" : "+ Watch Later";
+  el.seriesMyListBtn.title = inList ? "Remove from Watch Later" : "Add to Watch Later";
 }
 
 function closeMovie() {
