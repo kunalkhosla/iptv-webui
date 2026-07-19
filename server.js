@@ -4922,7 +4922,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       items: eligible.slice(0, 12),
     };
   };
-  const myListRail = userRail("My List",   "__mylist", userState.myList?.[mode]);
+  const myListRail = userRail("Watch Later",   "__mylist", userState.myList?.[mode]);
   const favsRail   = userRail("Favorites", "__favs",   userState.favorites?.[mode]);
   if (myListRail) rails.push(myListRail);
   if (favsRail)   rails.push(favsRail);
