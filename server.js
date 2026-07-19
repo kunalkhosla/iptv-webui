@@ -6211,13 +6211,26 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
     if (!q && ranked.length >= limit) break;
   }
   if (q) ranked.sort((a, b) => b.rank - a.rank);
-  const results = ranked.slice(0, limit).map(({ s }) => ({
-    id: s.id,
-    name: s.name,
-    icon: s.icon || null,
-    category_id: s.category_id,
-    category_name: catName.get(String(s.category_id)) || null,
-  }));
+  // Panel icon is unreliable for movie/series VOD entries (Xtream panels
+  // populate stream_icon reliably for live channel logos, but frequently
+  // leave it null/blank for VOD) — same reason /api/home and the detail
+  // screens lean on TMDB enrichment instead. This endpoint used to skip
+  // that fallback entirely, unlike /api/search/all's projectTile (which
+  // already does this exact lookup), leaving movie/series search results
+  // with blank thumbnails whenever the panel icon was empty. tmdbCache
+  // is already warmed in-memory (prewarmTmdbCache), so this is a
+  // synchronous lookup, no extra round-trip.
+  const results = ranked.slice(0, limit).map(({ s }) => {
+    const t = mode !== "live" ? tmdbCache[`${mode}:${s.id}`] : null;
+    return {
+      id: s.id,
+      name: s.name,
+      icon: s.icon || null,
+      poster: t?.poster_path ? `${TMDB_IMG_BASE}/w154${t.poster_path}` : null,
+      category_id: s.category_id,
+      category_name: catName.get(String(s.category_id)) || null,
+    };
+  });
   // EPG programme-title pass for live — same rationale as the
   // search/all pass 3: event searches match what's AIRING, not what
   // channels are named.

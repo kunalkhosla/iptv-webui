@@ -54,18 +54,24 @@ function expectFields(label, handler, fields) {
   }
 }
 
-// --- /api/search/:mode — consumed by Home Assistant's REST sensor
+// --- /api/search/:mode — consumed by Home Assistant's REST sensor,
+// and (as of the `poster` field) the Android TV app's SearchScreen.
 //
 // HA's secrets.yaml + packages/iptv.yaml expect `count` (used as
 // sensor value) and `results` (json_attributes). Each result row
 // needs at minimum id, name, icon, category_id, category_name.
+// `poster` (movie/series only, null for live) is a synchronous
+// tmdbCache lookup mirroring /api/search/all's projectTile — panel
+// `icon` is frequently blank for VOD entries, and without a poster
+// fallback the TV app's search grid showed blank thumbnails for any
+// such result.
 test("contract: /api/search/:mode returns { q, count, results }", () => {
   const h = handlerFor(/app\.get\("\/api\/search\/:mode/);
   expectFields("/api/search/:mode", h, ["q", "count", "results"]);
   // Each result row's fields — checked by literal property names
   // inside the handler's results.push(...) object.
   expectFields("/api/search/:mode result row", h, [
-    "id", "name", "icon", "category_id", "category_name", "programme",
+    "id", "name", "icon", "poster", "category_id", "category_name", "programme",
   ]);
 });
 
