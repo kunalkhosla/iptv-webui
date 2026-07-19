@@ -3290,6 +3290,24 @@ app.get("/api/download/:mode(movie|series)/:id.mp4", async (req, res) => {
     "-hide_banner", "-loglevel", "warning",
     "-fflags", "+genpts",
     "-user_agent", "Mozilla/5.0 (Linux; Android 12; Smart TV)",
+    // Same panel-flakiness problem /api/transcode already solves (see its
+    // comment near "-rw_timeout"): the panel CDN drops long-lived
+    // connections mid-transfer. Without these, a drop hits ffmpeg's input
+    // as a premature EOF — indistinguishable from a real end of file — so
+    // ffmpeg finishes cleanly (exit 0) with a TRUNCATED encode, and
+    // ff.stdout.pipe(res) closes the HTTP response normally right along
+    // with it. DownloadManager sees a well-formed, complete transfer and
+    // marks it SUCCESSFUL with a genuine non-zero byte count — not the
+    // 0-byte case DownloadsRepo's own guard already catches, a silently
+    // truncated file that LOOKS fine everywhere. This was very likely the
+    // actual cause of "downloads have never worked reliably" (any title
+    // long enough to hit one CDN drop, which per this file's own docs is
+    // routine). Do NOT add -reconnect_at_eof — see /api/transcode's
+    // comment for why that reconnect-loops forever on a genuine EOF.
+    "-rw_timeout", "15000000",
+    "-reconnect", "1",
+    "-reconnect_streamed", "1",
+    "-reconnect_delay_max", "5",
     "-i", sourceUrl,
     "-map", "0:v:0", "-map", "0:a:0?",
     "-c:v", "libx264", "-preset", "veryfast",
