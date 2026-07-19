@@ -5045,7 +5045,7 @@ function renderDiskMenu() {
     </div>
     <button type="button" data-action="episode">⬇ This episode</button>
     <button type="button" data-action="season">⬇ This whole season</button>
-    <button type="button" data-action="series">⬇ Whole series (${totalEpisodes} episodes)</button>
+    <button type="button" data-action="series">⬇ Whole series (${totalEpisodes} episode${totalEpisodes === 1 ? "" : "s"})</button>
   `;
   const seasonSel = dd.querySelector(".disk-menu-season");
   const epSel = dd.querySelector(".disk-menu-episode");

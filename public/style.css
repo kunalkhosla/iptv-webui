@@ -2432,13 +2432,19 @@ body.player-theater #search-all-view { display: none; }
 #series-disk-menu-dropdown button:hover { background: var(--bg-2); color: var(--accent); }
 .series-disk-btn:disabled { opacity: 0.55; cursor: default; }
 #series-disk-menu-dropdown .disk-menu-row {
+  /* Stacked, not side-by-side — a horizontal flex row here clipped the
+     episode <select> against the dropdown's right edge, since native
+     <select> intrinsic sizing (from its widest option, e.g. a long
+     episode title) doesn't reliably respect min-width:0/flex-shrink in
+     a narrow flex row across engines. Stacking sidesteps it entirely
+     and reads fine for long episode titles anyway. */
   display: flex;
+  flex-direction: column;
   gap: 6px;
   padding: 6px 6px 2px;
 }
 #series-disk-menu-dropdown .disk-menu-row select {
-  flex: 1;
-  min-width: 0;
+  width: 100%;
   background: var(--bg-2);
   color: var(--fg);
   border: 1px solid var(--line);
