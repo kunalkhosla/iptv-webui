@@ -1467,6 +1467,29 @@ main {
 }
 .channel:hover .cw-hide { opacity: 1; }
 .channel .cw-hide:hover { color: #fff; background: rgba(220, 38, 38, 0.85); }
+/* "Seen it, not now" clock overlay — For You rail tiles only. Same
+   top-left slot as .cw-hide: the two flags (hideable / snoozable) are
+   set by different rails (Continue Watching / For You) and never both
+   true on the same tile, so there's no collision reusing the position. */
+.channel .snooze-fy {
+  position: absolute;
+  top: 6px; left: 6px;
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.55);
+  border: 0;
+  display: grid; place-items: center;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--fg-dim);
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  z-index: 3;
+  padding: 0;
+}
+.channel:hover .snooze-fy { opacity: 1; }
+.channel .snooze-fy:hover { color: var(--accent); background: rgba(0,0,0,0.75); }
 .channel .progress-bar {
   position: absolute;
   left: 0; right: 0; bottom: 0;

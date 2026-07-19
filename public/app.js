@@ -32,6 +32,12 @@ const state = {
   // per-mode Set groups; up/down are mutually exclusive per id. Mirrors
   // favorites; pushed to the server via pushUserState (userState.feedback).
   feedback:  { up: byMode(() => new Set()), down: byMode(() => new Set()) },
+  // "Seen it, not now" — temporary For You exclusion, id -> expiresAtMs
+  // per mode (plain object, not a Set, since it carries a value not just
+  // membership). Mirrors lastPlayed's shape. Pushed via pushUserState
+  // (userState.seenSnooze); server-side expiry check lives in
+  // tasteSignalFor, client-side in renderHome's snoozable-rail filter.
+  seenSnooze: byMode(() => ({})),
   recents:   byMode(() => []),
   // Server-side last-played map by mode → { id: timestamp_ms }. Hydrated
   // from /api/bootstrap so it's shared across browsers and survives a
@@ -554,6 +560,9 @@ async function bootstrap() {
         state.feedback.up[m] = new Set((fu || []).map(toNum));
         const fd = u.feedback?.down && Array.isArray(u.feedback.down[m]) ? u.feedback.down[m] : null;
         state.feedback.down[m] = new Set((fd || []).map(toNum));
+        // Same "server is the sole source" hydration as feedback above.
+        const ss = u.seenSnooze?.[m] && typeof u.seenSnooze[m] === "object" ? u.seenSnooze[m] : null;
+        state.seenSnooze[m] = ss || {};
         const rs = u.recents && Array.isArray(u.recents[m]) ? u.recents[m] : null;
         if (rs && rs.length) {
           state.recents[m] = rs.map(toNum);
@@ -1593,7 +1602,19 @@ function renderRails() {
   const serverHome = state.home[mode];
   if (serverHome && Array.isArray(serverHome.rails) && serverHome.rails.length) {
     for (const r of serverHome.rails) {
-      const items = gate(r.items || []);
+      let items = gate(r.items || []);
+      // "Seen it, not now" — only meaningful on the recommendation rail
+      // (r.snoozable), and unlike thumbs-down's `gate()` above, this is
+      // scoped to just this one rail rather than every rail: the viewer
+      // liked the title, they just don't want THIS SURFACE re-suggesting
+      // it right now — it should still show up in a category/browse rail.
+      if (r.snoozable) {
+        const snoozed = state.seenSnooze?.[mode];
+        if (snoozed && Object.keys(snoozed).length) {
+          const now = Date.now();
+          items = items.filter(s => !(snoozed[s.id] > now));
+        }
+      }
       if (!items.length) continue;
       el.rails.appendChild(renderRail({
         title: r.title,
@@ -1601,6 +1622,7 @@ function renderRails() {
         navId: r.category_id || null,
         total: r.total ?? items.length,
         blurb: r.blurb || null,
+        snoozable: r.snoozable,
       }));
     }
     return;
@@ -1725,7 +1747,7 @@ function renderBrowseChipStrip(mode) {
   return bar;
 }
 
-function renderRail({ title, items, navId, total, hideable, onSeeAll, blurb }) {
+function renderRail({ title, items, navId, total, hideable, onSeeAll, blurb, snoozable }) {
   const sec = document.createElement("section");
   sec.className = "rail";
 
@@ -1767,7 +1789,7 @@ function renderRail({ title, items, navId, total, hideable, onSeeAll, blurb }) {
   // why a title is on their home — useful when a kids profile sees
   // something it shouldn't, or when filter chips are unexpectedly
   // including / excluding things.
-  for (const s of items) track.appendChild(channelCard(s, { reason: title, hideable }));
+  for (const s of items) track.appendChild(channelCard(s, { reason: title, hideable, snoozable }));
 
   sec.append(header, track);
   return sec;
@@ -2991,6 +3013,7 @@ function channelCard(s, opts = {}) {
     if (e.target.classList.contains("star")) return;
     if (e.target.classList.contains("thumb")) return;
     if (e.target.classList.contains("cw-hide")) return;
+    if (e.target.classList.contains("snooze-fy")) return;
     if (cardMode === "series") openSeries(s);
     else if (cardMode === "movie") openMovie(s, "movie");
     else if (cardMode === "disk") openMovie(s, "disk");
@@ -3014,6 +3037,27 @@ function channelCard(s, opts = {}) {
       removeRecent(cardMode, s.id);
     };
     card.appendChild(hide);
+  }
+
+  // "Seen it, not now" — For You rail only (opts.snoozable, set by
+  // renderHome's server-rails loop for the one rail the server tags
+  // snoozable:true). Distinct from thumbs-down: this is a SOFT, TEMPORARY
+  // exclusion (SEEN_SNOOZE_DAYS) — the viewer liked the title, they just
+  // don't want THIS rail re-suggesting it for a while. Live has no
+  // recommendation rail, so no live-mode gate needed here (opts.snoozable
+  // is simply never set for live tiles).
+  if (opts.snoozable) {
+    const snooze = document.createElement("button");
+    snooze.type = "button";
+    snooze.className = "snooze-fy";
+    snooze.title = "Seen it — don't suggest again for a while";
+    snooze.setAttribute("aria-label", `Snooze ${s.name} from For You`);
+    snooze.textContent = "🕒";
+    snooze.onclick = (e) => {
+      e.stopPropagation();
+      snoozeForYou(cardMode, s.id);
+    };
+    card.appendChild(snooze);
   }
 
   const logo = document.createElement("div");
@@ -3281,6 +3325,21 @@ function toggleFeedbackFromHero(mode, id, dir) {
   else { on.add(id); off.delete(id); }
   renderRails();
   pushUserState();
+}
+
+// "Seen it, not now" — see the state.seenSnooze / server tasteSignalFor
+// comments for the full rationale (soft + temporary vs thumbs-down's
+// permanent + AI-negative-signal exclusion). renderRails() (not
+// refreshView()/full home rebuild) matches the chip-strip pattern —
+// this only ever fires from the home rails column (For You is never
+// part of the hero), so there's no hero-position to preserve here the
+// way the hero-thumb click handler has to.
+const SEEN_SNOOZE_DAYS = 90;
+function snoozeForYou(mode, id) {
+  state.seenSnooze[mode][id] = Date.now() + SEEN_SNOOZE_DAYS * 86400000;
+  renderRails();
+  pushUserState();
+  toast(`Won't suggest this again for ${SEEN_SNOOZE_DAYS} days`, 2500);
 }
 
 function pushRecent(mode, id) {
@@ -3636,6 +3695,11 @@ function pushUserState() {
           series: [...state.feedback.down.series],
           disk:   [...state.feedback.down.disk],
         },
+      },
+      seenSnooze: {
+        movie:  state.seenSnooze.movie,
+        series: state.seenSnooze.series,
+        disk:   state.seenSnooze.disk,
       },
       recents:    state.recents,
       watched:    [...state.watched],

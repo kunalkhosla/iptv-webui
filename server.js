@@ -1881,6 +1881,27 @@ function pickModeBuckets(src, fallback, cap) {
   }
   return o;
 }
+// Same idea as emptyModeBuckets/pickModeBuckets but for id -> value maps
+// (seenSnooze: id -> expiresAtMs) rather than arrays.
+function emptyModeObjects() {
+  const o = {};
+  for (const m of MODE_KEYS) o[m] = {};
+  return o;
+}
+function pickModeObjects(src, fallback, cap) {
+  const o = {};
+  for (const m of MODE_KEYS) {
+    if (src?.[m] && typeof src[m] === "object" && !Array.isArray(src[m])) {
+      const entries = Object.entries(src[m])
+        .filter(([id, v]) => /^\d+$/.test(id) && Number.isFinite(v))
+        .slice(0, cap || 5000);
+      o[m] = Object.fromEntries(entries);
+    } else {
+      o[m] = fallback?.[m] || {};
+    }
+  }
+  return o;
+}
 function emptyUserState() {
   return {
     favorites: emptyModeBuckets(),
@@ -1890,6 +1911,16 @@ function emptyUserState() {
     // `up` counts as a positive like a favorite. Mutually exclusive per
     // id (client enforces); live bucket is unused (thumbs are VOD-only).
     feedback:  { up: emptyModeBuckets(), down: emptyModeBuckets() },
+    // "Seen it, not now" — a SOFTER, TEMPORARY exclusion than
+    // feedback.down: the viewer liked the title, just doesn't want it
+    // re-recommended for a while. Duration (SEEN_SNOOZE_DAYS, 90) is a
+    // client-side constant (public/app.js) — the server just trusts
+    // whatever expiresAtMs the client computed and pushed, same trust
+    // model as every other userState field. Unlike thumbs-down it's
+    // mode:id -> expiresAtMs (not an array), is never sent to Claude as
+    // a "disliked" signal, and only affects the For You candidate pool
+    // — never hides the title from browse/search.
+    seenSnooze: emptyModeObjects(),
     recents:   emptyModeBuckets(),
     watched:   [],
     lastEpisode: {},
@@ -1920,6 +1951,7 @@ function normalizeUserState(d) {
       up:   pickModeBuckets(d.feedback.up,   emptyModeBuckets()),
       down: pickModeBuckets(d.feedback.down, emptyModeBuckets()),
     } : e.feedback,
+    seenSnooze: pickModeObjects(d?.seenSnooze, e.seenSnooze),
     recents:   pickModeBuckets(d?.recents, e.recents),
     watched:     Array.isArray(d?.watched)         ? d.watched         : e.watched,
     lastEpisode: d?.lastEpisode && typeof d.lastEpisode === "object" ? d.lastEpisode : e.lastEpisode,
@@ -5169,6 +5201,10 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
           title: "For You",
           total: fyTiles.length,
           items: fyTiles.slice(0, 20),
+          // Client-side flag: only this rail's tiles get the "seen it,
+          // not now" affordance — it's a recommendation-snooze concept,
+          // meaningless on a plain browse/category rail.
+          snoozable: true,
         });
       }
     }
@@ -5911,6 +5947,9 @@ app.put("/api/user-state", express.json({ limit: "256kb" }), (req, res) => {
         }
       }
     }
+  }
+  if (b.seenSnooze && typeof b.seenSnooze === "object") {
+    userState.seenSnooze = pickModeObjects(b.seenSnooze, userState.seenSnooze);
   }
   if (b.recents && typeof b.recents === "object") {
     for (const m of MODE_KEYS) {
@@ -7236,6 +7275,18 @@ function tasteSignalFor(state, mode, cap = 40) {
     const genres = Array.isArray(t?.genres) && t.genres.length ? ` — ${t.genres.join("/")}` : "";
     const lang = t?.original_language ? ` [${t.original_language}]` : "";
     disliked.push(`${s.name} (${t?.year || s.year || "?"})${genres}${lang}`);
+  }
+  // "Seen it, not now" — a softer, TEMPORARY exclusion (see
+  // emptyUserState's seenSnooze comment). Only mechanically drops the
+  // id from the candidate pool for as long as it hasn't expired; unlike
+  // thumbs-down it's never surfaced to Claude as a "disliked" signal —
+  // the viewer liked it, they just don't want it re-picked right now.
+  const now = Date.now();
+  for (const [rawId, expiresAt] of Object.entries(state.seenSnooze?.[mode] || {})) {
+    if (expiresAt <= now) continue;
+    excludeIds.add(String(rawId));
+    const n = parseInt(rawId, 10);
+    if (Number.isFinite(n)) excludeIds.add(String(n));
   }
   const signal = [];
   for (const id of ids) {

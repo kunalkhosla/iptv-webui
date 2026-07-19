@@ -228,3 +228,19 @@ test("contract: userState carries a `feedback` store the PUT accepts", () => {
     throw new Error("PUT /api/user-state no longer accepts `feedback` — clients push thumbs through it");
   }
 });
+
+// --- userState.seenSnooze — the "seen it, not now" store (temporary,
+// mode:id -> expiresAtMs; distinct from feedback.down, which is
+// permanent and AI-negative-signal). Web-only today.
+test("contract: userState carries a `seenSnooze` store the PUT accepts", () => {
+  const src = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "server.js"), "utf8");
+  if (!/seenSnooze:\s*emptyModeObjects\(\)/.test(src)) {
+    throw new Error("emptyUserState() no longer seeds `seenSnooze` — clients read userState.seenSnooze");
+  }
+  const put = handlerFor(/app\.put\("\/api\/user-state/);
+  assert.ok(put, "PUT /api/user-state handler not found");
+  if (!/b\.seenSnooze\b/.test(put)) {
+    throw new Error("PUT /api/user-state no longer accepts `seenSnooze` — the client pushes snoozes through it");
+  }
+});
