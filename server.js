@@ -4861,10 +4861,15 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       // Emit up to 100 so the See-all grid actually shows all the
       // recently-added titles. Rail track is horizontally scrollable
       // and the home payload stays bounded by RECENTLY_ADDED_DAYS.
+      // total must be the PRE-slice count — clients gate "See all" on
+      // total > items.size, so using slice.length here (the post-slice
+      // count) made total == items.length always true, and the "See
+      // all" link never appeared no matter how many recently-added
+      // items actually existed beyond the visible rail row.
       const slice = recentTiles.slice(0, 100);
       rails.push({
         title: "Recently Added",
-        total: slice.length,
+        total: recentTiles.length,
         items: slice,
       });
     }
