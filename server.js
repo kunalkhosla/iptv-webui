@@ -1406,6 +1406,58 @@ function cleanPanelTitle(name, opts = {}) {
   return s;
 }
 
+// Fallback dedup key for a duplicate pair that hasn't (yet, or ever)
+// resolved a shared tmdb_id — the panel lists the same film twice under
+// different categories with different stream ids, and TMDB enrichment
+// runs per stream id, so a race or a permanent no-match can leave one
+// twin blank while the other has full metadata. Every seenTmdb/dedup
+// call site below also checks this so an un-enriched duplicate can't
+// silently bypass dedup just because it has no tmdb_id yet to collide
+// on. cleanPanelTitle already strips language/quality bracket tags
+// ("Movie Name (Hindi)" -> "Movie Name"), so most real duplicates
+// collapse to the same key without any extra normalization here — EXCEPT
+// a dot-separated filename twin ("The.Gift.2015.1080p"): cleanPanelTitle's
+// dot-collapse only fires before a NON-digit (it has to preserve decimals
+// like "9.5" in a title), so ".2015" stays glued to the title and never
+// matches its parenthesized-style duplicate ("The Gift (2015)"). Verified
+// via manual node -e sanity check before shipping — this is exactly the
+// "Title.YYYY.quality" convention findTmdbMatch's own loose cleanup pass
+// exists to handle (see the strict/loose retry there); pull the year out
+// as a token match (dot OR space delimited, not just parens) and strip
+// dots more aggressively here, since this key is dedup-only and never
+// sent to TMDB (unlike cleanPanelTitle's output).
+function dedupTitleKey(name) {
+  const raw = String(name || "");
+  const yearMatch = raw.match(/\((19|20)\d{2}\)/) || raw.match(/[.\s](19|20)\d{2}(?=[.\s]|$)/);
+  const year = yearMatch ? yearMatch[0].replace(/[()\s.]/g, "") : "";
+  const cleaned = cleanPanelTitle(raw)
+    .replace(/\b(19|20)\d{2}\b/g, " ")
+    // Apostrophes drop out entirely (no space) so "It's" and "Its"
+    // converge, not diverge into "it s" vs "its".
+    .replace(/['’]/g, "")
+    // Remaining punctuation that differs between a dot-filename twin
+    // (which never carries it) and a "clean" title twin (which might —
+    // a colon subtitle separator, etc.) — e.g. "Avatar.The.Way.of.Water"
+    // vs "Avatar: The Way of Water" only differ by the colon. Strip
+    // everything but letters/digits/marks/spaces for this key. \p{M}
+    // (not just \p{L}\p{N}) is required — Devanagari/Bengali/Gurmukhi
+    // vowel signs are combining-mark codepoints, several of them \p{Mc}
+    // (spacing mark) rather than \p{L}, so \p{L}\p{N} alone silently
+    // shredded Hindi/Bengali titles into disconnected letter fragments
+    // ("शोले" -> "श ले") — caught via manual testing against this
+    // catalog's actual language mix before shipping, not a hypothetical.
+    .replace(/[^\p{L}\p{N}\p{M}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  // A blank/unparseable name would otherwise collapse every such item
+  // onto the same "|" key, silently hiding all but the first — return
+  // null so call sites skip the title check for these instead (falling
+  // back to tmdb_id-only dedup, or none, which never merges wrongly).
+  if (!cleaned) return null;
+  return `${cleaned}|${year}`;
+}
+
 async function findTmdbMatch(mode, name, hintYear, langHint) {
   const action = mode === "movie" ? "/search/movie" : "/search/tv";
   // Effective release year. The panel's movie list usually has NO year
@@ -4543,17 +4595,23 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
         return isKidCategory;
       });
     }
-    // Walk the bucket dedup'ing by tmdb_id; track the eligible total
-    // (post-filter, post-dedup) so the client can show "12 of 87"
-    // counts on each rail. Cap the visible window at 12.
+    // Walk the bucket dedup'ing by tmdb_id (falling back to title+year
+    // when tmdb_id hasn't landed for one twin yet — see dedupTitleKey);
+    // track the eligible total (post-filter, post-dedup) so the client
+    // can show "12 of 87" counts on each rail. Cap the visible window
+    // at 12.
     const seenTmdb = new Set();
+    const seenTitle = new Set();
     const out = [];
     let totalEligible = 0;
     for (const s of bucket) {
+      const titleKey = dedupTitleKey(s.name);
+      if (titleKey && seenTitle.has(titleKey)) continue;
       if (s.tmdb_id) {
         if (seenTmdb.has(s.tmdb_id)) continue;
         seenTmdb.add(s.tmdb_id);
       }
+      if (titleKey) seenTitle.add(titleKey);
       totalEligible++;
       if (out.length < 12) out.push(s);
     }
@@ -5147,13 +5205,17 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // otherwise land in the pool once per category and unfairly dominate
   // the shuffle. Mirrors the seenTmdb pattern rails already use above.
   const seenTmdb = new Set();
+  const seenTitle = new Set();
   const heroPool = [];
   for (const items of byCat.values()) {
     for (const s of items.slice(0, 5)) {
       if (seen.has(s.id) || !s.icon) continue;
+      const titleKey = dedupTitleKey(s.name);
+      if (titleKey && seenTitle.has(titleKey)) continue;
       if (s.tmdb_id && seenTmdb.has(s.tmdb_id)) continue;
       if (isAdultForHero(s)) { seen.add(s.id); continue; }
       heroPool.push(s); seen.add(s.id);
+      if (titleKey) seenTitle.add(titleKey);
       if (s.tmdb_id) seenTmdb.add(s.tmdb_id);
     }
   }
@@ -5843,6 +5905,7 @@ app.get("/api/search/all", async (req, res, next) => {
     const isKidBlocked = mode === "live" ? () => false : kidBlocker;
     const seenTmdb = new Set();
     const seenIds = new Set();
+    const seenTitle = new Set();
     const results = [];
     const projectTile = (s) => {
       const t = mode !== "live" ? tmdbCache[`${mode}:${s.id}`] : null;
@@ -5863,10 +5926,16 @@ app.get("/api/search/all", async (req, res, next) => {
     const eligible = (s) => {
       if (!titleLangPasses(s.name)) return false;
       if (isKidBlocked(s)) return false;
+      // Title+year fallback — catches a duplicate before it has a
+      // tmdb_id to dedup on, or when two duplicates' tmdb_id lookups
+      // haven't converged yet. See dedupTitleKey.
+      const titleKey = dedupTitleKey(s.name);
+      if (titleKey && seenTitle.has(titleKey)) return false;
       if (s.tmdb_id) {
         if (seenTmdb.has(s.tmdb_id)) return false;
         seenTmdb.add(s.tmdb_id);
       }
+      if (titleKey) seenTitle.add(titleKey);
       if (seenIds.has(s.id)) return false;
       seenIds.add(s.id);
       return true;
@@ -5963,10 +6032,13 @@ app.get("/api/search/all", async (req, res, next) => {
         if (!Array.isArray(t.genres) || !t.genres.includes(matchedGenre)) continue;
         if (!titleLangPasses(s.name)) continue;
         if (isKidBlocked(s)) continue;
+        const titleKey = dedupTitleKey(s.name);
+        if (titleKey && seenTitle.has(titleKey)) continue;
         if (s.tmdb_id) {
           if (seenTmdb.has(s.tmdb_id)) continue;
           seenTmdb.add(s.tmdb_id);
         }
+        if (titleKey) seenTitle.add(titleKey);
         tagged.push({ s, vc: t.vote_count || 0 });
       }
       tagged.sort((a, b) => b.vc - a.vc);
@@ -6297,12 +6369,21 @@ app.get("/api/:mode(live|movie|series|disk)/streams", async (req, res, next) => 
         ? all.filter(s => s.category_id === catId)
         : (allowedCatIds ? all.filter(s => allowedCatIds.has(String(s.category_id))) : all);
       const seenTmdb = new Set();
+      const seenTitle = new Set();
       const deduped = catFiltered.filter(s => {
         if (!titleLangPasses(s.name)) return false;
         if (isKidBlocked(s)) return false;
-        if (!s.tmdb_id) return true;
-        if (seenTmdb.has(s.tmdb_id)) return false;
-        seenTmdb.add(s.tmdb_id);
+        // Title+year fallback catches the twin BEFORE it ever gets a
+        // tmdb_id to collide on (see dedupTitleKey) — checked first so
+        // an un-enriched duplicate of an already-kept enriched item is
+        // rejected too, not just the reverse.
+        const titleKey = dedupTitleKey(s.name);
+        if (titleKey && seenTitle.has(titleKey)) return false;
+        if (s.tmdb_id) {
+          if (seenTmdb.has(s.tmdb_id)) return false;
+          seenTmdb.add(s.tmdb_id);
+        }
+        if (titleKey) seenTitle.add(titleKey);
         return true;
       });
       if (hasPaging) {
