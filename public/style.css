@@ -528,6 +528,24 @@ main {
   gap: 8px;
 }
 #hero .hero-play:hover { background: var(--accent); color: #fff; }
+#hero .hero-thumb {
+  width: 44px; height: 44px;
+  border-radius: 6px;
+  background: rgba(0,0,0,0.35);
+  border: 1px solid rgba(255,255,255,0.22);
+  color: var(--fg);
+  font-size: 17px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+#hero .hero-thumb:hover { border-color: var(--accent); }
+#hero .hero-thumb.on {
+  background: rgba(var(--accent-rgb), 0.22);
+  border-color: rgba(var(--accent-rgb), 0.6);
+}
 
 #hero .hero-dots {
   position: absolute;
@@ -2442,6 +2460,10 @@ body.player-theater #search-all-view { display: none; }
 }
 .series-mylist-btn.on:hover {
   background: rgba(var(--accent-rgb), 0.28);
+}
+.series-thumb-btn.on {
+  background: rgba(var(--accent-rgb), 0.18);
+  border-color: rgba(var(--accent-rgb), 0.55);
 }
 .series-play-btn .play-sub {
   font-weight: 500;

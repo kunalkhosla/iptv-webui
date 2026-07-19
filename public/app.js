@@ -249,6 +249,8 @@ const el = {
   seriesPlot: document.getElementById("series-plot"),
   seriesPlayBtn: document.getElementById("series-play-btn"),
   seriesMyListBtn: document.getElementById("series-mylist-btn"),
+  seriesThumbUpBtn: document.getElementById("series-thumb-up-btn"),
+  seriesThumbDownBtn: document.getElementById("series-thumb-down-btn"),
   seriesPosterMenuBtn: document.getElementById("series-poster-menu"),
   seriesPosterMenuDropdown: document.getElementById("series-poster-menu-dropdown"),
   seriesTagline:     document.getElementById("series-tagline"),
@@ -1385,6 +1387,8 @@ function renderHero() {
       <p class="hero-plot"></p>
       <div class="hero-actions">
         <button type="button" class="hero-play">Play</button>
+        <button type="button" class="hero-thumb up" title="More like this" aria-label="More like this">👍</button>
+        <button type="button" class="hero-thumb down" title="Not for me" aria-label="Not for me">👎</button>
       </div>
     </div>
     <div class="hero-dots"></div>`;
@@ -1530,6 +1534,18 @@ function paintHero(pick) {
     if (state.mode === "series") openSeries(pick);
     else play(state.mode, pick);
   };
+
+  // Thumbs — hero is always movie/series (renderHero bails on live),
+  // so no cardMode gate needed here like channelCard() has.
+  const heroUp = el.hero.querySelector(".hero-thumb.up");
+  const heroDown = el.hero.querySelector(".hero-thumb.down");
+  const syncHeroThumbs = () => {
+    heroUp.classList.toggle("on", state.feedback.up[state.mode].has(pick.id));
+    heroDown.classList.toggle("on", state.feedback.down[state.mode].has(pick.id));
+  };
+  syncHeroThumbs();
+  heroUp.onclick = (e) => { e.stopPropagation(); toggleFeedback(state.mode, pick.id, "up"); syncHeroThumbs(); };
+  heroDown.onclick = (e) => { e.stopPropagation(); toggleFeedback(state.mode, pick.id, "down"); syncHeroThumbs(); };
 }
 
 function renderRails() {
@@ -4399,6 +4415,7 @@ async function openMovie(s, mode = "movie") {
   el.seriesPlot.textContent = s.plot || "";
   setMoviePlayButton(s);
   refreshSeriesMyListBtn();
+  refreshSeriesThumbBtns();
   updateUrl({ push: true });
   // Kick off TMDB enrichment in parallel with the panel info fetch —
   // either can finish first, the helper merges into state.openMovie.
@@ -4487,6 +4504,23 @@ function refreshSeriesMyListBtn() {
   el.seriesMyListBtn.title = inList ? "Remove from Watch Later" : "Add to Watch Later";
 }
 
+// Sync the detail-modal thumbs to whichever item is open. Same
+// target-resolution shape as refreshSeriesMyListBtn(); called from the
+// same spots. Live has no detail modal, so no cardMode gate needed.
+function refreshSeriesThumbBtns() {
+  if (!el.seriesThumbUpBtn || !el.seriesThumbDownBtn) return;
+  const target = state.openMovie
+    ? { mode: "movie", id: state.openMovie.id }
+    : state.openSeries
+      ? { mode: "series", id: state.openSeries.id }
+      : null;
+  if (!target) { el.seriesThumbUpBtn.hidden = true; el.seriesThumbDownBtn.hidden = true; return; }
+  el.seriesThumbUpBtn.hidden = false;
+  el.seriesThumbDownBtn.hidden = false;
+  el.seriesThumbUpBtn.classList.toggle("on", state.feedback.up[target.mode].has(target.id));
+  el.seriesThumbDownBtn.classList.toggle("on", state.feedback.down[target.mode].has(target.id));
+}
+
 function closeMovie() {
   el.seriesPanel.hidden = true;
   el.seriesPanel.removeAttribute("data-mode");
@@ -4528,6 +4562,7 @@ async function openSeries(s) {
   el.seriesSeasonSelect.innerHTML = "";
   el.seriesEpisodes.innerHTML = `<div class="empty">Loading episodes…</div>`;
   refreshSeriesMyListBtn();
+  refreshSeriesThumbBtns();
   updateUrl({ push: true });
   // Kick off TMDB enrichment in parallel with the panel info fetch.
   applyTmdbToDetail("series", s);
@@ -6304,6 +6339,28 @@ el.seriesMyListBtn.onclick = (e) => {
   if (!target) return;
   toggleMyList(target.mode, target.id);
   refreshSeriesMyListBtn();
+  refreshSeriesThumbBtns();
+};
+function seriesThumbTarget() {
+  return state.openMovie
+    ? { mode: "movie", id: state.openMovie.id }
+    : state.openSeries
+      ? { mode: "series", id: state.openSeries.id }
+      : null;
+}
+el.seriesThumbUpBtn.onclick = (e) => {
+  e.stopPropagation();
+  const target = seriesThumbTarget();
+  if (!target) return;
+  toggleFeedback(target.mode, target.id, "up");
+  refreshSeriesThumbBtns();
+};
+el.seriesThumbDownBtn.onclick = (e) => {
+  e.stopPropagation();
+  const target = seriesThumbTarget();
+  if (!target) return;
+  toggleFeedback(target.mode, target.id, "down");
+  refreshSeriesThumbBtns();
 };
 el.seriesPlayBtn.onclick = () => {
   if (state.openMovie) {
