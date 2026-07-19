@@ -2866,26 +2866,51 @@ function diskDownloadSafeName(s) {
 function diskDownloadDestPath(rootPath, job) {
   const dir = path.join(rootPath, "Downloads");
   fs.mkdirSync(dir, { recursive: true });
+  // year goes through the same sanitizer as title/seriesTitle/episodeTitle
+  // — all four are client-supplied (POST /api/disk-download body) and
+  // land raw in a real filesystem path. Missing this on `year` alone was
+  // a live path-traversal hole: a body like
+  // {year: "2020)/../../../../etc/cron.d/evil"} survived into the
+  // template literal untouched and path.join() happily normalized the
+  // embedded "../" segments outside `dir`.
+  const year = diskDownloadSafeName(job.year || "");
   let filename;
   if (job.mode === "movie") {
-    filename = diskDownloadSafeName(job.title) + (job.year ? ` (${job.year})` : "");
+    filename = diskDownloadSafeName(job.title) + (year ? ` (${year})` : "");
   } else {
     const season = String(job.season || 0).padStart(2, "0");
     const ep = String(job.episodeNum || 0).padStart(2, "0");
     filename = `${diskDownloadSafeName(job.seriesTitle)} S${season}E${ep}`
       + (job.episodeTitle ? ` - ${diskDownloadSafeName(job.episodeTitle)}` : "")
-      + (job.year ? ` (${job.year})` : "");
+      + (year ? ` (${year})` : "");
   }
-  return path.join(dir, `${filename}.${job.ext}`);
+  const dest = path.join(dir, `${filename}.${job.ext}`);
+  // Defense-in-depth containment check, matching the pattern the disk
+  // media routes already use (see CLAUDE.md: "containment-check the
+  // absolute path under the account's configured root") — belt-and-
+  // braces in case any future field lands in `filename` unsanitized the
+  // way `year` just was.
+  const resolved = path.resolve(dest);
+  if (!resolved.startsWith(path.resolve(dir) + path.sep)) {
+    throw new Error(`refusing to write outside Downloads dir: ${resolved}`);
+  }
+  return resolved;
 }
 
 // job: { mode, id, title, year, seriesTitle?, season?, episodeNum?,
 //        episodeTitle? } — enough to resolve the source URL and name the
 // destination file. Returns the new job's id.
 function enqueueDiskDownload(job) {
-  const id = crypto.randomUUID();
-  diskDownloadJobs.set(id, {
-    id,
+  const jobId = crypto.randomUUID();
+  // jobId (this queue entry's own tracking id) is a DIFFERENT thing from
+  // job.id (the panel's movie/episode content id, already present on the
+  // spread-in `job` spec) — spreading `job` last previously clobbered a
+  // same-named `id` field with the content id, silently breaking any
+  // future correlation between "the id POST /api/disk-download returned"
+  // and "the id this job shows up under in GET .../jobs". Named distinctly
+  // so the spread can never collide.
+  diskDownloadJobs.set(jobId, {
+    jobId,
     status: "queued",
     createdAt: Date.now(),
     bytesWritten: 0,
@@ -2894,7 +2919,7 @@ function enqueueDiskDownload(job) {
     ...job,
   });
   processDiskDownloadQueue().catch((e) => console.warn(`[disk-download] queue error: ${e.message}`));
-  return id;
+  return jobId;
 }
 
 // Downloads only run overnight (default 1–6 AM) rather than competing
@@ -2906,8 +2931,17 @@ function enqueueDiskDownload(job) {
 // New_York), not server-local — the container runs in UTC (confirmed
 // on hestia), so a naive Date().getHours() would silently pick the
 // wrong 5-hour block.
-const DISK_DOWNLOAD_WINDOW_START_HOUR = Number(process.env.DISK_DOWNLOAD_WINDOW_START_HOUR ?? 1);
-const DISK_DOWNLOAD_WINDOW_END_HOUR = Number(process.env.DISK_DOWNLOAD_WINDOW_END_HOUR ?? 6);
+// Number(badString) is NaN, and every comparison against NaN is false —
+// a typo'd env value (e.g. "1am" instead of "1") would otherwise make
+// isDiskDownloadWindowOpen() return false forever with zero error
+// surfaced anywhere; jobs would just sit "queued" indefinitely. Falls
+// back to the same default a missing/empty value would use.
+function diskDownloadWindowHour(envVal, fallback) {
+  const n = Number(envVal);
+  return Number.isFinite(n) && n >= 0 && n <= 23 ? n : fallback;
+}
+const DISK_DOWNLOAD_WINDOW_START_HOUR = diskDownloadWindowHour(process.env.DISK_DOWNLOAD_WINDOW_START_HOUR, 1);
+const DISK_DOWNLOAD_WINDOW_END_HOUR = diskDownloadWindowHour(process.env.DISK_DOWNLOAD_WINDOW_END_HOUR, 6);
 const DISK_DOWNLOAD_WINDOW_TZ = process.env.DISK_DOWNLOAD_WINDOW_TZ || "America/New_York";
 const DISK_DOWNLOAD_WINDOW_POLL_MS = 5 * 60_000;
 
@@ -2955,12 +2989,12 @@ async function runDiskDownloadJob(job) {
   if (free != null && free < DISK_DOWNLOAD_MIN_FREE_BYTES) {
     job.status = "failed";
     job.error = `disk almost full (${(free / 1024 / 1024 / 1024).toFixed(1)} GB free, need ${DISK_DOWNLOAD_MIN_FREE_BYTES / 1024 / 1024 / 1024} GB headroom)`;
-    console.warn(`[disk-download] ${job.id} refused: ${job.error}`);
+    console.warn(`[disk-download] ${job.jobId} (content id ${job.id}) refused: ${job.error}`);
     return;
   }
 
   job.status = "downloading";
-  const { sourceUrl, ext, error: probeErr } = await resolveDownloadSourceUrl(job.mode, job.id);
+  const { sourceUrl, ext, error: probeErr } = await resolveDownloadSourceUrl(job.mode, job.id, ownerAccount);
   if (!sourceUrl) {
     job.status = "failed";
     job.error = `source unavailable: ${probeErr}`;
@@ -2970,10 +3004,16 @@ async function runDiskDownloadJob(job) {
   const destPath = diskDownloadDestPath(rootPath, job);
   const tmpPath = `${destPath}.part`;
 
-  const owner = `disk-download:${job.id}`;
-  const accountKey = accountKeyOf(ownerAccount);
+  const owner = `disk-download:${job.jobId}`;
 
   while (true) {
+    // Recomputed fresh every iteration (not hoisted above the loop) so a
+    // panel failover mid-download (pickPanel switching ownerAccount.host)
+    // self-heals within one retry cycle — real viewer traffic recomputes
+    // this per-request too (see /api/proxy, /api/transcode), so a stale
+    // cached accountKey here would silently split the download and a
+    // real viewer into two independent cap=1 budgets after a failover.
+    const accountKey = accountKeyOf(ownerAccount);
     // admitStream()'s eviction rule is "newest wins, oldest gets evicted"
     // — correct for two real viewers (whoever just pressed play should
     // win over a stale session), but WRONG for this job: if a real
@@ -2991,6 +3031,8 @@ async function runDiskDownloadJob(job) {
     const slotHeld = [...streams.entries()]
       .some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced);
     if (slotHeld) {
+      job.status = "paused";
+      job.pausedReason = "slot-held";
       await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS));
       continue;
     }
@@ -3001,12 +3043,14 @@ async function runDiskDownloadJob(job) {
     };
     const admission = admitStream(owner, job.mode, job.id, killer, accountKey);
     if (!admission.ok) {
-      // Displaced before we even started this attempt (shouldn't happen —
-      // we just registered — but handle it the same way as a mid-transfer
-      // displacement: back off and retry).
+      // Our own prior registration is still tagged displaced (the
+      // streams-map reaper hasn't cleared it yet) — same "waiting for
+      // the slot" state as slotHeld above, not actively downloading.
+      job.status = "paused";
       await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS));
       continue;
     }
+    job.status = "downloading";
 
     let startByte = 0;
     try { startByte = fs.statSync(tmpPath).size; } catch {}
@@ -3060,7 +3104,7 @@ async function runDiskDownloadJob(job) {
       job.finishedAt = Date.now();
       dropStreamKiller(owner, killer);
       streams.delete(owner);
-      console.log(`[disk-download] ${job.id} done → ${destPath} (${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB)`);
+      console.log(`[disk-download] ${job.jobId} done → ${destPath} (${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB)`);
       try {
         await buildDiskIndex(ownerAccount, rootPath);
         prewarmTmdbCache("disk", ownerAccount).catch(() => {});
@@ -3074,10 +3118,15 @@ async function runDiskDownloadJob(job) {
         // Loop back: re-admit once the slot frees (streams' idle reaper
         // or the viewer's own session ending clears it), resuming via
         // Range from whatever this attempt already wrote.
-        console.log(`[disk-download] ${job.id} paused (${job.pausedReason || "displaced"}) at ${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB — will resume`);
+        console.log(`[disk-download] ${job.jobId} paused (${job.pausedReason || "displaced"}) at ${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB — will resume`);
         job.status = "paused";
+        // Matches the other exit paths (success, error-retry) — a
+        // displaced entry is functionally inert (excluded from every
+        // admitStream/slotHeld check by its own `displaced` flag) but
+        // leaving it around until the idle reaper gets to it is a
+        // needless stale entry for anyone reading `streams` to debug.
+        streams.delete(owner);
         await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS));
-        job.status = "downloading";
         continue;
       }
       job.retries += 1;
@@ -3085,11 +3134,11 @@ async function runDiskDownloadJob(job) {
       streams.delete(owner);
       if (job.retries > DISK_DOWNLOAD_MAX_ERROR_RETRIES) {
         job.status = "failed";
-        console.warn(`[disk-download] ${job.id} gave up after ${job.retries} attempts: ${e.message}`);
+        console.warn(`[disk-download] ${job.jobId} gave up after ${job.retries} attempts: ${e.message}`);
         try { fs.rmSync(tmpPath, { force: true }); } catch {}
         return;
       }
-      console.warn(`[disk-download] ${job.id} retry ${job.retries}/${DISK_DOWNLOAD_MAX_ERROR_RETRIES}: ${e.message}`);
+      console.warn(`[disk-download] ${job.jobId} retry ${job.retries}/${DISK_DOWNLOAD_MAX_ERROR_RETRIES}: ${e.message}`);
       await new Promise((r) => setTimeout(r, Math.min(5000 * job.retries, 60_000)));
     }
   }
@@ -3511,9 +3560,16 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/seg_:n.ts", (req, res)
 // /api/download (client-side download) and the disk-download job queue
 // (server-side save to the Disk library) — both hit this exact panel
 // flakiness.
-async function resolveDownloadSourceUrl(mode, id) {
+// actx defaults to currentAccount() (ALS-backed) like streamUrl() does,
+// so /api/download's request-context call site is unchanged. The
+// disk-download job queue runs with no active request/ALS context — it
+// passes ownerAccount explicitly rather than relying on the fallback
+// (currentAccount() happens to resolve to ownerAccount outside a
+// request today, but that's implicit; explicit matches the rest of the
+// job's actx-threading — see buildDiskIndex/prewarmTmdbCache calls).
+async function resolveDownloadSourceUrl(mode, id, actx = currentAccount()) {
   const indexExt = (mode === "movie"
-    ? indexes.movie.byId.get(parseInt(id, 10))?.container
+    ? getIndexesFor(actx).movie.byId.get(parseInt(id, 10))?.container
     : null);
   const candidates = indexExt
     ? [indexExt, ...["mp4", "mkv", "avi"].filter(x => x !== indexExt)]
@@ -3525,7 +3581,7 @@ async function resolveDownloadSourceUrl(mode, id) {
   // consumer (ffmpeg, or a raw fetch) would "succeed" with 0 real bytes.
   let lastProbeErr = "no candidates";
   for (const ext of candidates) {
-    const url = streamUrl(mode, id, ext);
+    const url = streamUrl(mode, id, ext, actx);
     if (!url) continue;
     try {
       const probe = await fetch(url, {
@@ -8543,7 +8599,7 @@ app.post("/api/admin/disk-config", express.json(), async (req, res) => {
 // is informative enough without exposing the raw killer/abort plumbing).
 function projectDiskDownloadJob(j) {
   return {
-    id: j.id, mode: j.mode, sourceId: j.id, status: j.status,
+    id: j.jobId, mode: j.mode, sourceId: j.id, status: j.status,
     title: j.mode === "movie" ? j.title : j.episodeTitle,
     seriesTitle: j.seriesTitle || null, season: j.season || null, episodeNum: j.episodeNum || null,
     bytesWritten: j.bytesWritten, error: j.error, createdAt: j.createdAt, finishedAt: j.finishedAt || null,

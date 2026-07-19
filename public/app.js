@@ -5385,6 +5385,7 @@ function closeSeries() {
 // caller doesn't have to care which mode the panel is showing.
 function closeDetail() {
   closePosterMenu();
+  closeDiskMenu();
   if (state.openMovie) closeMovie();
   else if (state.openSeries) closeSeries();
   else { el.seriesPanel.hidden = true; el.seriesPanel.removeAttribute("data-mode"); }
