@@ -2821,12 +2821,16 @@ async function buildDiskIndex(actx, rootPath) {
 // highest available quality: a stream COPY (no re-encode, no downscale —
 // unlike /api/download's client-facing 720p CRF22 re-encode meant for a
 // phone's limited storage). Runs as a background job queue, ONE AT A
-// TIME, and shares the SAME admitStream() concurrency slot as a real
-// viewer via a synthetic owner key — so a family member pressing play
-// always displaces an in-progress download (never the reverse); the job
-// just waits for the slot to free and resumes via HTTP Range from
-// wherever it left off. Disk is owner-only (see userDiskPath), so this
-// whole subsystem only ever targets the owner's disk root.
+// TIME, gated to an overnight window (isDiskDownloadWindowOpen) so it
+// never competes with live viewing at all in practice. As a backstop for
+// the rare case someone's up during the window, it also participates in
+// the SAME admitStream() concurrency slot a real viewer uses, via a
+// synthetic owner key — but ONLY after confirming the slot isn't already
+// held by someone else (admitStream()'s own "newest wins" rule would
+// otherwise let the download evict an ALREADY-WATCHING viewer, not the
+// reverse — see the slotHeld check in runDiskDownloadJob for why). Disk
+// is owner-only (see userDiskPath), so this whole subsystem only ever
+// targets the owner's disk root.
 // ===========================================================================
 
 const DISK_DOWNLOAD_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB headroom
