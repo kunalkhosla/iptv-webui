@@ -5116,7 +5116,7 @@ async function triggerDiskDownload(payload) {
     const d = await r.json();
     if (!r.ok || !d.ok) { toast(`Download failed to queue: ${d.error || r.status}`, 4000); return; }
     const n = (d.jobIds || []).length;
-    toast(n > 1 ? `Queued ${n} downloads — check Disk later` : "Queued for download — will show up in Disk when done", 3500);
+    toast(n > 1 ? `Queued ${n} downloads — runs overnight, check Disk tomorrow` : "Queued — downloads overnight, will show up in Disk", 3500);
   } catch (e) {
     toast(`Download request failed: ${e.message}`, 4000);
   }

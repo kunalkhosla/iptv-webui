@@ -2893,6 +2893,33 @@ function enqueueDiskDownload(job) {
   return id;
 }
 
+// Downloads only run overnight (default 1–6 AM) rather than competing
+// with live viewing at all — Kunal's call, simpler and safer than
+// relying solely on the admitStream() displacement dance below to sort
+// it out in real time (that mechanism stays in place as a backstop for
+// the rare case someone's up during the window, not the primary guard).
+// Hours are computed in the household's actual timezone (America/
+// New_York), not server-local — the container runs in UTC (confirmed
+// on hestia), so a naive Date().getHours() would silently pick the
+// wrong 5-hour block.
+const DISK_DOWNLOAD_WINDOW_START_HOUR = Number(process.env.DISK_DOWNLOAD_WINDOW_START_HOUR ?? 1);
+const DISK_DOWNLOAD_WINDOW_END_HOUR = Number(process.env.DISK_DOWNLOAD_WINDOW_END_HOUR ?? 6);
+const DISK_DOWNLOAD_WINDOW_TZ = process.env.DISK_DOWNLOAD_WINDOW_TZ || "America/New_York";
+const DISK_DOWNLOAD_WINDOW_POLL_MS = 5 * 60_000;
+
+function currentHourInDiskDownloadWindow() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: DISK_DOWNLOAD_WINDOW_TZ, hour: "numeric", hour12: false,
+  }).formatToParts(new Date());
+  return Number(parts.find((p) => p.type === "hour").value) % 24;
+}
+function isDiskDownloadWindowOpen() {
+  const h = currentHourInDiskDownloadWindow();
+  return DISK_DOWNLOAD_WINDOW_START_HOUR <= DISK_DOWNLOAD_WINDOW_END_HOUR
+    ? h >= DISK_DOWNLOAD_WINDOW_START_HOUR && h < DISK_DOWNLOAD_WINDOW_END_HOUR
+    : h >= DISK_DOWNLOAD_WINDOW_START_HOUR || h < DISK_DOWNLOAD_WINDOW_END_HOUR; // window wraps midnight
+}
+
 async function processDiskDownloadQueue() {
   if (diskDownloadQueueRunning) return;
   diskDownloadQueueRunning = true;
@@ -2900,6 +2927,10 @@ async function processDiskDownloadQueue() {
     while (true) {
       const job = [...diskDownloadJobs.values()].find((j) => j.status === "queued");
       if (!job) break;
+      if (!isDiskDownloadWindowOpen()) {
+        await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_WINDOW_POLL_MS));
+        continue;
+      }
       await runDiskDownloadJob(job);
     }
   } finally {
@@ -2939,6 +2970,26 @@ async function runDiskDownloadJob(job) {
   const accountKey = accountKeyOf(ownerAccount);
 
   while (true) {
+    // admitStream()'s eviction rule is "newest wins, oldest gets evicted"
+    // — correct for two real viewers (whoever just pressed play should
+    // win over a stale session), but WRONG for this job: if a real
+    // viewer is already occupying the slot when the download tries to
+    // (re)admit, admitStream would treat the download as "newest" and
+    // evict the VIEWER instead of the reverse — the exact harm this
+    // whole mechanism exists to prevent. So: never call admitStream()
+    // while the slot is already held by someone else. Only registering
+    // when the slot is free means the ONLY way this job ever loses it
+    // afterward is a real viewer arriving LATER (registering newer),
+    // which correctly evicts the download via the same "oldest evicted"
+    // rule — that direction is the intended one. Synchronous check
+    // immediately followed by admitStream(), no await between them, so
+    // there's no event-loop window for a real request to interleave.
+    const slotHeld = [...streams.entries()]
+      .some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced);
+    if (slotHeld) {
+      await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS));
+      continue;
+    }
     let ac = new AbortController();
     const killer = (reason) => {
       job.pausedReason = reason;
@@ -2982,7 +3033,14 @@ async function runDiskDownloadJob(job) {
         ? Number(resp.headers.get("content-range")?.split("/")?.[1]) || null
         : Number(resp.headers.get("content-length")) || null;
       const source = Readable.fromWeb(resp.body);
-      source.on("data", (chunk) => { job.bytesWritten += chunk.length; });
+      // touchStream keeps streams' lastSeen fresh for the whole transfer —
+      // without it, admitStream() is only called once per pause/resume
+      // cycle (job start / after a displacement), so lastSeen goes stale
+      // the moment bytes start flowing and the idle reaper (which reaps
+      // ANY entry — not just displaced ones — after LIVE_IDLE_GRACE_MS
+      // with no touch) would kill a perfectly healthy, actively-writing
+      // download as if it were an abandoned viewer.
+      source.on("data", (chunk) => { job.bytesWritten += chunk.length; touchStream(owner); });
       await pipeline(source, out);
 
       if (expectedTotal != null) {
