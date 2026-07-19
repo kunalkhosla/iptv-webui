@@ -4554,10 +4554,17 @@ function refreshSeriesThumbBtns() {
 // see server.js's userDiskPath) and only makes sense for movie/series
 // (never live). Hidden entirely for non-owner accounts rather than
 // disabled, since a non-owner can never have a configured disk to save to.
+// Gates on state.diskConfig.path, NOT .enabled — .enabled means "the
+// Disk tab has at least one scanned file" (server.js's bootstrap route:
+// `indexes.disk.byId.size > 0`, used to decide whether to show the nav
+// tab at all), which would make this button unreachable on a freshly
+// configured, still-empty Disk library — exactly the case downloading
+// a first file is for. `path` is populated whenever the owner has a
+// disk root configured, regardless of current content.
 function refreshSeriesDiskBtn() {
   if (!el.seriesDiskBtnWrap) return;
   const target = openItemTarget();
-  const canShow = !!target && !!state.diskConfig?.isOwner && !!state.diskConfig?.enabled;
+  const canShow = !!target && !!state.diskConfig?.isOwner && !!state.diskConfig?.path;
   el.seriesDiskBtnWrap.hidden = !canShow;
   if (canShow) renderDiskMenu();
 }

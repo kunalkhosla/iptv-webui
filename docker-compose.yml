@@ -9,10 +9,12 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-      # Local media library (owner-only "Disk" section). Mount the movie
-      # folder read-only and point DISK_MEDIA_DIR (.env) at the in-container
-      # path. Omit both to disable the Disk feature.
-      # - /mnt/media/new-volume/Movies:/media/movies:ro
+      # Local media library (owner-only "Disk" section). Point DISK_MEDIA_DIR
+      # (.env) at the in-container path. Omit both to disable the Disk
+      # feature. Read-write, NOT :ro — the "Save to Disk" download feature
+      # writes new files into <path>/Downloads/. A :ro mount here makes
+      # every queued download fail at fs.mkdirSync/fs.createWriteStream.
+      # - /mnt/media/new-volume/Movies:/media/movies
     # VAAPI transcode for disk avi/DTS (+ panel MKV). Needs the iGPU passed in.
     # devices:
     #   - /dev/dri:/dev/dri
