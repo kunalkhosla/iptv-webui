@@ -1208,7 +1208,11 @@ async function tmdb(action, params = {}) {
 // (G, PG, PG-13, R, NC-17 / TV-Y, TV-Y7, TV-G, TV-PG, TV-14, TV-MA).
 function extractUsCert(mode, detail) {
   if (!detail) return "";
-  if (mode === "movie") {
+  // "disk" is a flat movie-style library (see CLAUDE.md) — treat anything
+  // that isn't literally "series" as movie-shaped, so disk items route to
+  // the same TMDB movie fields/endpoints as panel movies instead of falling
+  // into the TV branch by default.
+  if (mode !== "series") {
     const rd = detail.release_dates;
     const us = rd && Array.isArray(rd.results) ? rd.results.find(r => r.iso_3166_1 === "US") : null;
     if (!us || !Array.isArray(us.release_dates)) return "";
@@ -1225,7 +1229,8 @@ function extractUsCert(mode, detail) {
 
 function projectTmdbDetail(mode, detail, baseTitle) {
   if (!detail || !detail.id) return null;
-  const isMovie = mode === "movie";
+  // See extractUsCert's comment — disk is movie-shaped, not series-shaped.
+  const isMovie = mode !== "series";
   const dateStr = isMovie ? detail.release_date : detail.first_air_date;
 
   // append_to_response payloads. Each is optional — older callers that
@@ -1460,7 +1465,9 @@ function dedupTitleKey(name) {
 }
 
 async function findTmdbMatch(mode, name, hintYear, langHint) {
-  const action = mode === "movie" ? "/search/movie" : "/search/tv";
+  // "disk" is movie-shaped (see extractUsCert's comment) — only "series"
+  // routes to the TV-side TMDB endpoints.
+  const action = mode !== "series" ? "/search/movie" : "/search/tv";
   // Effective release year. The panel's movie list usually has NO year
   // field — the year lives only in the title ("Blind (2023)"). Parse it
   // from the name as a fallback. Without a year, a generic query like
@@ -1487,7 +1494,7 @@ async function findTmdbMatch(mode, name, hintYear, langHint) {
     const cleaned = cleanPanelTitle(name, { strict });
     if (!cleaned) continue;
     const params = { query: cleaned };
-    if (effYear) params[mode === "movie" ? "year" : "first_air_date_year"] = String(effYear);
+    if (effYear) params[mode !== "series" ? "year" : "first_air_date_year"] = String(effYear);
     const searchRes = await tmdb(action, params);
     const results = searchRes && Array.isArray(searchRes.results) ? searchRes.results : [];
     if (!results.length) continue;
@@ -1518,7 +1525,7 @@ async function findTmdbMatch(mode, name, hintYear, langHint) {
     // append_to_response folds certification + credits + videos +
     // reviews + keywords + recommendations + similar + external_ids
     // into one call (TMDB allows up to 20 appends).
-    const detailAction = mode === "movie" ? `/movie/${pick.id}` : `/tv/${pick.id}`;
+    const detailAction = mode !== "series" ? `/movie/${pick.id}` : `/tv/${pick.id}`;
     const detail = await tmdb(detailAction, { append_to_response: TMDB_DETAIL_APPENDS(mode) });
     return projectTmdbDetail(mode, detail || pick, cleaned);
   }
@@ -1530,7 +1537,7 @@ async function findTmdbMatch(mode, name, hintYear, langHint) {
 // TV uses content_ratings); everything else is the same shape on
 // both endpoints, so we can share one comma-joined string.
 const TMDB_DETAIL_APPENDS = (mode) => {
-  const cert = mode === "movie" ? "release_dates" : "content_ratings";
+  const cert = mode !== "series" ? "release_dates" : "content_ratings";
   return [
     cert,
     "credits",
@@ -1547,7 +1554,7 @@ const TMDB_DETAIL_APPENDS = (mode) => {
 // to backfill new fields on old cache entries without re-running the
 // search step. Returns the projected entry, or null on failure.
 async function refetchTmdbDetail(mode, tmdbId) {
-  const detailAction = mode === "movie" ? `/movie/${tmdbId}` : `/tv/${tmdbId}`;
+  const detailAction = mode !== "series" ? `/movie/${tmdbId}` : `/tv/${tmdbId}`;
   const detail = await tmdb(detailAction, { append_to_response: TMDB_DETAIL_APPENDS(mode) });
   if (!detail) return null;
   return projectTmdbDetail(mode, detail, detail.title || detail.name || "");
@@ -2799,8 +2806,11 @@ async function buildDiskIndex(actx, rootPath) {
       if (!a || !a.video) continue; // not a real video / probe failed
       const { title, year } = parseTitleYear(path.basename(f.relpath));
       const id = stableDiskId(f.relpath);
-      const catName = f.folder;
-      const catId = slugifyCat(catName);
+      // catId stays derived from the raw folder name so it's stable even
+      // if the display label below changes — only the label is prettied
+      // up for Save-to-Disk's own "Downloads" folder (diskDownloadDestPath).
+      const catId = slugifyCat(f.folder);
+      const catName = f.folder === "Downloads" ? "Khouch IPTV Downloads" : f.folder;
       if (!cats.has(catId)) cats.set(catId, catName);
       // sidecar artwork next to the file
       const baseNoExt = f.absPath.replace(/\.[a-z0-9]+$/i, "");
@@ -4933,7 +4943,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     if (!s) return null;
     const t = tmdbFor(s.id);
     let cert = t?.us_cert || null;
-    if (!cert && mode === "movie" && catName && KID_CAT_RE.test(catName)) {
+    if (!cert && (mode === "movie" || mode === "disk") && catName && KID_CAT_RE.test(catName)) {
       cert = "G";
     }
     return {
@@ -7055,7 +7065,7 @@ app.get("/api/poster/series/:id/season/:n", async (req, res, next) => {
 // Wipe a TMDB cache entry so the next poster request re-searches.
 // Used by the "Fix poster" override in the detail modal. Also clears
 // any series-season:<id>:* entries when called for a series.
-app.delete("/api/poster/:mode(movie|series)/:id", (req, res) => {
+app.delete("/api/poster/:mode(movie|series|disk)/:id", (req, res) => {
   const { mode, id } = req.params;
   let cleared = 0;
   const primaryKey = `${mode}:${id}`;
@@ -7085,7 +7095,7 @@ async function retryTmdbNoMatches({ onProgress } = {}) {
   for (const [key, entry] of Object.entries(tmdbCache)) {
     if (!entry || entry.source !== "no-match") continue;
     const [mode, id] = key.split(":");
-    if (!["movie", "series"].includes(mode) || !id) continue;
+    if (!["movie", "series", "disk"].includes(mode) || !id) continue;
     candidates.push({ key, mode, id });
   }
   tally.scanned = candidates.length;
@@ -7149,7 +7159,7 @@ async function revalidateTmdbYears({ onProgress } = {}) {
   for (const [key, entry] of Object.entries(tmdbCache)) {
     if (!entry || entry.source !== "tmdb" || !entry.tmdb_id) continue;
     const [mode, id] = key.split(":");
-    if (!["movie", "series"].includes(mode) || !id) continue;
+    if (!["movie", "series", "disk"].includes(mode) || !id) continue;
     const item = indexes[mode]?.byId?.get(parseInt(id, 10)) || indexes[mode]?.byId?.get(id);
     if (!item) continue; // not in index → can't compare, leave alone
     const lang = isoLangForItem(item);
@@ -8363,7 +8373,7 @@ async function backfillTmdbCacheV2({ onProgress } = {}) {
     if (!entry || entry.source !== "tmdb" || !entry.tmdb_id) continue;
     if ("vote_count" in entry) continue; // already upgraded
     const [mode, id] = key.split(":");
-    if (!["movie", "series"].includes(mode) || !id) continue;
+    if (!["movie", "series", "disk"].includes(mode) || !id) continue;
     candidates.push({ key, mode, id, tmdb_id: entry.tmdb_id });
   }
   tally.scanned = candidates.length;
