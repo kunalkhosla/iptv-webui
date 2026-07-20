@@ -2869,7 +2869,53 @@ const DISK_DOWNLOAD_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB headroom
 const DISK_DOWNLOAD_DISPLACED_RETRY_MS = 30_000;
 const DISK_DOWNLOAD_MAX_ERROR_RETRIES = 8;
 
+// Persisted the same way as diskProbeCache above — a plain in-memory Map
+// used to be the whole store, so a container restart (a deploy, a crash)
+// silently dropped every queued/paused job with zero trace, and the
+// overnight window that follows just never had anything to run. Loaded
+// once at boot; "downloading"/"paused" entries are demoted back to
+// "queued" since whatever admitStream/ffmpeg state they held is gone
+// with the old process — the job itself resumes cleanly via the existing
+// tmpPath + Range logic in runDiskDownloadJob.
+const diskDownloadJobsFile = path.join(DATA_DIR, "disk-download-jobs.json");
 const diskDownloadJobs = new Map(); // jobId -> job
+try {
+  const saved = JSON.parse(fs.readFileSync(diskDownloadJobsFile, "utf8"));
+  for (const job of saved) {
+    if (job.status === "downloading" || job.status === "paused") {
+      job.status = "queued";
+      job.pausedReason = null;
+    }
+    diskDownloadJobs.set(job.jobId, job);
+  }
+} catch {}
+// Unlike diskProbeCache's save (called per-item during a bulk scan, hence
+// debounced), this fires only a handful of times across a whole job's
+// lifecycle — cheap enough to write synchronously. That matters here
+// specifically: a debounced write pending when the container gets SIGTERM'd
+// (the Dockerfile has no signal-forwarding init, so Node exits immediately
+// with no chance to flush a timer) would lose exactly the transition this
+// fix exists to survive — e.g. a `"done"` a few hundred ms before a deploy
+// lands would boot back as `"queued"` and silently re-download. History
+// (done/failed) is capped to the newest 200 by createdAt, matching the
+// `GET /jobs` display cap, so a long-lived job history doesn't turn every
+// save into an ever-growing write — but anything still actionable
+// (queued/downloading/paused) is ALWAYS kept regardless of the cap: a
+// "download whole series" click can queue hundreds of same-timestamp
+// episode jobs in one request, and letting recency evict from that set
+// would silently drop the front of a FIFO queue right when a restart
+// mid-batch is the exact case this feature exists to survive.
+function saveDiskDownloadJobs() {
+  try {
+    const all = [...diskDownloadJobs.values()];
+    const active = all.filter((j) => j.status === "queued" || j.status === "downloading" || j.status === "paused");
+    const terminal = all.filter((j) => j.status === "done" || j.status === "failed")
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, 200);
+    fs.writeFileSync(diskDownloadJobsFile + ".tmp", JSON.stringify([...active, ...terminal]));
+    fs.renameSync(diskDownloadJobsFile + ".tmp", diskDownloadJobsFile);
+  } catch (e) { console.warn(`[disk-download] jobs save failed: ${e.message}`); }
+}
 let diskDownloadQueueRunning = false;
 
 function diskDownloadFreeBytes(rootPath) {
@@ -2950,6 +2996,7 @@ function enqueueDiskDownload(job) {
     error: null,
     ...job,
   });
+  saveDiskDownloadJobs();
   processDiskDownloadQueue().catch((e) => console.warn(`[disk-download] queue error: ${e.message}`));
   return jobId;
 }
@@ -3014,6 +3061,7 @@ async function runDiskDownloadJob(job) {
   if (!rootPath || !userDiskEnabled(user)) {
     job.status = "failed";
     job.error = "disk not configured";
+    saveDiskDownloadJobs();
     return;
   }
 
@@ -3022,6 +3070,7 @@ async function runDiskDownloadJob(job) {
     job.status = "failed";
     job.error = `disk almost full (${(free / 1024 / 1024 / 1024).toFixed(1)} GB free, need ${DISK_DOWNLOAD_MIN_FREE_BYTES / 1024 / 1024 / 1024} GB headroom)`;
     console.warn(`[disk-download] ${job.jobId} (content id ${job.id}) refused: ${job.error}`);
+    saveDiskDownloadJobs();
     return;
   }
 
@@ -3030,6 +3079,7 @@ async function runDiskDownloadJob(job) {
   if (!sourceUrl) {
     job.status = "failed";
     job.error = `source unavailable: ${probeErr}`;
+    saveDiskDownloadJobs();
     return;
   }
   job.ext = ext;
@@ -3065,6 +3115,7 @@ async function runDiskDownloadJob(job) {
     if (slotHeld) {
       job.status = "paused";
       job.pausedReason = "slot-held";
+      saveDiskDownloadJobs();
       await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS));
       continue;
     }
@@ -3079,6 +3130,7 @@ async function runDiskDownloadJob(job) {
       // streams-map reaper hasn't cleared it yet) — same "waiting for
       // the slot" state as slotHeld above, not actively downloading.
       job.status = "paused";
+      saveDiskDownloadJobs();
       await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS));
       continue;
     }
@@ -3100,7 +3152,13 @@ async function runDiskDownloadJob(job) {
       if (!resp.ok && resp.status !== 206) throw new Error(`HTTP ${resp.status}`);
       const resumed = resp.status === 206;
       const out = fs.createWriteStream(tmpPath, { flags: resumed ? "a" : "w" });
-      if (!resumed) job.bytesWritten = 0;
+      // Resync to the .part file's real size, not the in-memory value —
+      // bytesWritten is only persisted on status transitions (not per
+      // chunk), so a job resuming after a restart would otherwise keep
+      // incrementing from a stale/zero baseline forever. Within a single
+      // process's lifetime this was already correct (a same-process pause/
+      // resume never touched bytesWritten), so this is a no-op there.
+      job.bytesWritten = resumed ? startByte : 0;
       // Expected total size, for verifying the transfer actually completed
       // rather than silently truncating — the same CDN-drop failure mode
       // /api/download had (closes the connection cleanly mid-transfer;
@@ -3134,6 +3192,7 @@ async function runDiskDownloadJob(job) {
       fs.renameSync(tmpPath, destPath);
       job.status = "done";
       job.finishedAt = Date.now();
+      saveDiskDownloadJobs();
       dropStreamKiller(owner, killer);
       streams.delete(owner);
       console.log(`[disk-download] ${job.jobId} done → ${destPath} (${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB)`);
@@ -3152,6 +3211,7 @@ async function runDiskDownloadJob(job) {
         // Range from whatever this attempt already wrote.
         console.log(`[disk-download] ${job.jobId} paused (${job.pausedReason || "displaced"}) at ${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB — will resume`);
         job.status = "paused";
+        saveDiskDownloadJobs();
         // Matches the other exit paths (success, error-retry) — a
         // displaced entry is functionally inert (excluded from every
         // admitStream/slotHeld check by its own `displaced` flag) but
@@ -3168,6 +3228,7 @@ async function runDiskDownloadJob(job) {
         job.status = "failed";
         console.warn(`[disk-download] ${job.jobId} gave up after ${job.retries} attempts: ${e.message}`);
         try { fs.rmSync(tmpPath, { force: true }); } catch {}
+        saveDiskDownloadJobs();
         return;
       }
       console.warn(`[disk-download] ${job.jobId} retry ${job.retries}/${DISK_DOWNLOAD_MAX_ERROR_RETRIES}: ${e.message}`);
@@ -10129,6 +10190,11 @@ app.listen(PORT, async () => {
   console.log(`  tmdb:       ${TMDB_API_KEY ? "enabled" : "disabled (set TMDB_API_KEY to enable)"}`);
   console.log(`  concurrency cap: ${MAX_CONCURRENT_STREAMS} concurrent stream(s) per IPTV account`);
   console.log(`  panel-config:    ${PANEL_CONFIG_KEY ? "encrypted (AES-256-GCM)" : "plaintext (set PROXY_SECRET in env to encrypt at rest)"}`);
+
+  if ([...diskDownloadJobs.values()].some((j) => j.status === "queued")) {
+    console.log(`[disk-download] resuming ${[...diskDownloadJobs.values()].filter((j) => j.status === "queued").length} job(s) restored from disk`);
+    processDiskDownloadQueue().catch((e) => console.warn(`[disk-download] queue error: ${e.message}`));
+  }
 
   for (const mode of PANEL_MODES) {
     const data = await loadIndexFromDisk(mode, actx);
