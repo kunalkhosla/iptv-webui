@@ -1544,6 +1544,7 @@ function paintHero(pick) {
 
   playBtn.onclick = () => {
     if (state.mode === "series") openSeries(pick);
+    else if (state.mode === "disk" && pick.isSeriesGroup) openDiskSeriesGroup(pick);
     else play(state.mode, pick);
   };
 
@@ -3016,7 +3017,7 @@ function channelCard(s, opts = {}) {
     if (e.target.classList.contains("snooze-fy")) return;
     if (cardMode === "series") openSeries(s);
     else if (cardMode === "movie") openMovie(s, "movie");
-    else if (cardMode === "disk") openMovie(s, "disk");
+    else if (cardMode === "disk") { if (s.isSeriesGroup) openDiskSeriesGroup(s); else openMovie(s, "disk"); }
     else play("live", s);
   };
 
@@ -4472,6 +4473,19 @@ function closePlayer() {
 }
 
 // --- Movie / disk detail (reuses the series modal's hero + close UI) -
+// Buttons that only make sense for a real series (favorites/thumbs/
+// Save-to-Disk/poster-override) — hidden while a disk series-group
+// panel is open (it's already-downloaded local content, none of these
+// apply) and restored the instant ANY other detail panel opens. Every
+// panel-opening function must call restoreDiskSeriesOnlyButtons() —
+// skipping it in even one of them leaves these buttons hidden forever
+// after the user later opens a disk series group and then navigates to
+// a real movie/series (confirmed reachable via ordinary back/forward).
+const DISK_SERIES_ONLY_HIDE = ["seriesMyListBtn", "seriesThumbUpBtn", "seriesThumbDownBtn", "seriesDiskBtnWrap", "seriesPosterMenuBtn"];
+function restoreDiskSeriesOnlyButtons() {
+  for (const key of DISK_SERIES_ONLY_HIDE) { if (el[key]) el[key].hidden = false; }
+}
+
 async function openMovie(s, mode = "movie") {
   saveScroll();
   // Switch to the item's mode so updateUrl() builds the right path
@@ -4488,6 +4502,9 @@ async function openMovie(s, mode = "movie") {
   state.openMovieMode = mode; // "movie" | "disk" — drives the panel /info skip + play mode
   state.openSeries = null;
   state.openSeriesData = null;
+  state.openDiskSeries = null;
+  state.openDiskSeriesData = null;
+  restoreDiskSeriesOnlyButtons();
   el.seriesPanel.dataset.mode = "movie";
   el.seriesPanel.hidden = false;
   el.seriesPanel.scrollTop = 0;
@@ -4521,6 +4538,11 @@ async function openMovie(s, mode = "movie") {
   try {
     const r = await fetch(`/api/movie/info/${s.id}`);
     const d = await r.json();
+    // Stale-response guard — the user can navigate to a different detail
+    // panel (movie, series, or a disk series group) before this fetch
+    // resolves. Without this, a late-arriving response overwrites
+    // whatever's now actually on screen instead of being a no-op.
+    if (!(state.openMovie && state.openMovie.id === s.id)) return;
     state.openMovieData = d;
     const info = d && d.info ? d.info : {};
     const md = d && d.movie_data ? d.movie_data : {};
@@ -4555,7 +4577,7 @@ function renderMovieMeta(s, info) {
   const year = (info && (info.releasedate || info.releaseDate || info.year)) || s.year;
   const rating = (info && info.rating) || s.rating;
   const dur = (info && (info.duration_secs || info.duration)) || s.duration;
-  const genre = info && info.genre;
+  const genre = (info && info.genre) || s.genre;
   if (year) bits.push(`<span class="meta-dim">${escapeHtml(String(year).slice(0, 4))}</span>`);
   if (s.us_cert) bits.push(`<span class="meta-cert">${escapeHtml(String(s.us_cert))}</span>`);
   if (dur) bits.push(`<span class="meta-dim">${escapeHtml(formatDuration(dur))}</span>`);
@@ -4655,8 +4677,13 @@ async function openSeries(s) {
     for (const b of el.modeButtons) b.classList.toggle("active", b.dataset.mode === "series");
   }
   if (state.view === "collection" && el.hindiTab) el.hindiTab.classList.remove("active");
+  state.openMovie = null;
+  state.openMovieData = null;
   state.openSeries = s;
   state.openSeriesData = null;
+  state.openDiskSeries = null;
+  state.openDiskSeriesData = null;
+  restoreDiskSeriesOnlyButtons();
   // Don't push to recents on open — only when the user actually plays
   // an episode (handled in playEpisode → pushRecent).
   el.seriesPanel.dataset.mode = "series";
@@ -4735,6 +4762,138 @@ async function openSeries(s) {
   }
 }
 
+// A disk-library "series group" — Save-to-Disk episodes grouped under
+// one tile server-side (buildDiskIndex) instead of a flat per-episode
+// dump. Deliberately its own function rather than a mode branch inside
+// openSeries(): a disk group has no favorites/thumbs/save-to-disk
+// (it's already downloaded) and its own clean episode-list endpoint
+// (GET /api/disk/series/:id) rather than the panel's get_series_info
+// shape — reuses the SAME panel DOM + renderSeriesEpisodes by adapting
+// the response into that function's expected {episodes:{"1":[...]}}
+// shape, so the season dropdown / episode rows / thumbnails all work
+// unmodified.
+async function openDiskSeriesGroup(s) {
+  saveScroll();
+  if (state.mode !== "disk") {
+    state.mode = "disk";
+    for (const b of el.modeButtons) b.classList.toggle("active", b.dataset.mode === "disk");
+  }
+  if (state.view === "collection" && el.hindiTab) el.hindiTab.classList.remove("active");
+  state.openMovie = null;
+  state.openMovieData = null;
+  state.openSeries = null;
+  state.openSeriesData = null;
+  state.openDiskSeries = s;
+  state.openDiskSeriesData = null;
+  el.seriesPanel.dataset.mode = "series"; // same CSS layout real series uses (season/episode UI visible)
+  el.seriesPanel.hidden = false;
+  el.seriesPanel.scrollTop = 0;
+  resetVersoTab();
+  for (const key of DISK_SERIES_ONLY_HIDE) { if (el[key]) el[key].hidden = true; }
+
+  el.seriesTitle.textContent = s.name;
+  setSeriesHeroBackdrop(s.icon, s.icon);
+  renderSeriesMeta(s, null);
+  el.seriesPlot.textContent = s.plot || "";
+  el.seriesSeasonSelect.innerHTML = "";
+  el.seriesEpisodes.innerHTML = `<div class="empty">Loading episodes…</div>`;
+  updateUrl({ push: true });
+  applyTmdbToDetail("disk", s);
+  // No renderSimilarRails("disk", s) here — it early-returns for any
+  // mode other than movie/series (no "More Like This" concept for disk).
+
+  try {
+    const r = await fetch(`/api/disk/series/${s.id}`);
+    const raw = await r.json();
+    if (!r.ok) throw new Error(raw?.error || `HTTP ${r.status}`);
+    // Adapt this endpoint's {seasons:[{season,episodes}]} into the
+    // {episodes:{"<season>":[...]}} shape renderSeriesEpisodes/
+    // pickResumeOrFirstEpisode expect (the same shape /api/series/info
+    // returns) — reuses that rendering code unmodified.
+    const episodes = {};
+    for (const season of raw.seasons || []) {
+      episodes[String(season.season)] = season.episodes.map(ep => ({
+        id: ep.id, episode_num: ep.episodeNum, title: ep.title,
+        container_extension: ep.container,
+        // No per-episode stills for disk (no TMDB episode-level data) —
+        // fall back to the series poster so rows aren't blank, same as
+        // renderSeriesEpisodes' own seriesItem.icon fallback would do
+        // if raw.poster had landed on the tile itself.
+        info: { duration_secs: ep.durationSecs, movie_image: raw.poster },
+      }));
+    }
+    const d = { info: { plot: raw.plot, cover: raw.poster, cover_big: raw.poster, backdrop_path: raw.backdrop ? [raw.backdrop] : [] }, episodes };
+    state.openDiskSeriesData = d;
+    const backdrop = raw.backdrop || s.icon;
+    const poster = raw.poster || s.icon;
+    setSeriesHeroBackdrop(backdrop, poster);
+    renderSeriesMeta(s, d);
+    if (raw.plot) el.seriesPlot.textContent = raw.plot;
+
+    const seasonNums = Object.keys(episodes).sort((a, b) => Number(a) - Number(b));
+    if (!seasonNums.length) {
+      el.seriesEpisodes.innerHTML = `<div class="empty">No episodes found.</div>`;
+      el.seriesPlayBtn.disabled = true;
+      return;
+    }
+    el.seriesPlayBtn.disabled = false;
+    el.seriesSeasonSelect.innerHTML = "";
+    for (const sn of seasonNums) {
+      const opt = document.createElement("option");
+      opt.value = sn;
+      opt.textContent = `Season ${sn} · ${episodes[sn].length} ep`;
+      el.seriesSeasonSelect.appendChild(opt);
+    }
+    const lastEp = state.lastEpisode[s.id];
+    const initial = lastEp && seasonNums.includes(String(lastEp.season)) ? String(lastEp.season) : seasonNums[0];
+    el.seriesSeasonSelect.value = initial;
+    renderDiskSeriesEpisodes(s, d, initial);
+
+    const pick = pickResumeOrFirstEpisode(s, d);
+    if (pick) {
+      const isResume = !!lastEp;
+      const label = `S${String(pick.sn).padStart(2, "0")}E${String(pick.ep.episode_num).padStart(2, "0")}`;
+      el.seriesPlayBtn.innerHTML = isResume
+        ? `▸ Resume <span class="play-sub">${escapeHtml(label)}</span>`
+        : `▸ Play <span class="play-sub">${escapeHtml(label)}</span>`;
+    }
+  } catch (e) {
+    el.seriesEpisodes.innerHTML = `<div class="empty">Failed to load: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+// Thin wrapper around renderSeriesEpisodes for a disk series group —
+// same rendering, but episode clicks go through playDiskEpisode (mode
+// "disk") instead of playEpisode (mode "series").
+function renderDiskSeriesEpisodes(seriesItem, info, sn) {
+  renderSeriesEpisodes(seriesItem, info, sn, playDiskEpisode);
+}
+
+function closeDiskSeries() {
+  restoreDiskSeriesOnlyButtons();
+  el.seriesPanel.hidden = true;
+  el.seriesPanel.removeAttribute("data-mode");
+  el.seriesEpisodes.innerHTML = "";
+  state.openDiskSeries = null;
+  state.openDiskSeriesData = null;
+  updateUrl();
+}
+
+function playDiskEpisode(seriesItem, ep, sn) {
+  const title = ep.title || `Episode ${ep.episode_num}`;
+  const ext = ep.container_extension || "mp4";
+  // state.lastEpisode is keyed by seriesId with no mode namespace — safe
+  // to reuse for a disk series-group id since it lives in a completely
+  // different id space (SHA1-derived) than real panel series ids. Drives
+  // "resume last episode" on next open + the .watched row marker.
+  rememberEpisode(seriesItem.id, ep, sn, seriesItem.name);
+  closeDiskSeries();
+  play("disk",
+       { id: ep.id, name: title, container: ext },
+       `${seriesItem.name} · S${sn}E${ep.episode_num}`);
+  pushRecent("disk", seriesItem.id);
+}
+
 // Apply TMDB enrichment to the open detail modal. Artwork is upgraded
 // to TMDB unconditionally (better quality + actual backdrops). Text
 // metadata only fills blanks the panel left empty so a hand-curated
@@ -4742,6 +4901,20 @@ async function openSeries(s) {
 // bits and updates the override menu's "matched as ..." line.
 async function applyTmdbToDetail(mode, item) {
   const d = await posterFor(mode, item.id);
+  // Stale-response guard — always fire-and-forget from openMovie/
+  // openSeries/openDiskSeriesGroup, never awaited by the caller, so the
+  // user can navigate to a DIFFERENT detail panel before this resolves.
+  // "disk" covers two live objects (a plain disk movie via openMovie,
+  // or a series group) — without this check a stale disk-movie response
+  // can land after a disk SERIES GROUP is what's actually on screen and
+  // overwrite its title/hero/genre with the wrong item's data (the two
+  // objects are otherwise mutually exclusive, but only while this
+  // function isn't itself racing across that transition).
+  const stillOpen = mode === "movie" ? (state.openMovie && state.openMovie.id === item.id)
+    : mode === "series" ? (state.openSeries && state.openSeries.id === item.id)
+    : ((state.openDiskSeries && state.openDiskSeries.id === item.id) ||
+       (state.openMovie && state.openMovieMode === "disk" && state.openMovie.id === item.id));
+  if (!stillOpen) return;
   // Always update the override menu line (even on no-match it should
   // say "No TMDB match").
   if (typeof renderPosterMenu === "function") renderPosterMenu(mode, item, d);
@@ -4763,7 +4936,9 @@ async function applyTmdbToDetail(mode, item) {
   }
   // Text fill-ins, on the live `state.openMovie` / `state.openSeries`
   // first so renderXxxMeta() picks them up, then re-render.
-  const target = mode === "movie" ? state.openMovie : state.openSeries;
+  const target = mode === "movie" ? state.openMovie
+    : mode === "disk" ? state.openDiskSeries || state.openMovie
+    : state.openSeries;
   if (target) {
     if (d.tmdb_title) target.name = d.tmdb_title;
     if (!target.plot && d.plot) {
@@ -4777,7 +4952,8 @@ async function applyTmdbToDetail(mode, item) {
     if ((!target.genre || !String(target.genre).trim()) && d.genres && d.genres.length) {
       target.genre = d.genres.join(", ");
     }
-    if (mode === "movie") renderMovieMeta(target, null);
+    if (mode === "movie" || (mode === "disk" && !state.openDiskSeries)) renderMovieMeta(target, null);
+    else if (mode === "disk") renderSeriesMeta(target, state.openDiskSeriesData);
     else renderSeriesMeta(target, state.openSeriesData);
   }
 }
@@ -5222,7 +5398,7 @@ function renderSeriesMeta(s, info) {
   const seasonsCount = info && info.episodes ? Object.keys(info.episodes).length : null;
   const year = (info && info.info && (info.info.releaseDate || info.info.release_date)) || s.year;
   const rating = (info && info.info && (info.info.rating || info.info.rating_5based)) || s.rating;
-  const genre = info && info.info && info.info.genre;
+  const genre = (info && info.info && info.info.genre) || s.genre;
   if (year) bits.push(`<span class="meta-dim">${escapeHtml(String(year).slice(0, 4))}</span>`);
   if (s.us_cert) bits.push(`<span class="meta-cert">${escapeHtml(String(s.us_cert))}</span>`);
   if (seasonsCount) bits.push(`<span class="meta-dim">${seasonsCount} season${seasonsCount === 1 ? "" : "s"}</span>`);
@@ -5370,14 +5546,15 @@ function pickResumeOrFirstEpisode(seriesItem, info) {
   return { ep: episodesByS[firstSn][0], sn: firstSn };
 }
 
-function renderSeriesEpisodes(seriesItem, info, sn) {
+function renderSeriesEpisodes(seriesItem, info, sn, onPlay = playEpisode) {
   const list = (info.episodes && info.episodes[sn]) || [];
   el.seriesEpisodes.innerHTML = "";
   if (!list.length) {
     el.seriesEpisodes.innerHTML = `<div class="empty">No episodes in this season.</div>`;
     return;
   }
-  const playingId = state.playing && state.playing.mode === "series"
+  const playingMode = onPlay === playDiskEpisode ? "disk" : "series";
+  const playingId = state.playing && state.playing.mode === playingMode
     ? String(state.playing.item.id)
     : null;
   const frag = document.createDocumentFragment();
@@ -5386,7 +5563,7 @@ function renderSeriesEpisodes(seriesItem, info, sn) {
     const thumbUrl = ep.info?.movie_image || ep.info?.cover_big || seriesItem.icon || "";
     const duration = formatDuration(ep.info?.duration_secs || ep.info?.duration);
     const plot = (ep.info?.plot || "").trim();
-    const epProg = state.progress[`series:${ep.id}`];
+    const epProg = state.progress[`${playingMode}:${ep.id}`];
     const epPct = epProg && epProg.d
       ? Math.min(99, Math.max(2, Math.floor((epProg.p / epProg.d) * 100)))
       : null;
@@ -5420,14 +5597,17 @@ function renderSeriesEpisodes(seriesItem, info, sn) {
       img.src = thumbUrl;
     }
     epEl.dataset.epId = String(ep.id);
-    epEl.onclick = () => playEpisode(seriesItem, ep, sn);
+    epEl.onclick = () => onPlay(seriesItem, ep, sn);
     frag.appendChild(epEl);
   }
   el.seriesEpisodes.appendChild(frag);
 
   // Upgrade thumbnails to TMDB stills when available. Single fetch
   // per (series, season); cached server-side and in-memory after first
-  // call, so re-opening the same season is instant.
+  // call, so re-opening the same season is instant. Skipped for disk —
+  // there's no per-episode TMDB data for local files, and seriesItem.id
+  // isn't in the real series id space so the call would just 404.
+  if (playingMode === "disk") return;
   stillsForSeason(seriesItem.id, sn).then((stills) => {
     if (!stills || !Object.keys(stills).length) return;
     for (const epId of Object.keys(stills)) {
@@ -5459,6 +5639,7 @@ function closeDetail() {
   closeDiskMenu();
   if (state.openMovie) closeMovie();
   else if (state.openSeries) closeSeries();
+  else if (state.openDiskSeries) closeDiskSeries();
   else { el.seriesPanel.hidden = true; el.seriesPanel.removeAttribute("data-mode"); }
 }
 
@@ -5632,7 +5813,11 @@ function updateUrl({ push = false } = {}) {
     if (state.playing.ext) parts.push(state.playing.ext);
   } else if (state.openSeries && m === "series") {
     parts.push("open", tokenize(state.openSeries.id, state.openSeries.name));
-  } else if (state.openMovie && m === "movie") {
+  } else if (state.openDiskSeries && m === "disk") {
+    parts.push("open", tokenize(state.openDiskSeries.id, state.openDiskSeries.name));
+  } else if (state.openMovie && (m === "movie" || m === "disk")) {
+    // m === "disk" covers a plain (non-series-group) disk movie —
+    // openMovie(s, "disk") sets state.mode to "disk", not "movie".
     parts.push("open", tokenize(state.openMovie.id, state.openMovie.name));
   }
   const url = "/" + parts.join("/");
@@ -5643,6 +5828,7 @@ function updateUrl({ push = false } = {}) {
   document.title = state.playing
     ? `${state.playing.label} · Khouch Potato`
     : state.openSeries ? `${state.openSeries.name} · Khouch Potato`
+    : state.openDiskSeries ? `${state.openDiskSeries.name} · Khouch Potato`
     : state.openMovie ? `${state.openMovie.name} · Khouch Potato`
     : state.query ? `“${state.query}” · Khouch Potato`
     : "Khouch Potato";
@@ -5680,7 +5866,7 @@ async function applyPath() {
     // Back/forward out of an open movie/series modal that was launched
     // from the collection — clear it directly (mirrors the stale-modal
     // teardown the mode path does below, which our early return skips).
-    if (state.openMovie || state.openSeries) {
+    if (state.openMovie || state.openSeries || state.openDiskSeries) {
       closePosterMenu();
       el.seriesPanel.hidden = true;
       el.seriesPanel.removeAttribute("data-mode");
@@ -5689,6 +5875,9 @@ async function applyPath() {
       state.openMovieData = null;
       state.openSeries = null;
       state.openSeriesData = null;
+      state.openDiskSeries = null;
+      state.openDiskSeriesData = null;
+      restoreDiskSeriesOnlyButtons();
     }
     const sub = parts[1] === "series" ? "series" : "movie";
     enterCollection(sub, { skipUrl: true });
@@ -5702,9 +5891,10 @@ async function applyPath() {
   // against the popstate-driven URL we're already responding to).
   const openIdx = parts.indexOf("open");
   const urlOpenId = openIdx >= 0 && parts[openIdx + 1] ? untoken(parts[openIdx + 1]) : null;
-  const movieStale = state.openMovie && (mode !== "movie" || state.openMovie.id !== urlOpenId);
+  const movieStale = state.openMovie && (!(mode === "movie" || mode === "disk") || state.openMovie.id !== urlOpenId);
   const seriesStale = state.openSeries && (mode !== "series" || state.openSeries.id !== urlOpenId);
-  if (movieStale || seriesStale) {
+  const diskSeriesStale = state.openDiskSeries && (mode !== "disk" || state.openDiskSeries.id !== urlOpenId);
+  if (movieStale || seriesStale || diskSeriesStale) {
     closePosterMenu();
     el.seriesPanel.hidden = true;
     el.seriesPanel.removeAttribute("data-mode");
@@ -5713,6 +5903,9 @@ async function applyPath() {
     state.openMovieData = null;
     state.openSeries = null;
     state.openSeriesData = null;
+    state.openDiskSeries = null;
+    state.openDiskSeriesData = null;
+    restoreDiskSeriesOnlyButtons();
   }
 
   setMode(mode, { skipUrl: true, skipSelect: true });
@@ -5804,18 +5997,21 @@ async function applyPath() {
       await new Promise(r => setTimeout(r, 200));
       play(mode, item, item.name, ext);
       i += ext ? 3 : 2;
-    } else if (tok === "open" && parts[i + 1] && (mode === "series" || mode === "movie")) {
+    } else if (tok === "open" && parts[i + 1] && (mode === "series" || mode === "movie" || mode === "disk")) {
       const id = untoken(parts[i + 1]);
       if (id == null) { i += 2; continue; }
       if (!contextApplied) showHome();
-      // mode is always "series" or "movie" here (see the else-if guard
-      // above) — always resolve via the single-item endpoint; openMovie()/
-      // openSeries() immediately re-fetch full detail via /api/{mode}/info
-      // regardless, so this only needs to seed a title/icon stub.
+      // Always resolve via the single-item endpoint; openMovie()/
+      // openSeries()/openDiskSeriesGroup() immediately re-fetch full
+      // detail regardless, so this only needs to seed a title/icon stub.
       let item = await fetchSingleItem(mode, id);
       if (mode === "series") {
         if (!item) item = { id, name: parts[i + 1].replace(/^\d+-/, "").replace(/-/g, " ") || `Series ${id}` };
         openSeries(item);
+      } else if (mode === "disk") {
+        if (!item) item = { id, name: parts[i + 1].replace(/^\d+-/, "").replace(/-/g, " ") || `Item ${id}` };
+        if (item.isSeriesGroup) openDiskSeriesGroup(item);
+        else openMovie(item, "disk");
       } else {
         if (!item) item = { id, name: parts[i + 1].replace(/^\d+-/, "").replace(/-/g, " ") || `Movie ${id}` };
         openMovie(item);
@@ -6558,6 +6754,8 @@ function resetVersoTab() {
 el.seriesSeasonSelect.onchange = () => {
   if (state.openSeries && state.openSeriesData) {
     renderSeriesEpisodes(state.openSeries, state.openSeriesData, el.seriesSeasonSelect.value);
+  } else if (state.openDiskSeries && state.openDiskSeriesData) {
+    renderDiskSeriesEpisodes(state.openDiskSeries, state.openDiskSeriesData, el.seriesSeasonSelect.value);
   }
 };
 el.seriesPosterMenuBtn.onclick = (e) => {
@@ -6615,6 +6813,11 @@ el.seriesPlayBtn.onclick = () => {
     const playMode = state.openMovieMode || "movie";
     closeMovie();
     play(playMode, { id: m.id, name: m.name, container: m.container || "mp4" }, m.name);
+    return;
+  }
+  if (state.openDiskSeries && state.openDiskSeriesData) {
+    const pick = pickResumeOrFirstEpisode(state.openDiskSeries, state.openDiskSeriesData);
+    if (pick) playDiskEpisode(state.openDiskSeries, pick.ep, pick.sn);
     return;
   }
   if (!state.openSeries || !state.openSeriesData) return;

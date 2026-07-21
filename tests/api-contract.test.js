@@ -124,6 +124,27 @@ test("contract: /api/home/:mode tile carries `container` for the MKV badge", () 
   }
 });
 
+// --- /api/home/:mode disk tiles — consumed by web, Android phone, TV.
+// A disk series-group tile (Save-to-Disk episodes grouped under one
+// series) is not directly playable; clients must check `isSeriesGroup`
+// and open the episode picker instead of calling /api/stream directly.
+// Drop this field and every client silently tries (and fails) to play
+// the synthetic group id.
+test("contract: /api/home/:mode tile carries `isSeriesGroup` for disk series groups", () => {
+  const src = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "server.js"), "utf8");
+  if (!/isSeriesGroup:\s*s\.isSeriesGroup\s*\|\|\s*undefined/.test(src)) {
+    throw new Error("home tileFor() no longer emits `isSeriesGroup` — clients can't tell a disk series group from a playable movie");
+  }
+});
+
+// --- /api/disk/series/:id — episode list for a disk series-group tile.
+// Consumed by web (openDiskSeriesGroup) and Android (DiskSeriesInfo).
+test("contract: /api/disk/series/:id returns { id, name, seasons }", () => {
+  const h = handlerFor(/app\.get\("\/api\/disk\/series\/:id/);
+  expectFields("/api/disk/series/:id", h, ["id", "name", "seasons"]);
+});
+
 // --- /api/index/:mode — consumed by web, Android.
 test("contract: /api/index/:mode returns { total, done, ready, streams }", () => {
   const h = handlerFor(/app\.get\("\/api\/index\/:mode/);

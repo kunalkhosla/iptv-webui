@@ -1464,7 +1464,7 @@ function dedupTitleKey(name) {
   return `${cleaned}|${year}`;
 }
 
-async function findTmdbMatch(mode, name, hintYear, langHint) {
+async function findTmdbMatch(mode, name, hintYear, langHint, forcedKind) {
   // Disk-mode Save-to-Disk episodes are named "Series Name SxxEyy - ..."
   // (see diskDownloadDestPath) — genuinely TV content saved into the flat
   // movie-style Disk library, NOT a movie. "disk" is movie-shaped in
@@ -1473,8 +1473,14 @@ async function findTmdbMatch(mode, name, hintYear, langHint) {
   // endpoint can never find a TV series. Detect it from the name itself
   // (not from `mode`, since a real disk MOVIE must still route as movie)
   // and route this call as series-shaped, querying just the series name.
-  const episodeMatch = mode === "disk" ? String(name || "").match(/^(.+?)\s+S(\d{2})E(\d{2})\b/i) : null;
-  const effMode = episodeMatch ? "series" : mode;
+  // Individual episode files no longer reach this function directly once
+  // buildDiskIndex groups them (see stableDiskSeriesId) — this stays as
+  // defense-in-depth for any episode-shaped file reached some other way.
+  // `forcedKind` (used for the series-GROUP tile itself, whose name is
+  // just the clean series name — nothing here to detect it from) wins
+  // over both.
+  const episodeMatch = !forcedKind && mode === "disk" ? String(name || "").match(/^(.+?)\s+S(\d{2})E(\d{2})\b/i) : null;
+  const effMode = forcedKind || (episodeMatch ? "series" : mode);
   const queryName = episodeMatch ? episodeMatch[1].trim() : name;
   const action = effMode !== "series" ? "/search/movie" : "/search/tv";
   // Effective release year. The panel's movie list usually has NO year
@@ -1541,7 +1547,7 @@ async function findTmdbMatch(mode, name, hintYear, langHint) {
     // upgrade) knows this entry is TV-shaped even though its cache key is
     // "disk:<id>" — without this it would default back to disk's normal
     // movie-shaped assumption and hit /movie/<id> with a TV show's id.
-    if (projected && episodeMatch) projected.tmdb_kind = "series";
+    if (projected && (episodeMatch || forcedKind)) projected.tmdb_kind = forcedKind || "series";
     return projected;
   }
   return null;
@@ -1634,7 +1640,7 @@ async function ensureTmdbForItem(mode, id, panelHints) {
     // Detail fetch with the panel-supplied id failed — fall through
     // to the search-based path rather than caching a bad miss.
   }
-  const match = await findTmdbMatch(mode, panelHints.name, panelHints.year, panelHints.lang);
+  const match = await findTmdbMatch(mode, panelHints.name, panelHints.year, panelHints.lang, panelHints.forcedKind);
   const entry = match
     ? { ...match, source: "tmdb", checked_at: Date.now() }
     : { tmdb_id: null, source: "no-match", checked_at: Date.now() };
@@ -1669,7 +1675,7 @@ async function prewarmTmdbCache(mode, actx = currentAccount()) {
       while (active < TMDB_PREWARM_CONCURRENCY && i < items.length) {
         const it = items[i++];
         active++;
-        ensureTmdbForItem(mode, it.id, { name: it.name, year: it.year, lang: isoLangForItem(it) })
+        ensureTmdbForItem(mode, it.id, { name: it.name, year: it.year, lang: isoLangForItem(it), forcedKind: it.isSeriesGroup ? "series" : undefined })
           .catch(() => {})
           .finally(() => {
             active--;
@@ -2717,6 +2723,46 @@ function parseTitleYear(basename) {
   return { title: title || s, year };
 }
 
+// Save-to-Disk names series episodes "Series Name SxxEyy - EpisodeTitle
+// (Year)" (see diskDownloadDestPath). Detect that shape so buildDiskIndex
+// can group episodes under one series tile instead of a flat per-file
+// dump — with a big downloaded show (Entourage: 18 episodes) a flat list
+// becomes unmanageable, one tile per episode. Returns null for anything
+// else (real movies, manually-placed files) — those stay flat, one tile
+// per file, exactly as today.
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function parseDiskEpisode(basename) {
+  let s = String(basename).replace(/\.[a-z0-9]+$/i, "");
+  s = s.replace(/[._]+/g, " ").replace(/\s+/g, " ").trim();
+  const m = s.match(/^(.+?)\s+S(\d{2})E(\d{2})\b\s*-?\s*(.*)$/i);
+  if (!m) return null;
+  const seriesName = m[1].trim();
+  if (!seriesName) return null;
+  let episodeTitle = m[4].trim();
+  // The Android season/episode picker's disk-download POST sometimes
+  // sends an episodeTitle that re-includes "Series SxxEyy - " itself
+  // (a client-side quirk, not this server's doing) — e.g. filenames
+  // like "Entourage S03E13 - Entourage - S03E13 - Less Than 30 (2004)".
+  // Strip that redundant repeat so the episode row shows a clean title
+  // ("Less Than 30") instead of the whole thing again.
+  const redundantPrefix = new RegExp(`^${escapeRegExp(seriesName)}\\s*-?\\s*S\\d{2}E\\d{2}\\s*-?\\s*`, "i");
+  episodeTitle = episodeTitle.replace(redundantPrefix, "").trim();
+  // Strip the trailing "(Year)" that parseTitleYear would otherwise
+  // extract — the episode picker shows its own season/episode number,
+  // the year belongs to the series as a whole, not repeated per-row.
+  episodeTitle = episodeTitle.replace(/\((19\d{2}|20\d{2})\)\s*$/, "").trim();
+  const yearMatch = s.match(/\((19\d{2}|20\d{2})\)\s*$/);
+  return {
+    seriesName,
+    season: parseInt(m[2], 10),
+    episodeNum: parseInt(m[3], 10),
+    episodeTitle: episodeTitle || null,
+    year: yearMatch ? yearMatch[1] : null,
+  };
+}
+
 // One ffprobe per file, cached by absPath+mtime. Returns
 // {video:{codec,width,height}, audioTracks:[…], subTracks:[…]} or null.
 function analyzeDiskFile(absPath, mtimeMs) {
@@ -2755,6 +2801,17 @@ function analyzeDiskFile(absPath, mtimeMs) {
 function stableDiskId(relpath) {
   const hex = crypto.createHash("sha1").update(relpath).digest("hex").slice(0, 13);
   return parseInt(hex, 16); // ≤ 2^52, safe integer, unique within the disk mode
+}
+
+// Synthetic id for a series-group tile — keyed by series NAME (not a
+// filepath, unlike stableDiskId), so the same show groups to the same
+// tile across rescans regardless of which episode files exist at any
+// given time. Distinct hash prefix ("series:" salt) so a series group
+// can never collide with a real file's id in the same disk:<id>
+// tmdbCache / byId namespace.
+function stableDiskSeriesId(seriesName) {
+  const hex = crypto.createHash("sha1").update(`series:${seriesName.toLowerCase()}`).digest("hex").slice(0, 13);
+  return parseInt(hex, 16);
 }
 
 const LANG_LABELS = {
@@ -2823,11 +2880,15 @@ async function buildDiskIndex(actx, rootPath) {
     const byId = new Map();
     const meta = new Map();
     const cats = new Map(); // catId -> catName
+    // Save-to-Disk episodes group under one series tile instead of a
+    // flat per-file dump (a big downloaded show would otherwise be
+    // dozens of individual tiles — unmanageable). seriesId -> group.
+    const seriesGroups = new Map();
     for (const f of files) {
       const a = analyzeDiskFile(f.absPath, f.mtimeMs);
       ix.done++;
       if (!a || !a.video) continue; // not a real video / probe failed
-      const { title, year } = parseTitleYear(path.basename(f.relpath));
+      const basename = path.basename(f.relpath);
       const id = stableDiskId(f.relpath);
       // catId stays derived from the raw folder name so it's stable even
       // if the display label below changes — only the label is prettied
@@ -2841,14 +2902,38 @@ async function buildDiskIndex(actx, rootPath) {
       const backdropPath = [`${baseNoExt}-backdrop.jpg`, `${baseNoExt}-fanart.jpg`].find(p => { try { return fs.statSync(p).isFile(); } catch { return false; } }) || null;
       const container = path.extname(f.relpath).slice(1).toLowerCase();
       const maxCh = a.audioTracks.reduce((mx, t) => Math.max(mx, t.channels || 0), 0);
+      // client-safe audio/sub track summaries for the player selector
+      const audioTracks = a.audioTracks.map(t => ({ index: t.i, codec: t.codec, channels: t.channels, lang: t.lang, label: t.title || langLabel(t.lang) || `Audio ${t.i + 1}`, default: t.default }));
+      const subtitleTracks = a.subTracks.map(t => ({ index: t.i, codec: t.codec, lang: t.lang, kind: t.kind, label: t.title || langLabel(t.lang) || `Subtitle ${t.i + 1}` }));
+      // meta always gets a per-file entry, grouped or not — playback
+      // (/api/stream/disk/:id) resolves the REAL underlying file by its
+      // own id regardless of whether the tile shown for it was a series
+      // group or a standalone movie.
+      meta.set(id, { absPath: f.absPath, root: rootPath, container, video: a.video, audioTracks: a.audioTracks, subTracks: a.subTracks, posterPath, backdropPath, durationSecs: a.durationSecs || null });
+
+      const episodeInfo = parseDiskEpisode(basename);
+      if (episodeInfo) {
+        const seriesId = stableDiskSeriesId(episodeInfo.seriesName);
+        let group = seriesGroups.get(seriesId);
+        if (!group) {
+          group = { seriesId, seriesName: episodeInfo.seriesName, catId, catName, year: episodeInfo.year, episodes: [] };
+          seriesGroups.set(seriesId, group);
+        }
+        group.episodes.push({
+          id, season: episodeInfo.season, episodeNum: episodeInfo.episodeNum,
+          title: episodeInfo.episodeTitle,
+          container, durationSecs: a.durationSecs || null,
+          audio_channels: maxCh || null,
+        });
+        continue; // absorbed into the series group, not its own tile
+      }
+
+      const { title, year } = parseTitleYear(basename);
       let tags = streamTagsFor(title, ["disk"]);
       if (!tags.includes("disk")) tags = [...tags, "disk"];
       if (classifyAs4k(a.video.width, a.video.height) && !tags.includes("4k")) tags = [...tags, "4k"];
       if (maxCh >= 3 && !tags.includes("surround")) tags = [...tags, "surround"];
       const tmdbEntry = tmdbCache[`disk:${id}`];
-      // client-safe audio/sub track summaries for the player selector
-      const audioTracks = a.audioTracks.map(t => ({ index: t.i, codec: t.codec, channels: t.channels, lang: t.lang, label: t.title || langLabel(t.lang) || `Audio ${t.i + 1}`, default: t.default }));
-      const subtitleTracks = a.subTracks.map(t => ({ index: t.i, codec: t.codec, lang: t.lang, kind: t.kind, label: t.title || langLabel(t.lang) || `Subtitle ${t.i + 1}` }));
       byId.set(id, {
         id, name: title, year: year || null,
         icon: posterPath ? `/api/diskart/${id}/poster?acct=${diskAcctId(actx)}` : null,
@@ -2863,7 +2948,37 @@ async function buildDiskIndex(actx, rootPath) {
         audioTracks, subtitleTracks,
         tags,
       });
-      meta.set(id, { absPath: f.absPath, root: rootPath, container, video: a.video, audioTracks: a.audioTracks, subTracks: a.subTracks, posterPath, backdropPath, durationSecs: a.durationSecs || null });
+    }
+    // One synthetic tile per series group, keyed by series name so it
+    // stays the same tile across rescans. No sidecar poster of its own
+    // (icon: null) — same as any disk movie with no local poster file,
+    // it picks up a real poster from tmdb_id via the normal downstream
+    // TMDB-compositing path once ensureTmdbForItem/prewarmTmdbCache
+    // matches it (isSeriesGroup tells prewarmTmdbCache to force a
+    // series-shaped TMDB search rather than disk's movie-shaped default
+    // — see prewarmTmdbCache). The episode list itself is server-only
+    // (meta), read by GET /api/disk/series/:id for the episode picker.
+    for (const group of seriesGroups.values()) {
+      const seriesId = group.seriesId;
+      group.episodes.sort((x, y) => x.season - y.season || x.episodeNum - y.episodeNum);
+      const tmdbEntry = tmdbCache[`disk:${seriesId}`];
+      byId.set(seriesId, {
+        id: seriesId, name: group.seriesName, year: group.year || null,
+        icon: null,
+        category_id: group.catId, category_name: group.catName,
+        container: null,
+        rating: null,
+        us_cert: tmdbEntry?.us_cert || null,
+        tmdb_id: tmdbEntry?.tmdb_id || null,
+        audio_channels: null,
+        audio_codec: null,
+        durationSecs: null,
+        audioTracks: [], subtitleTracks: [],
+        tags: ["disk", "series-group"],
+        isSeriesGroup: true,
+        episodeCount: group.episodes.length,
+      });
+      meta.set(seriesId, { isSeriesGroup: true, seriesName: group.seriesName, episodes: group.episodes });
     }
     ix.byId = byId;
     ix.meta = meta;
@@ -3299,7 +3414,10 @@ function resolveDiskRequest(kind, req, requireSig = true) {
   if (!user) return null;
   const actx = getAccountForUser(user);
   const meta = getIndexesFor(actx).disk?.meta?.get(id);
-  if (!meta) return null;
+  // A series-group entry has no absPath (it's not a real file) — not
+  // reachable today (nothing signs a disk URL for a group id), but
+  // path.resolve(undefined) below would throw if that ever changes.
+  if (!meta || meta.isSeriesGroup) return null;
   // containment: absPath must live under the configured root
   const root = path.resolve(meta.root || userDiskPath(user) || "");
   const abs = path.resolve(meta.absPath);
@@ -4994,6 +5112,11 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       // screens — null until then.
       audio_channels: s.audio_channels ?? null,
       audio_codec: s.audio_codec ?? null,
+      // Disk-only: a synthetic tile grouping Save-to-Disk episodes under
+      // one series (see buildDiskIndex) — the client opens the episode
+      // picker instead of playing this id directly.
+      isSeriesGroup: s.isSeriesGroup || undefined,
+      episodeCount: s.episodeCount || undefined,
     };
   };
   const heroFor = (s) => {
@@ -5014,6 +5137,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       rating: t?.rating || null,
       runtime: t?.runtime || null,
       us_cert: t?.us_cert || null,
+      isSeriesGroup: s.isSeriesGroup || undefined,
     };
   };
 
@@ -6413,6 +6537,7 @@ app.get("/api/search/all", async (req, res, next) => {
         category_id: s.category_id,
         tags: s.tags || [],
         container: s.container || null,
+        isSeriesGroup: s.isSeriesGroup || undefined,
       };
     };
     const eligible = (s) => {
@@ -6703,6 +6828,7 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
       poster: t?.poster_path ? `${TMDB_IMG_BASE}/w154${t.poster_path}` : null,
       category_id: s.category_id,
       category_name: catName.get(String(s.category_id)) || null,
+      isSeriesGroup: s.isSeriesGroup || undefined,
     };
   });
   // EPG programme-title pass for live — same rationale as the
@@ -7036,7 +7162,7 @@ app.get("/api/poster/:mode(movie|series|disk)/:id", async (req, res, next) => {
     const numId = parseInt(id, 10);
     const item = (indexes[mode].byId.get(numId) || indexes[mode].byId.get(id));
     if (!item) return res.status(404).json({ error: "unknown id" });
-    const entry = await ensureTmdbForItem(mode, id, { name: item.name, year: item.year, lang: isoLangForItem(item) });
+    const entry = await ensureTmdbForItem(mode, id, { name: item.name, year: item.year, lang: isoLangForItem(item), forcedKind: item.isSeriesGroup ? "series" : undefined });
     // 10 min cache — TMDB metadata changes slowly and the TV app's
     // OkHttp disk cache picks this up to avoid network round-trips
     // when the user re-opens the same title.
@@ -7137,7 +7263,7 @@ async function retryTmdbNoMatches({ onProgress } = {}) {
         const name = item?.name;
         const year = item?.year;
         if (!name) { tally.errors++; continue; }
-        const match = await findTmdbMatch(c.mode, name, year, isoLangForItem(item));
+        const match = await findTmdbMatch(c.mode, name, year, isoLangForItem(item), item?.isSeriesGroup ? "series" : undefined);
         if (match && match.tmdb_id) {
           tmdbCache[c.key] = { ...match, source: "tmdb", checked_at: Date.now() };
           tally.promoted++;
@@ -7199,7 +7325,7 @@ async function revalidateTmdbYears({ onProgress } = {}) {
     const yearBad = nameYear && Number.isFinite(tmdbYear) && Math.abs(nameYear - tmdbYear) > 1;
     const langBad = lang && entry.original_language && entry.original_language !== lang;
     if (!yearBad && !langBad) continue;
-    candidates.push({ key, mode, id, name: item.name, nameYear, tmdbYear, lang, reason: yearBad ? "year" : "lang" });
+    candidates.push({ key, mode, id, name: item.name, nameYear, tmdbYear, lang, reason: yearBad ? "year" : "lang", forcedKind: item.isSeriesGroup ? "series" : undefined });
   }
   tally.scanned = Object.keys(tmdbCache).length;
   tally.mismatched = candidates.length;
@@ -7210,7 +7336,7 @@ async function revalidateTmdbYears({ onProgress } = {}) {
     while (i < candidates.length) {
       const c = candidates[i++];
       try {
-        const match = await findTmdbMatch(c.mode, c.name, c.nameYear, c.lang);
+        const match = await findTmdbMatch(c.mode, c.name, c.nameYear, c.lang, c.forcedKind);
         const cur = tmdbCache[c.key];
         // For a lang candidate, only accept a re-match that actually
         // resolved to the wanted language — otherwise the regional-default
@@ -8740,6 +8866,50 @@ app.post("/api/admin/disk-config", express.json(), async (req, res) => {
   res.json({ ok: true, path: resolved || "", enabled: userDiskEnabled(req.user), count });
 });
 
+// Episode list for a disk series-group tile (see buildDiskIndex /
+// stableDiskSeriesId) — the client's disk detail screen calls this
+// instead of playing the tile directly when it sees `isSeriesGroup`.
+// Deliberately its OWN shape (not a copy of the Xtream get_series_info
+// tree /api/series/info returns) — disk has no real season metadata,
+// just what parseDiskEpisode inferred from filenames, so a purpose-built
+// {seasons:[{season,episodes:[...]}]} shape is simpler and less fragile
+// than mimicking the panel's shape for data that isn't panel-shaped.
+app.get("/api/disk/series/:id", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  const ix = getIndexesFor(req.account).disk;
+  const numId = parseInt(req.params.id, 10);
+  const tile = ix?.byId?.get(numId) || ix?.byId?.get(req.params.id);
+  const info = ix?.meta?.get(numId) || ix?.meta?.get(req.params.id);
+  if (!tile || !info || !info.isSeriesGroup) {
+    return res.status(404).json({ ok: false, error: "not a series group" });
+  }
+  const tmdbEntry = tmdbCache[`disk:${tile.id}`];
+  const seasons = new Map();
+  for (const ep of info.episodes) {
+    if (!seasons.has(ep.season)) seasons.set(ep.season, []);
+    seasons.get(ep.season).push({
+      id: ep.id,
+      episodeNum: ep.episodeNum,
+      title: ep.title || `Episode ${ep.episodeNum}`,
+      container: ep.container,
+      durationSecs: ep.durationSecs,
+      audioChannels: ep.audio_channels,
+    });
+  }
+  res.json({
+    id: tile.id,
+    name: tile.name,
+    year: tile.year,
+    poster: tmdbEntry?.poster_path ? `${TMDB_IMG_BASE}/w342${tmdbEntry.poster_path}` : null,
+    backdrop: tmdbEntry?.backdrop_path ? `${TMDB_IMG_BASE}/w780${tmdbEntry.backdrop_path}` : null,
+    plot: tmdbEntry?.plot || null,
+    us_cert: tile.us_cert,
+    seasons: [...seasons.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([season, episodes]) => ({ season, episodes })),
+  });
+});
+
 // Client-safe projection of a job — omits internal fields (pausedReason
 // is informative enough without exposing the raw killer/abort plumbing).
 function projectDiskDownloadJob(j) {
@@ -9803,17 +9973,34 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   // codec metadata (no network probe). Return signed same-origin URLs; the
   // absolute path never reaches the client. Honors ?audio=<idx> / ?sub=<idx>.
   if (req.params.mode === "disk") {
-    if (!Number.isFinite(idInt) || !indexes.disk?.byId?.has(idInt)) {
+    const actx = currentAccount();
+    // Sourced from meta, NOT indexes.disk.byId — a series-group's
+    // episode files were deliberately excluded from byId (buildDiskIndex
+    // groups them under one synthetic tile there); byId only has real,
+    // independently-playable files PLUS series-group placeholders. meta
+    // has an entry for every real file regardless of whether it's
+    // grouped for display, which is exactly what playback needs.
+    const meta = Number.isFinite(idInt) ? getIndexesFor(actx).disk.meta.get(idInt) : null;
+    if (!meta) {
       return res.status(404).json({ error: "not in catalog" });
     }
-    const actx = currentAccount();
+    // A series-group tile isn't a real file — no absPath, nothing to
+    // stream. The client should be hitting GET /api/disk/series/:id and
+    // playing one of ITS episode ids (each a real file), never this one
+    // directly; a stray direct hit (stale link, bad client code) gets a
+    // clean 400 instead of the transcoder choking on an undefined path.
+    if (meta.isSeriesGroup) {
+      return res.status(400).json({ error: "series group has no playable file", hint: "fetch /api/disk/series/:id and play an episode id instead" });
+    }
     const acctId = diskAcctId(actx);
-    const meta = getIndexesFor(actx).disk.meta.get(idInt) || {};
-    const entry = indexes.disk.byId.get(idInt) || {};
     const offset = normalizeOffsetSecs(req.query.t);
     const audio = normalizeAudio(req.query.a);
-    const audioTracks = entry.audioTracks || [];
-    const subtitleTracks = entry.subtitleTracks || [];
+    // Client-safe shape — same mapping buildDiskIndex uses to build a
+    // tile's byId entry, recomputed here since episode files no longer
+    // have their own byId entry (only meta, which keeps the raw probed
+    // tracks: {i, codec, channels, lang, title, default}).
+    const audioTracks = (meta.audioTracks || []).map(t => ({ index: t.i, codec: t.codec, channels: t.channels, lang: t.lang, label: t.title || langLabel(t.lang) || `Audio ${t.i + 1}`, default: t.default }));
+    const subtitleTracks = (meta.subTracks || []).map(t => ({ index: t.i, codec: t.codec, lang: t.lang, kind: t.kind, label: t.title || langLabel(t.lang) || `Subtitle ${t.i + 1}` }));
     const defAudioIdx = audioTracks.findIndex(t => t.default);
     const baseAudioIdx = defAudioIdx >= 0 ? defAudioIdx : 0;
     const reqAudio = parseInt(req.query.audio, 10);
@@ -9821,7 +10008,7 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     const selAudioIdx = Number.isFinite(reqAudio) ? reqAudio : baseAudioIdx;
     const selAudio = audioTracks[selAudioIdx];
     const selSub = Number.isFinite(reqSub) ? subtitleTracks[reqSub] : null;
-    const container = (entry.container || "").toLowerCase();
+    const container = (meta.container || "").toLowerCase();
     // Chrome's <video> can only direct-play a handful of containers,
     // regardless of codec. mkv/avi/ts must be remuxed through the
     // transcoder (HLS) even when their codecs are themselves fine.
@@ -9856,7 +10043,7 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
       transcodeAnchorSecs: offset,
       forceTranscode: need,
       forceReason: reason,
-      durationSecs: entry.durationSecs || meta.durationSecs || null,
+      durationSecs: meta.durationSecs || null,
       audioTracks,
       subtitleTracks,
       subtitleUrls,
