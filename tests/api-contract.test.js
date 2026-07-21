@@ -209,8 +209,13 @@ test("contract: /api/:mode/streams stays a bare array unless ?limit, else { item
   }
   // paginated branch shape
   expectFields("/api/:mode/streams paginated", h, ["items", "total", "hasMore"]);
-  // bare-array default must remain (both index + panel-fallback paths)
-  if (!/return res\.json\(deduped\)/.test(h) || !/res\.json\(mapped\)/.test(h)) {
+  // bare-array default must remain (both index + panel-fallback paths).
+  // Allows an optional .map(...) — e.g. the disk/VOD icon→TMDB-poster
+  // fallback — since .map() on an array still returns a bare array,
+  // which is the actual contract being pinned here (not the literal
+  // absence of any transform).
+  if (!/return res\.json\(deduped(?:\.map\([^)]*\))?\)/.test(h) ||
+      !/res\.json\(mapped(?:\.map\([^)]*\))?\)/.test(h)) {
     throw new Error("/streams must still return a bare array when ?limit is absent");
   }
 });
