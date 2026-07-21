@@ -6935,20 +6935,21 @@ app.get("/api/:mode(live|movie|series|disk)/streams", async (req, res, next) => 
     const mode = req.params.mode;
     const ix = indexes[mode];
     const catId = req.query.category_id ? String(req.query.category_id) : null;
-    // Panel `icon` is unreliable for movie/series VOD (frequently blank),
-    // and disk only has one when a local sidecar poster file exists next
-    // to the video — most saved titles have neither — so plenty of disk
-    // items hit this the same way VOD does. Same rationale as
-    // /api/search/:mode's poster fallback. Unlike that endpoint this one
-    // can't add a separate `poster` field without a client-model change
-    // (the Android Stream model only has `icon`), so this overrides
-    // `icon` in the RESPONSE only when it's already empty — never
-    // mutates the shared index entry. Without this, "See All" on a disk
-    // category showed 400+ blank tiles (no sidecar poster + TMDB posters
-    // only composited by /api/home + /api/poster + /api/search today,
-    // not here).
+    // TMDB poster wins whenever a match exists — mirroring /api/home's
+    // tileFor (poster is TMDB-first, icon is only the fallback) and the
+    // client's own toStream() convention (`icon = poster ?: icon`).
+    // This is NOT just "fill in a blank icon": disk's raw `icon` is
+    // frequently a same-origin-relative sidecar path
+    // (`/api/diskart/<id>/poster`) that a browser resolves fine against
+    // its own origin but Android's Coil can't load at all (no base URL
+    // to resolve against) — so a disk item can have a perfectly
+    // "present" icon that's still unusable client-side. Every other
+    // read path (/api/home, /api/search/:mode) already prefers TMDB for
+    // exactly this reason; this endpoint was the one place that didn't,
+    // which is why "See All" on a disk category showed 400+ blank tiles
+    // even though every item technically had a non-null `icon`.
     const withPosterFallback = (s) => {
-      if (s.icon || mode === "live") return s;
+      if (mode === "live") return s;
       const t = tmdbCache[`${mode}:${s.id}`];
       if (!t?.poster_path) return s;
       return { ...s, icon: `${TMDB_IMG_BASE}/w154${t.poster_path}` };
