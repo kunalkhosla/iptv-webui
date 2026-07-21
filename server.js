@@ -1465,9 +1465,18 @@ function dedupTitleKey(name) {
 }
 
 async function findTmdbMatch(mode, name, hintYear, langHint) {
-  // "disk" is movie-shaped (see extractUsCert's comment) — only "series"
-  // routes to the TV-side TMDB endpoints.
-  const action = mode !== "series" ? "/search/movie" : "/search/tv";
+  // Disk-mode Save-to-Disk episodes are named "Series Name SxxEyy - ..."
+  // (see diskDownloadDestPath) — genuinely TV content saved into the flat
+  // movie-style Disk library, NOT a movie. "disk" is movie-shaped in
+  // general (see extractUsCert's comment) but this ONE filename shape is
+  // the exception: searching the raw episode title against TMDB's movie
+  // endpoint can never find a TV series. Detect it from the name itself
+  // (not from `mode`, since a real disk MOVIE must still route as movie)
+  // and route this call as series-shaped, querying just the series name.
+  const episodeMatch = mode === "disk" ? String(name || "").match(/^(.+?)\s+S(\d{2})E(\d{2})\b/i) : null;
+  const effMode = episodeMatch ? "series" : mode;
+  const queryName = episodeMatch ? episodeMatch[1].trim() : name;
+  const action = effMode !== "series" ? "/search/movie" : "/search/tv";
   // Effective release year. The panel's movie list usually has NO year
   // field — the year lives only in the title ("Blind (2023)"). Parse it
   // from the name as a fallback. Without a year, a generic query like
@@ -1491,10 +1500,10 @@ async function findTmdbMatch(mode, name, hintYear, langHint) {
   // that the strict pass leaves as garbage; the loose pass collapses
   // dot-separators into spaces and tries again.
   for (const strict of [true, false]) {
-    const cleaned = cleanPanelTitle(name, { strict });
+    const cleaned = cleanPanelTitle(queryName, { strict });
     if (!cleaned) continue;
     const params = { query: cleaned };
-    if (effYear) params[mode !== "series" ? "year" : "first_air_date_year"] = String(effYear);
+    if (effYear) params[effMode !== "series" ? "year" : "first_air_date_year"] = String(effYear);
     const searchRes = await tmdb(action, params);
     const results = searchRes && Array.isArray(searchRes.results) ? searchRes.results : [];
     if (!results.length) continue;
@@ -1525,9 +1534,15 @@ async function findTmdbMatch(mode, name, hintYear, langHint) {
     // append_to_response folds certification + credits + videos +
     // reviews + keywords + recommendations + similar + external_ids
     // into one call (TMDB allows up to 20 appends).
-    const detailAction = mode !== "series" ? `/movie/${pick.id}` : `/tv/${pick.id}`;
-    const detail = await tmdb(detailAction, { append_to_response: TMDB_DETAIL_APPENDS(mode) });
-    return projectTmdbDetail(mode, detail || pick, cleaned);
+    const detailAction = effMode !== "series" ? `/movie/${pick.id}` : `/tv/${pick.id}`;
+    const detail = await tmdb(detailAction, { append_to_response: TMDB_DETAIL_APPENDS(effMode) });
+    const projected = projectTmdbDetail(effMode, detail || pick, cleaned);
+    // Stamped so a later refetchTmdbDetail (cert backfill, cache-schema
+    // upgrade) knows this entry is TV-shaped even though its cache key is
+    // "disk:<id>" — without this it would default back to disk's normal
+    // movie-shaped assumption and hit /movie/<id> with a TV show's id.
+    if (projected && episodeMatch) projected.tmdb_kind = "series";
+    return projected;
   }
   return null;
 }
@@ -1552,12 +1567,20 @@ const TMDB_DETAIL_APPENDS = (mode) => {
 
 // Re-fetch TMDB detail for an already-matched item by tmdb_id. Used
 // to backfill new fields on old cache entries without re-running the
-// search step. Returns the projected entry, or null on failure.
-async function refetchTmdbDetail(mode, tmdbId) {
-  const detailAction = mode !== "series" ? `/movie/${tmdbId}` : `/tv/${tmdbId}`;
-  const detail = await tmdb(detailAction, { append_to_response: TMDB_DETAIL_APPENDS(mode) });
+// search step. `kindOverride` ("movie"|"series"), when given, wins over
+// `mode`'s default assumption — needed for a disk-mode Save-to-Disk
+// episode entry (cache key "disk:<id>"), which findTmdbMatch stamps
+// `tmdb_kind: "series"` on since its tmdb_id is a TV show's, not a
+// movie's, even though disk mode is movie-shaped by default. Returns
+// the projected entry, or null on failure.
+async function refetchTmdbDetail(mode, tmdbId, kindOverride) {
+  const effMode = kindOverride || mode;
+  const detailAction = effMode !== "series" ? `/movie/${tmdbId}` : `/tv/${tmdbId}`;
+  const detail = await tmdb(detailAction, { append_to_response: TMDB_DETAIL_APPENDS(effMode) });
   if (!detail) return null;
-  return projectTmdbDetail(mode, detail, detail.title || detail.name || "");
+  const projected = projectTmdbDetail(effMode, detail, detail.title || detail.name || "");
+  if (projected && kindOverride) projected.tmdb_kind = kindOverride;
+  return projected;
 }
 
 // Entry point used by the /api/poster routes. Reads cache (with negative
@@ -1575,7 +1598,7 @@ async function ensureTmdbForItem(mode, id, panelHints) {
     && existing.tmdb_id
     && !("us_cert" in existing);
   if (needsCertBackfill) {
-    const refreshed = await refetchTmdbDetail(mode, existing.tmdb_id);
+    const refreshed = await refetchTmdbDetail(mode, existing.tmdb_id, existing.tmdb_kind);
     if (refreshed) {
       const entry = { ...refreshed, source: "tmdb", checked_at: Date.now() };
       tmdbCache[cacheKey] = entry;
@@ -8374,7 +8397,7 @@ async function backfillTmdbCacheV2({ onProgress } = {}) {
     if ("vote_count" in entry) continue; // already upgraded
     const [mode, id] = key.split(":");
     if (!["movie", "series", "disk"].includes(mode) || !id) continue;
-    candidates.push({ key, mode, id, tmdb_id: entry.tmdb_id });
+    candidates.push({ key, mode, id, tmdb_id: entry.tmdb_id, kind: entry.tmdb_kind });
   }
   tally.scanned = candidates.length;
   onProgress?.({ phase: "start", candidates: candidates.length });
@@ -8389,7 +8412,7 @@ async function backfillTmdbCacheV2({ onProgress } = {}) {
       const c = candidates[i++];
       tally.retried++;
       try {
-        const fresh = await refetchTmdbDetail(c.mode, c.tmdb_id);
+        const fresh = await refetchTmdbDetail(c.mode, c.tmdb_id, c.kind);
         if (fresh && fresh.tmdb_id) {
           tmdbCache[c.key] = { ...fresh, source: "tmdb", checked_at: Date.now() };
           tally.upgraded++;

@@ -5586,6 +5586,15 @@ function tokenize(id, name) {
   // itself when no panel category matches) would double-slug as
   // "__rail-action-rail-action". Emit the id verbatim.
   if (typeof id === "string" && id.startsWith("__rail-")) return id;
+  // Disk category ids (slugifyCat(folderName) server-side, e.g.
+  // "downloads") are non-numeric strings, unlike every other mode's
+  // panel category ids. untoken() recovers an id via parseInt, which
+  // only works when the id itself is the leading digits of the token —
+  // appending "-<slug>" here would make refreshing/deep-linking a disk
+  // category URL untokenize to null and blank the page (same failure
+  // shape the __rail- case above already exists to avoid). Any id that
+  // isn't itself numeric must round-trip verbatim, with no suffix.
+  if (typeof id === "string" && !/^\d+$/.test(id)) return id;
   const slug = slugify(name);
   return slug ? `${id}-${slug}` : String(id);
 }
@@ -5738,7 +5747,10 @@ async function applyPath() {
            r.category_id === `__rail-${seg.replace(/^__rail-/, "")}`));
         if (rail) await selectCategory(rail.category_id, { skipUrl: true });
       } else {
-        const id = untoken(parts[i + 1]);
+        // Falls back to the raw segment for non-numeric ids (disk
+        // categories) — tokenize() now emits those verbatim with no
+        // appended slug, so the segment itself IS the id.
+        const id = untoken(parts[i + 1]) ?? parts[i + 1];
         if (id != null) await selectCategory(id, { skipUrl: true });
       }
       contextApplied = true;
