@@ -9255,6 +9255,24 @@ function stopTranscoder(t, reason = "?") {
   try { t.proc.kill("SIGTERM"); } catch {}
 }
 
+// Sum of #EXTINF durations already written to a VOD transcoder's on-disk
+// playlist — the actual elapsed seconds produced so far. NOT segment-count *
+// nominal -hls_time: the muxer cuts at the next keyframe at-or-after that
+// target, and GOP size here is pinned to a fixed 48 frames, so real segment
+// duration is 48/sourceFps rounded up to the next GOP boundary ≥ hls_time —
+// exactly 4s only at 24fps; ~4.8s at 30fps, ~5.76s at 25fps. A respawn seek
+// offset built from segment count alone would drift further off with every
+// respawn on any non-24fps source. Reading the real EXTINF values sidesteps
+// the framerate math entirely.
+function playlistElapsedSecs(dir) {
+  try {
+    const text = fs.readFileSync(path.join(dir, "index.m3u8"), "utf8");
+    let total = 0;
+    for (const m of text.matchAll(/#EXTINF:([\d.]+),/g)) total += parseFloat(m[1]);
+    return total;
+  } catch { return 0; }
+}
+
 // Newest seg mtime + next free segment number for a live transcoder dir.
 function liveSegStats(dir) {
   let maxN = -1, newest = 0;
@@ -9608,6 +9626,18 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
   // than seeing a fresh stream. sourceUrl below is rebuilt fresh either way —
   // that's what recovers a CDN-host/token rotation.
   const startNumber = respawn ? respawn.startNumber : 0;
+  // A VOD respawn must seek the NEW process to where the dying one actually
+  // left off — the session's original offsetSecs plus the REAL elapsed time
+  // already produced (playlistElapsedSecs, summed from the playlist's own
+  // EXTINF values — segment-count * nominal hls_time drifts on anything but
+  // a 24fps source, see that function's comment). Without this, a respawn
+  // restarts the input at the session's original anchor and duplicates
+  // everything already played into the (appended) playlist — a visible
+  // rewind instead of a brief rebuffer. Live has no such offset (unseekable,
+  // always "now"), so this only matters for movie/series.
+  const effectiveOffsetSecs = (respawn && mode !== "live")
+    ? offsetSecs + playlistElapsedSecs(dir)
+    : offsetSecs;
   // Source container ext. Live is always HLS; VOD has to match the
   // actual file on the panel — mp4 hardcode was breaking ALL .mkv
   // titles (Bajirao Mastani 4K, etc.) with "Invalid data found when
@@ -9719,8 +9749,8 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     if (hw && !preset.copy) {
       args.push("-vaapi_device", VAAPI_DEVICE);
     }
-    if (offsetSecs > 0 && mode !== "live") {
-      args.push("-ss", String(offsetSecs));
+    if (effectiveOffsetSecs > 0 && mode !== "live") {
+      args.push("-ss", String(effectiveOffsetSecs));
     }
     args.push("-i", sourceUrl, "-map", "0:v:0", "-map", `0:a:${audioTrack}?`);
     if (preset.copy) {
@@ -9776,9 +9806,14 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     // The idle reaper still cleans the whole dir when the user navigates
     // away (after the shared idle grace), so this doesn't leak disk
     // across sessions.
+    // -start_number + append_list on respawn mirror live's self-heal: the
+    // new process continues the SAME growing playlist instead of
+    // overwriting it from segment 0, so a mid-movie panel connection drop
+    // is a brief rebuffer, not a dead stream.
     args.push(
       "-hls_list_size", "0",
-      "-hls_flags", "independent_segments",
+      "-start_number", String(startNumber),
+      "-hls_flags", "independent_segments" + (respawn ? "+append_list" : ""),
     );
   }
   args.push(path.join(dir, "index.m3u8"));
@@ -9809,11 +9844,17 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     const tail = stderrBuf.split("\n").filter(Boolean).slice(-3).join(" | ");
     const now = Date.now();
     entry.restarts = (entry.restarts || []).filter((ts) => now - ts < RESTART_WINDOW_MS);
-    // Live transcoders self-heal: an unexpected exit (provider EOF / I/O error,
-    // CDN-host rotation, or a watchdog SIGTERM of a wedged ffmpeg) respawns
-    // against a freshly-built panel URL while a viewer is still connected.
-    // Terminal cleanup on a deliberate stop, VOD, an abandoned stream, or a
-    // flapping channel that's blown the restart cap.
+    // Self-heal: an unexpected exit (provider EOF / I/O error, CDN-host
+    // rotation, or a watchdog SIGTERM of a wedged ffmpeg) respawns against a
+    // freshly-built panel URL while a viewer is still connected. Panel-backed
+    // modes only (live, movie, series) — disk reads a local file, so an
+    // unexpected exit there is a real error respawning would just loop on,
+    // not a dropped upstream connection. VOD didn't get this before: the
+    // panel closes long-lived movie/series downloads after ~10-20 min (looks
+    // to ffmpeg like a clean EOF, exit 0) and every session died outright —
+    // no continuation, the viewer had to manually re-open and resume. Terminal
+    // cleanup on a deliberate stop, an abandoned stream, or a flapping source
+    // that's blown the restart cap.
     const recentViewer = now - entry.lastAccess < idleWindowMs();
     // Did THIS ffmpeg run emit a segment? If so, the channel is live — remember it
     // for the lifetime of this entry (survives respawns).
@@ -9855,15 +9896,15 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     //    fail fast so we don't machine-gun the cap=1 panel into locking the account.
     const slotHeldRetry = connectFail && entry.everConnected
       && (entry.slotRetries || 0) < MAX_SLOT_RETRIES;
-    const canRespawn = !entry.stopping && mode === "live" && recentViewer
+    const canRespawn = !entry.stopping && !isLocalMode(mode) && recentViewer
       && entry.restarts.length < MAX_RESTARTS
       && (!connectFail || slotHeldRetry);
     if (!canRespawn) {
-      const note = (entry.stopping || mode !== "live") ? ""
+      const note = (entry.stopping || isLocalMode(mode)) ? ""
         : !recentViewer ? " (viewer gone)"
         : (connectFail && !entry.everConnected) ? " (input unavailable — not respawning)"
-        : connectFail ? " (slot never freed / channel went off-air — giving up)"
-        : " (restart cap — channel unstable, giving up)";
+        : connectFail ? " (slot never freed / source went off-air — giving up)"
+        : " (restart cap — source unstable, giving up)";
       console.log(`[transcode ${key}] exit ${code}${note}${tail ? ": " + tail : ""}`);
       // Trip the circuit breaker when we give up on a source that never
       // connected (invalid/broken upstream), but not on a deliberate stop.
