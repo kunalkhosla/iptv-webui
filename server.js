@@ -9860,6 +9860,46 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     // for the lifetime of this entry (survives respawns).
     const connectFail = liveSegStats(dir).nextNumber <= (entry.segAtSpawn || 0);
     if (!connectFail) { entry.everConnected = true; entry.slotRetries = 0; transcoderFailures.delete(key); }
+    // VOD races the source with no -re pacing (grow-only playlist, no
+    // realtime throttle) — a viewer only partway through can already be
+    // sitting on a FULLY encoded playlist well before they've watched that
+    // far. Without this, a genuine "reached the real end of the title" exit
+    // is indistinguishable from a dropped connection: the respawn logic
+    // below would keep computing a `-ss` offset further past the actual
+    // end of the file, immediately re-hit EOF, exit near-instantly, and
+    // repeat until the restart cap gives up — on a title that was actually
+    // already fully encoded and playable. Movies only (TMDB `runtime` is
+    // series-level/typical for series, not the specific episode's real
+    // length, so this is a no-op there — series keeps the plain respawn
+    // behavior above). TMDB runtime is whole-minute-rounded and can floor
+    // (a 145m47s film can report as "145") — +65s clears that rounding
+    // risk with room to spare; a false "complete" here would truncate the
+    // movie's real ending, worse than the runaway respawn this replaces.
+    if (mode === "movie" && !connectFail) {
+      const knownRuntimeMin = tmdbCache[`${mode}:${id}`]?.runtime;
+      const knownDurationSecs = Number.isFinite(knownRuntimeMin) ? knownRuntimeMin * 60 : null;
+      if (knownDurationSecs && playlistElapsedSecs(dir) >= knownDurationSecs + 65) {
+        console.log(`[transcode ${key}] exit ${code} — reached known runtime (${knownRuntimeMin}min), transcode complete`);
+        // No respawn needed (nothing left to encode) but also no
+        // transcoders.delete/fs.rmSync here — a still-connected viewer is
+        // reading already-written segments off this dir. Cleanup normally
+        // happens inside THIS exit handler on a later exit, but ffmpeg has
+        // already exited once and won't fire again, so nothing would ever
+        // reap this entry. Self-schedule the same idle check the reaper
+        // would otherwise apply, purely for this now-inert entry.
+        const reapWhenIdle = () => {
+          if (transcoders.get(key) !== entry) return;
+          if (Date.now() - entry.lastAccess > idleWindowMs()) {
+            transcoders.delete(key);
+            fs.rmSync(dir, { recursive: true, force: true });
+            return;
+          }
+          setTimeout(reapWhenIdle, 30_000);
+        };
+        setTimeout(reapWhenIdle, 30_000);
+        return;
+      }
+    }
     // VOD hardware-encode fallback. The boot HW_ENCODE probe only proves a
     // bare nv12→h264 upload works, not that every source encodes: some files
     // carry video params the VAAPI encoder rejects at runtime (`h264_vaapi`
