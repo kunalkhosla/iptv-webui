@@ -9937,7 +9937,17 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
       if (entry.stopping || Date.now() - entry.lastAccess > idleWindowMs()) {
         transcoders.delete(key); fs.rmSync(dir, { recursive: true, force: true }); return;
       }
-      spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel, { startNumber: nextStart, entry }, audioTrack)
+      // Thread entry.swTried through as the new run's swFallback: once a
+      // source has proven VAAPI can't encode it (a real, permanent property
+      // of that file, not a transient blip), every respawn must keep using
+      // software — omitting this made each respawn default back to
+      // HW_ENCODE from scratch, so a VAAPI-hostile VOD file flip-flopped
+      // hardware-fail → one-shot-software-success → next respawn tries
+      // hardware again → fails → (already used its one-shot fallback, so
+      // vodSoftwareFallbackEligible now says no) → burns through the
+      // restart/slot-retry budget on repeated hardware failures and gives
+      // up entirely, instead of just continuing on software indefinitely.
+      spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel, { startNumber: nextStart, entry }, audioTrack, entry.swTried)
         .catch((e) => {
           console.log(`[transcode ${key}] respawn failed: ${e?.message || e}`);
           transcoders.delete(key);
