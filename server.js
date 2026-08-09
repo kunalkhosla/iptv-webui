@@ -4744,6 +4744,12 @@ const LANGUAGE_GROUP_KEYS_SET = new Set(LANGUAGE_GROUP_KEYS);
 // the ONLY place a specific dub variant's language is recorded anywhere
 // (category tags are identical across all of a title's variants).
 const TITLE_LANG_SUFFIX_RE = new RegExp(`\\((${LANGUAGE_GROUP_KEYS.join("|")})\\)`, "i");
+// A dub variant's own explicit language, parsed from its title suffix
+// ("Kohrra (Hindi)" -> "hindi"); null for the bare/default entry.
+function suffixOf(name) {
+  const m = TITLE_LANG_SUFFIX_RE.exec(String(name || ""));
+  return m ? m[1].toLowerCase() : null;
+}
 
 // Map a language group tag → TMDB ISO-639-1 original_language code. Used
 // to disambiguate generic-titled foreign films: a query like "Blind"
@@ -6571,13 +6577,10 @@ app.get("/api/search/all", async (req, res, next) => {
     // a title shares the same panel category, hence identical tags,
     // regardless of which language it actually contains. The dub
     // language only ever shows up in the title text itself, panel
-    // convention "Title (Language)". Matched against the RAW name (not
+    // convention "Title (Language)" — suffixOf (module-level, near
+    // TITLE_LANG_SUFFIX_RE) parses it. Matched against the RAW name (not
     // dedupTitleKey's cleaned version, which deliberately strips this
     // exact suffix).
-    const suffixOf = (name) => {
-      const m = TITLE_LANG_SUFFIX_RE.exec(String(name || ""));
-      return m ? m[1].toLowerCase() : null;
-    };
     const langRank = (s) => {
       if (!langPref.length) return 0;
       const suffix = suffixOf(s.name);
@@ -6607,6 +6610,13 @@ app.get("/api/search/all", async (req, res, next) => {
         tags: s.tags || [],
         container: s.container || null,
         isSeriesGroup: s.isSeriesGroup || undefined,
+        // Explicit dub-language marker ("hindi", "punjabi", …) parsed from
+        // the title's own "(Language)" suffix — null for the bare/default
+        // entry. Search can now return several same-poster variants of one
+        // title side by side (their own onboarded languages, see eligible()
+        // above); without this the client has no way to tell two otherwise-
+        // identical tiles apart short of the full un-truncated title text.
+        dubLang: suffixOf(s.name) || null,
       };
     };
     const eligible = (s) => {
@@ -6946,6 +6956,13 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
       category_id: s.category_id,
       category_name: catName.get(String(s.category_id)) || null,
       isSeriesGroup: s.isSeriesGroup || undefined,
+      // Same dub-language marker /api/search/all's projectTile sets — this
+      // endpoint has no dedup layer (titleLangPasses above already drops
+      // non-onboarded-language dubs), but a viewer's own onboarded-
+      // language variants (e.g. bare + Hindi + Punjabi) still surface
+      // side by side with identical posters, so the client badge needs
+      // this to tell them apart.
+      dubLang: mode !== "live" ? (suffixOf(s.name) || null) : null,
     };
   });
   // EPG programme-title pass for live — same rationale as the

@@ -6,6 +6,13 @@ const PSEUDO = { RECENTS: "__recents", FAVS: "__favs", MY_LIST: "__mylist", ALL:
 // reports disk.enabled for this account.
 const MODES = ["live", "movie", "series", "disk"];
 const byMode = (fn) => Object.fromEntries(MODES.map((m) => [m, fn(m)]));
+// s.dubLang → short badge code (ISO 639-1, same codes the server uses for
+// TMDB language matching). Mirrors LANGUAGE_GROUP_KEYS server-side.
+const LANG_BADGE_CODE = {
+  english: "EN", hindi: "HI", tamil: "TA", telugu: "TE", malayalam: "ML",
+  kannada: "KN", marathi: "MR", gujarati: "GU", bengali: "BN", urdu: "UR",
+  punjabi: "PA", arabic: "AR", turkish: "TR",
+};
 
 function emptyModeState() {
   return {
@@ -3125,6 +3132,22 @@ function channelCard(s, opts = {}) {
       ab.textContent = label;
       logo.appendChild(ab);
     }
+  }
+
+  // Language badge — search can now return several same-poster dub
+  // variants of one title side by side ("Kohrra" / "Kohrra (Hindi)" /
+  // "Kohrra (Punjabi)"), and the title text alone is easy to miss at a
+  // glance (or clipped by the tile's own truncation) when two tiles are
+  // sitting right next to each other with near-identical art. Top-center
+  // so it doesn't fight the MKV/audio-channel/rating/cert badges already
+  // in all four corners. 2-letter code, not the full word — "MALAYALAM"/
+  // "GUJARATI" at badge scale would crowd or overlap those same corners.
+  if (s.dubLang) {
+    const lb = document.createElement("span");
+    lb.className = "lang-badge";
+    lb.textContent = LANG_BADGE_CODE[s.dubLang] || s.dubLang.slice(0, 2).toUpperCase();
+    lb.title = s.dubLang;
+    logo.appendChild(lb);
   }
 
   if (state.mode !== "live" && s.rating) {

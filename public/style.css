@@ -1538,6 +1538,23 @@ main {
   pointer-events: none;
   z-index: 2;
 }
+/* Language badge — top-center, distinct from the accent-orange
+ * audio-channel badge so the two never read as the same kind of thing. */
+.channel .lang-badge {
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(212, 165, 68, .92); /* --accent-2 (brass) at ~92% */
+  color: #14110a;
+  font: 700 9px/1 var(--font-body);
+  letter-spacing: .06em;
+  padding: 3px 6px;
+  border-radius: 3px;
+  pointer-events: none;
+  z-index: 2;
+  white-space: nowrap;
+}
 .channel .rating-badge {
   position: absolute;
   bottom: 6px;

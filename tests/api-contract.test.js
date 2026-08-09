@@ -71,7 +71,7 @@ test("contract: /api/search/:mode returns { q, count, results }", () => {
   // Each result row's fields — checked by literal property names
   // inside the handler's results.push(...) object.
   expectFields("/api/search/:mode result row", h, [
-    "id", "name", "icon", "poster", "category_id", "category_name", "programme",
+    "id", "name", "icon", "poster", "category_id", "category_name", "programme", "dubLang",
   ]);
 });
 
@@ -82,7 +82,7 @@ test("contract: /api/search/all returns { q, movie, series, live }", () => {
   expectFields("/api/search/all", h, ["q", "movie", "series", "live"]);
   // Each item row fields.
   expectFields("/api/search/all item", h, [
-    "id", "name", "icon", "poster", "year", "us_cert", "container", "programme",
+    "id", "name", "icon", "poster", "year", "us_cert", "container", "programme", "dubLang",
   ]);
 });
 
