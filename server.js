@@ -6612,16 +6612,31 @@ app.get("/api/search/all", async (req, res, next) => {
     const eligible = (s) => {
       if (!titleLangPasses(s.name)) return false;
       if (isKidBlocked(s)) return false;
+      const suffix = suffixOf(s.name);
+      // Hard-drop a dub variant explicitly labeled in a language the
+      // profile didn't onboard (Kunal, 2026-08-09: wants Hindi AND
+      // English/bare shown for a title, since both are onboarded, but
+      // never Tamil/Telugu/etc since those aren't). Distinct from the
+      // dedup below — this is exclusion, not a same-title tiebreak.
+      if (onboarded && suffix && !langPref.includes(suffix)) return false;
       // Title+year fallback — catches a duplicate before it has a
       // tmdb_id to dedup on, or when two duplicates' tmdb_id lookups
-      // haven't converged yet. See dedupTitleKey.
+      // haven't converged yet. See dedupTitleKey. Keyed on (title,
+      // accepted-language-variant) rather than title alone, so a title's
+      // OWN onboarded-language dub gets its own tile instead of every
+      // variant collapsing into a single winner — e.g. "Kohrra" (bare)
+      // and "Kohrra (Hindi)" both survive as separate results; "Kohrra
+      // (Tamil)"/"(Telugu)" were already rejected above and never reach
+      // this point.
       const titleKey = dedupTitleKey(s.name);
-      if (titleKey && seenTitle.has(titleKey)) return false;
+      const dedupKey = titleKey ? `${titleKey}::${suffix || "_"}` : null;
+      if (dedupKey && seenTitle.has(dedupKey)) return false;
       if (s.tmdb_id) {
-        if (seenTmdb.has(s.tmdb_id)) return false;
-        seenTmdb.add(s.tmdb_id);
+        const tmdbKey = `${s.tmdb_id}::${suffix || "_"}`;
+        if (seenTmdb.has(tmdbKey)) return false;
+        seenTmdb.add(tmdbKey);
       }
-      if (titleKey) seenTitle.add(titleKey);
+      if (dedupKey) seenTitle.add(dedupKey);
       if (seenIds.has(s.id)) return false;
       seenIds.add(s.id);
       return true;
@@ -6750,12 +6765,19 @@ app.get("/api/search/all", async (req, res, next) => {
       });
       for (const { s, dtKey } of tagged) {
         if (results.length >= limit) break;
-        if (dtKey && seenTitle.has(dtKey)) continue;
+        // Same exclusion + (title, language-variant) dedup as eligible()
+        // above — kept inline here since this pass has never called
+        // eligible() (pre-existing duplication, not introduced by this).
+        const suffix = suffixOf(s.name);
+        if (onboarded && suffix && !langPref.includes(suffix)) continue;
+        const dedupKey = dtKey ? `${dtKey}::${suffix || "_"}` : null;
+        if (dedupKey && seenTitle.has(dedupKey)) continue;
         if (s.tmdb_id) {
-          if (seenTmdb.has(s.tmdb_id)) continue;
-          seenTmdb.add(s.tmdb_id);
+          const tmdbKey = `${s.tmdb_id}::${suffix || "_"}`;
+          if (seenTmdb.has(tmdbKey)) continue;
+          seenTmdb.add(tmdbKey);
         }
-        if (dtKey) seenTitle.add(dtKey);
+        if (dedupKey) seenTitle.add(dedupKey);
         seenIds.add(s.id);
         results.push(projectTile(s));
       }
