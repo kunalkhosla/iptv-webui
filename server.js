@@ -4739,6 +4739,11 @@ const LANGUAGE_GROUP_KEYS = [
   "marathi", "gujarati", "bengali", "urdu", "punjabi", "arabic", "turkish",
 ];
 const LANGUAGE_GROUP_KEYS_SET = new Set(LANGUAGE_GROUP_KEYS);
+// Panel convention for a multi-dub title's separate catalog entries:
+// "Kohrra", "Kohrra (Hindi)", "Kohrra (Tamil)", … — the bracketed word is
+// the ONLY place a specific dub variant's language is recorded anywhere
+// (category tags are identical across all of a title's variants).
+const TITLE_LANG_SUFFIX_RE = new RegExp(`\\((${LANGUAGE_GROUP_KEYS.join("|")})\\)`, "i");
 
 // Map a language group tag → TMDB ISO-639-1 original_language code. Used
 // to disambiguate generic-titled foreign films: a query like "Blind"
@@ -6562,11 +6567,30 @@ app.get("/api/search/all", async (req, res, next) => {
     // profile's onboarded language(s) instead of raw text-match rank, so
     // eligible() gets offered the right dub first and keeps THAT one.
     const langPref = onboarded ? modeKeys.filter(k => LANGUAGE_GROUP_KEYS_SET.has(k)) : [];
+    // s.tags is USELESS for telling dub variants apart — every variant of
+    // a title shares the same panel category, hence identical tags,
+    // regardless of which language it actually contains. The dub
+    // language only ever shows up in the title text itself, panel
+    // convention "Title (Language)". Matched against the RAW name (not
+    // dedupTitleKey's cleaned version, which deliberately strips this
+    // exact suffix).
+    const suffixOf = (name) => {
+      const m = TITLE_LANG_SUFFIX_RE.exec(String(name || ""));
+      return m ? m[1].toLowerCase() : null;
+    };
     const langRank = (s) => {
       if (!langPref.length) return 0;
+      const suffix = suffixOf(s.name);
+      if (suffix) {
+        // An explicit, WRONG-language suffix is a confirmed miss — rank
+        // it below even a bare/no-suffix title (ambiguous default audio,
+        // could still turn out to be the preferred language).
+        const i = langPref.indexOf(suffix);
+        return i >= 0 ? i : langPref.length + 1;
+      }
       const tags = Array.isArray(s.tags) ? s.tags : [];
       const i = langPref.findIndex(l => tags.includes(l));
-      return i === -1 ? langPref.length : i; // lower = more preferred; no match sorts last
+      return i === -1 ? langPref.length : i; // lower = more preferred; no match sorts in the ambiguous middle
     };
     const projectTile = (s) => {
       const t = mode !== "live" ? tmdbCache[`${mode}:${s.id}`] : null;
