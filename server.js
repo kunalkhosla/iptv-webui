@@ -4760,6 +4760,32 @@ function isoLangForItem(item) {
   return null;
 }
 
+// Language group tag → the language codes an embedded audio track's
+// `stream_tags:language` might actually carry. Container/mux tooling
+// almost always writes ISO 639-2 (3-letter: "hin", "eng"), not the
+// 639-1 2-letter form LANG_TAG_TO_ISO uses for TMDB — accept both since
+// a handful of files do use the 2-letter form.
+const LANG_TAG_TO_AUDIO_CODES = {
+  english: ["eng", "en"], hindi: ["hin", "hi"], tamil: ["tam", "ta"], telugu: ["tel", "te"],
+  malayalam: ["mal", "ml"], kannada: ["kan", "kn"], marathi: ["mar", "mr"], gujarati: ["guj", "gu"],
+  bengali: ["ben", "bn"], urdu: ["urd", "ur"], punjabi: ["pan", "pa"], arabic: ["ara", "ar"], turkish: ["tur", "tr"],
+};
+// Pick the audio track index (the transcoder's 0:a:N ordinal) matching the
+// profile's onboarded language(s), preferring the earlier language when a
+// profile onboarded more than one. Null when nothing matches (or no track
+// carries a language tag at all) — caller falls back to the existing
+// track-0 default.
+function preferredAudioTrackIndex(langKeys, audioTracks) {
+  if (!Array.isArray(audioTracks) || !audioTracks.length) return null;
+  for (const key of langKeys) {
+    const codes = LANG_TAG_TO_AUDIO_CODES[key];
+    if (!codes) continue;
+    const hit = audioTracks.find(t => t.lang && codes.includes(String(t.lang).toLowerCase()));
+    if (hit) return hit.index;
+  }
+  return null;
+}
+
 // Alternate title words that panels use for the same language.
 // Key = LANGUAGE_GROUP_KEYS entry, value = extra words to block.
 const LANGUAGE_TITLE_ALIASES = {
@@ -6523,6 +6549,25 @@ app.get("/api/search/all", async (req, res, next) => {
     const seenIds = new Set();
     const seenTitle = new Set();
     const results = [];
+    // Same-title dub variants ("Kohrra", "Kohrra (Hindi)", "Kohrra
+    // (Tamil)", …) collapse to one dedupTitleKey below — intentional, one
+    // tile per show, not five near-identical ones. But whichever candidate
+    // reaches eligible() FIRST wins that slot and every other dub is
+    // silently dropped from results entirely, unreachable by any search.
+    // A bare/no-suffix title almost always ranks as the best text match
+    // for its own name, so a profile onboarded for Hindi searching
+    // "Kohrra" got the (usually English-default) bare entry every time,
+    // with the Hindi dub invisibly discarded — not filtered, not a lower
+    // rank, just gone. langRank breaks a same-titleKey tie toward the
+    // profile's onboarded language(s) instead of raw text-match rank, so
+    // eligible() gets offered the right dub first and keeps THAT one.
+    const langPref = onboarded ? modeKeys.filter(k => LANGUAGE_GROUP_KEYS_SET.has(k)) : [];
+    const langRank = (s) => {
+      if (!langPref.length) return 0;
+      const tags = Array.isArray(s.tags) ? s.tags : [];
+      const i = langPref.findIndex(l => tags.includes(l));
+      return i === -1 ? langPref.length : i; // lower = more preferred; no match sorts last
+    };
     const projectTile = (s) => {
       const t = mode !== "live" ? tmdbCache[`${mode}:${s.id}`] : null;
       return {
@@ -6603,15 +6648,28 @@ app.get("/api/search/all", async (req, res, next) => {
           const haystack = haystackParts.join(" | ");
           if (!prefixes.every(p => haystack.includes(p))) continue;
         }
-        if (!eligible(s)) continue;
-        matches.push({ s, t });
-        if (matches.length >= limit * 3) break; // collect a bit extra to sort
+        matches.push({ s, t, dtKey: dedupTitleKey(s.name) });
+        // Collect well past the limit, NOT just eligible() survivors —
+        // dedup now runs after the sort below (was inline here before),
+        // so a title's dub-cluster siblings must all still be in this
+        // list when the language tiebreak runs, not thinned by whichever
+        // happened to be scanned first.
+        if (matches.length >= limit * 10) break;
       }
-      // Sort by audience size (vote_count) — bigger / more-watched
-      // titles first so the user sees recognizable matches up top.
-      matches.sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0));
+      // Sort by audience size (vote_count) — bigger / more-watched titles
+      // first. Same-titleKey candidates (dub variants of one show)
+      // tiebreak on langRank instead — see the comment on langRank above
+      // — so eligible() below sees the profile's onboarded-language dub
+      // first and keeps THAT one, not whichever the raw catalog scan
+      // happened to reach first (previously: dedup ran inline during the
+      // scan, before any vote_count sort even applied).
+      matches.sort((a, b) => {
+        if (a.dtKey && a.dtKey === b.dtKey) return langRank(a.s) - langRank(b.s);
+        return (b.t.vote_count || 0) - (a.t.vote_count || 0);
+      });
       for (const m of matches) {
         if (results.length >= limit) break;
+        if (!eligible(m.s)) continue;
         results.push(projectTile(m.s));
       }
       return results;
@@ -6627,9 +6685,16 @@ app.get("/api/search/all", async (req, res, next) => {
     const ranked = [];
     for (const s of ix.byId.values()) {
       const rank = nameMatchRank(normalizeForSearch(s.name), normQ, qTokens);
-      if (rank) ranked.push({ s, rank });
+      if (rank) ranked.push({ s, rank, dtKey: dedupTitleKey(s.name) });
     }
-    ranked.sort((a, b) => b.rank - a.rank);
+    // Same-titleKey candidates (dub variants of one show) tiebreak on
+    // langRank instead of raw rank — see the comment on langRank above —
+    // so the profile's onboarded-language dub is what eligible() sees
+    // first and keeps. Different titles keep the existing rank order.
+    ranked.sort((a, b) => {
+      if (a.dtKey && a.dtKey === b.dtKey) return langRank(a.s) - langRank(b.s);
+      return b.rank - a.rank;
+    });
     for (const { s } of ranked) {
       if (results.length >= limit) break;
       if (!eligible(s)) continue;
@@ -6649,18 +6714,24 @@ app.get("/api/search/all", async (req, res, next) => {
         if (!Array.isArray(t.genres) || !t.genres.includes(matchedGenre)) continue;
         if (!titleLangPasses(s.name)) continue;
         if (isKidBlocked(s)) continue;
-        const titleKey = dedupTitleKey(s.name);
-        if (titleKey && seenTitle.has(titleKey)) continue;
+        // Dedup (titleKey/tmdb_id) deliberately NOT applied here — same
+        // reasoning as the faceted-match pass above: it has to run AFTER
+        // the sort below so a dub-cluster's language tiebreak sees every
+        // sibling, not just whichever the raw scan reached first.
+        tagged.push({ s, vc: t.vote_count || 0, dtKey: dedupTitleKey(s.name) });
+      }
+      tagged.sort((a, b) => {
+        if (a.dtKey && a.dtKey === b.dtKey) return langRank(a.s) - langRank(b.s);
+        return b.vc - a.vc;
+      });
+      for (const { s, dtKey } of tagged) {
+        if (results.length >= limit) break;
+        if (dtKey && seenTitle.has(dtKey)) continue;
         if (s.tmdb_id) {
           if (seenTmdb.has(s.tmdb_id)) continue;
           seenTmdb.add(s.tmdb_id);
         }
-        if (titleKey) seenTitle.add(titleKey);
-        tagged.push({ s, vc: t.vote_count || 0 });
-      }
-      tagged.sort((a, b) => b.vc - a.vc);
-      for (const { s } of tagged) {
-        if (results.length >= limit) break;
+        if (dtKey) seenTitle.add(dtKey);
         seenIds.add(s.id);
         results.push(projectTile(s));
       }
@@ -10173,6 +10244,37 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   // Android TVs can request E-AC3 multi-channel instead of the
   // default AAC stereo. Like ?q= (quality), not part of the HMAC.
   const audio = normalizeAudio(req.query.a);
+  // Default a fresh play (no client-chosen ?at=) to the profile's onboarded
+  // language track when the file has one, instead of always track 0. Many
+  // panel dual-audio rips list English as track 0 even for Hindi (etc.)
+  // content — a Hindi-onboarded profile playing one used to silently get
+  // English audio with no indication anything was wrong. Cache-only lookup
+  // — NEVER triggers a fresh probe here. /api/tracks (fire-and-forget from
+  // the client, after play already starts, purely to populate the audio
+  // picker) is what's allowed to pay ffprobe's cost; this route stays on
+  // the play-start critical path and a title nobody's probed yet is
+  // exactly the first-play case this feature targets, so blocking here
+  // would stall Play by up to 10s on precisely the plays that matter most.
+  // First play of an unprobed title still falls back to track 0 same as
+  // before; a rewatch/family-shared title (already probed via /api/tracks
+  // or a prior play) gets the preference for free.
+  let preferredAudioTrack = 0;
+  if ((req.params.mode === "movie" || req.params.mode === "series") && !req.query.at) {
+    const userState = getProfileState(req.profileId);
+    const langKeys = (() => {
+      const own = userState.filter?.groups?.[req.params.mode];
+      if (Array.isArray(own) && own.length) return own;
+      const liveKeys = userState.filter?.groups?.live;
+      return Array.isArray(liveKeys) ? liveKeys : [];
+    })().filter((k) => LANGUAGE_GROUP_KEYS_SET.has(k));
+    if (langKeys.length) {
+      const cached = panelTracksCache[`${req.params.mode}:${req.params.id}`];
+      const fresh = cached && typeof cached.ts === "number" && Date.now() - cached.ts < PROBE_ALIVE_TTL_MS;
+      const idx = fresh ? preferredAudioTrackIndex(langKeys, cached.audioTracks) : null;
+      if (idx != null) preferredAudioTrack = idx;
+    }
+  }
+  const audioTrack = normalizeAudioTrack(req.query.at ?? preferredAudioTrack);
   const transcodeSigInput = offsetSecs > 0
     ? `transcode:${req.params.mode}:${req.params.id}:${offsetSecs}`
     : `transcode:${req.params.mode}:${req.params.id}`;
@@ -10181,7 +10283,8 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   const transcodeQuery =
     `s=${transcodeSig}` +
     (offsetSecs > 0 ? `&t=${offsetSecs}` : "") +
-    (audio === "surround" ? `&a=surround` : "");
+    (audio === "surround" ? `&a=surround` : "") +
+    (audioTrack > 0 ? `&at=${audioTrack}` : "");
   const transcodeUrl = `/api/transcode/${req.params.mode}/${req.params.id}/index.m3u8?${transcodeQuery}`;
   // /api/download produces a single-file 720p mp4 piped from ffmpeg.
   // Consumed by the Android phone's DownloadManager. HMAC-signed
