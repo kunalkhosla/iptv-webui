@@ -6937,6 +6937,21 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
     if (!q && ranked.length >= limit) break;
   }
   if (q) ranked.sort((a, b) => b.rank - a.rank);
+  // Dedup genuine duplicate catalog listings (two separate ids both named
+  // bare "Kohrra", for instance — confirmed live on this panel) that
+  // slip through unrelated to onboarding: titleLangPasses above already
+  // keeps a non-onboarded-language dub out, but doesn't catch a literal
+  // duplicate entry in the SAME language. Keyed on (title, dub-language-
+  // suffix), same as /api/search/all's eligible(), so distinct onboarded-
+  // language variants of one title (bare + Hindi + Punjabi) still each
+  // survive as their own result — only exact repeats collapse.
+  const seenDedup = new Set();
+  const deduped = ranked.filter((r) => {
+    const key = `${dedupTitleKey(r.s.name)}::${suffixOf(r.s.name) || "_"}`;
+    if (seenDedup.has(key)) return false;
+    seenDedup.add(key);
+    return true;
+  });
   // Panel icon is unreliable for movie/series VOD entries (Xtream panels
   // populate stream_icon reliably for live channel logos, but frequently
   // leave it null/blank for VOD) — same reason /api/home and the detail
@@ -6946,7 +6961,7 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
   // with blank thumbnails whenever the panel icon was empty. tmdbCache
   // is already warmed in-memory (prewarmTmdbCache), so this is a
   // synchronous lookup, no extra round-trip.
-  const results = ranked.slice(0, limit).map(({ s }) => {
+  const results = deduped.slice(0, limit).map(({ s }) => {
     const t = mode !== "live" ? tmdbCache[`${mode}:${s.id}`] : null;
     return {
       id: s.id,
