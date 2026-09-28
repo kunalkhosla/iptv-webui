@@ -89,11 +89,13 @@ test("notifications get no response body", async () => {
 // cookie/Basic path, and the tools never touch the stream-open paths.
 const SERVER = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
 test("server.js: /mcp is bearer-only and wired before cookie auth", () => {
-  const mw = SERVER.indexOf('if (req.path === "/mcp")');
+  const mw = SERVER.indexOf('if (req.path.toLowerCase().replace(/\\/+$/, "") === "/mcp")');
   const cookie = SERVER.indexOf("const sessionToken = parseSessionCookie(req);");
   assert.ok(mw > 0 && cookie > mw, "/mcp branch must precede cookie/Basic auth");
   assert.match(SERVER.slice(mw, cookie), /matchBearer\(mcpTokens, req\.headers\.authorization\)/);
   assert.match(SERVER, /app\.post\("\/mcp"/);
+  // The handler itself refuses anything the bearer branch didn't admit.
+  assert.match(SERVER, /app\.post\("\/mcp"[^\n]*\n\s*if \(!req\.mcpAuthed\)/);
 });
 test("server.js: MCP tools never fetch stream/transcode/proxy bytes", () => {
   const start = SERVER.indexOf("const MCP_TOOLS = [");

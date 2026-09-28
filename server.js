@@ -4091,7 +4091,10 @@ app.use((req, res, next) => {
   // /mcp: bearer-token only (MCP_TOKENS) — never cookies or Basic Auth,
   // so a browser session can't be ridden into it and the household
   // password never sits in an assistant's config. See lib/mcp.js.
-  if (req.path === "/mcp") {
+  // Normalised: Express routing is case-insensitive and non-strict, so
+  // "/MCP" or "/mcp/" also reach the /mcp handler and must not fall
+  // through to cookie auth.
+  if (req.path.toLowerCase().replace(/\/+$/, "") === "/mcp") {
     const hit = matchBearer(mcpTokens, req.headers.authorization);
     const mcpUser = hit ? getUserByUsername(hit.username) : null;
     if (!mcpUser) return res.status(401).json({ error: "bearer token required" });
@@ -4101,6 +4104,7 @@ app.use((req, res, next) => {
     req.user = mcpUser;
     req.account = getAccountForUser(mcpUser);
     req.profileId = prof.id;
+    req.mcpAuthed = true;
     return accountStore.run(req.account, () => next());
   }
   // Theatre-portrait SVGs are unauthenticated static assets so
@@ -8875,6 +8879,8 @@ const MCP_TOOLS = [
         }
         if (!ep) throw new Error("series has no episodes");
         id = String(ep.id);
+        // Upstream panel data goes into a loopback path — digits only.
+        if (!/^\d{1,12}$/.test(id)) throw new Error("bad episode id");
         ext = String(ep.container_extension || "mp4").toLowerCase();
         label = `S${ep.season}E${ep.episode_num}${ep.title ? ` — ${ep.title}` : ""}`;
         mode = "episode";
@@ -8909,6 +8915,7 @@ const MCP_TOOLS = [
 const mcpServer = createMcpServer({ name: "khouch", version: require("./package.json").version, tools: MCP_TOOLS });
 
 app.post("/mcp", express.json({ limit: "64kb" }), async (req, res) => {
+  if (!req.mcpAuthed) return res.status(401).json({ error: "bearer token required" });
   const out = await mcpServer(req.body, req);
   if (out === null) return res.status(202).end();
   res.json(out);
