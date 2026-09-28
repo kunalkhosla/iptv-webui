@@ -83,6 +83,35 @@ user in `data/accounts.json`. After that:
 credentials. Keep it stable across restarts; rotating it makes every
 non-owner user's sealed creds unreadable.
 
+## MCP endpoint (assistants)
+
+`POST /mcp` is a minimal, stateless [MCP](https://modelcontextprotocol.io)
+server (Streamable HTTP, JSON responses, no sessions) so an assistant can
+drive Khouch. Enable it with:
+
+```
+MCP_TOKENS=alice/p1=<token>      # username[/profileId]=token, comma-separated
+MCP_PUBLIC_URL=https://iptv.example.com
+```
+
+- **Auth:** `Authorization: Bearer <token>` only — cookies and Basic Auth are
+  refused on `/mcp`. Each token acts as one user + profile, so that
+  profile's kids/language filters and Continue Watching apply. Tokens are
+  held as SHA-256 digests and compared in constant time; rotate by editing
+  the env and restarting.
+- **Tools:** `search` (catalog → opaque `ref`s), `whats_on` (now/next for
+  matching channels, plus programmes whose title matches, e.g. a team name),
+  `continue_watching` (saved positions), `resolve_playback` (ref → cast-ready
+  URL + resume position; for a series picks the last-watched or a given
+  S/E episode).
+- **Khouch never casts or opens a stream here.** `resolve_playback` only
+  builds the URL (the same one `/api/stream` gives every client); the stream
+  opens when the caller's media player (e.g. Home Assistant
+  `media_player.play_media`) fetches it. Mind your panel's concurrent-stream
+  limit.
+- Read tools reuse the real HTTP handlers via a loopback request as the
+  token's user, so results match what the web UI shows.
+
 ## Running locally
 
 ```

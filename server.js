@@ -4082,8 +4082,27 @@ const PROFILE_GATED_BYPASS = new Set([
   "/api/profiles", "/api/profile/select", "/api/logout",
 ]);
 
+const { parseTokens, matchBearer, parseRef, createMcpServer } = require("./lib/mcp");
+// Bearer tokens for POST /mcp (see lib/mcp.js). Unset = endpoint always 401s.
+const mcpTokens = parseTokens(process.env.MCP_TOKENS);
+
 app.use((req, res, next) => {
   if (PUBLIC_PATHS.has(req.path)) return next();
+  // /mcp: bearer-token only (MCP_TOKENS) — never cookies or Basic Auth,
+  // so a browser session can't be ridden into it and the household
+  // password never sits in an assistant's config. See lib/mcp.js.
+  if (req.path === "/mcp") {
+    const hit = matchBearer(mcpTokens, req.headers.authorization);
+    const mcpUser = hit ? getUserByUsername(hit.username) : null;
+    if (!mcpUser) return res.status(401).json({ error: "bearer token required" });
+    const own = profiles.profiles.filter(p => p.ownerUserId === mcpUser.id);
+    const prof = hit.profileId ? own.find(p => p.id === hit.profileId) : own[0];
+    if (!prof) return res.status(403).json({ error: "token's profile not found for this user" });
+    req.user = mcpUser;
+    req.account = getAccountForUser(mcpUser);
+    req.profileId = prof.id;
+    return accountStore.run(req.account, () => next());
+  }
   // Theatre-portrait SVGs are unauthenticated static assets so
   // they render on the login page (future) and the Android phone
   // app's pre-login profile picker — Coil's SVG decoder fetches
@@ -8646,6 +8665,257 @@ async function runAssistant(req, utterance) {
     action,
   };
 }
+
+// ---------------------------------------------------------------------
+// MCP endpoint (POST /mcp) — lets an assistant (e.g. a household agent)
+// search, read the guide, see Continue Watching and resolve a cast-ready
+// URL. Auth: bearer token from MCP_TOKENS (handled in the auth
+// middleware). Khouch itself casts nothing server-side — playback on a
+// TV/speaker is the caller's job (e.g. Home Assistant
+// media_player.play_media with resolve_playback's url).
+//
+// Read tools reuse the real HTTP handlers via a loopback request carrying
+// a freshly minted session + profile cookie for the token's user, so
+// kids/language filters and response shapes stay exactly what every
+// other client sees. NOTHING here starts upstream playback: resolving a
+// URL only builds it; the stream opens when a player fetches it.
+// ---------------------------------------------------------------------
+async function mcpApi(req, pathAndQuery) {
+  const cookie = `${SESSION_COOKIE}=${encodeURIComponent(makeSessionToken(req.user))}; `
+    + `${PROFILE_COOKIE}=${encodeURIComponent(makeProfileToken(req.profileId))}`;
+  const r = await fetch(`http://127.0.0.1:${PORT}${pathAndQuery}`, {
+    headers: { cookie, accept: "application/json" },
+  });
+  if (!r.ok) throw new Error(`${pathAndQuery.split("?")[0]} returned HTTP ${r.status}`);
+  return r.json();
+}
+
+function mcpHit(mode, item) {
+  const id = item.id ?? item.stream_id ?? item.series_id;
+  const ext = mode === "live" ? "m3u8"
+    : String(item.container_extension || item.container || "mp4").toLowerCase();
+  const out = { ref: `${mode}:${id}:${ext}`, title: item.name || item.title || "", kind: mode };
+  if (item.year) out.year = item.year;
+  const cat = item.category_name || item.category;
+  if (cat) out.category = cat;
+  return out;
+}
+
+const mcpNow = () => Math.floor(Date.now() / 1000);
+function mcpProgram(p) {
+  return { title: p.title, start: new Date(p.start_ts * 1000).toISOString(), end: new Date(p.stop_ts * 1000).toISOString() };
+}
+
+const MCP_TOOLS = [
+  {
+    name: "search",
+    description: "Search the Khouch catalog (live TV channels, movies, series, local disk media). "
+      + "Returns every match with an opaque `ref` to pass to resolve_playback. A query like 'CNN' "
+      + "often matches several channels — pick or confirm the right one.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        kind: { type: "string", enum: ["live", "movie", "series", "disk"] },
+        limit: { type: "integer", minimum: 1, maximum: 30 },
+      },
+      required: ["query"],
+    },
+    async handler(args, req) {
+      const q = String(args.query || "").trim();
+      if (!q) throw new Error("query is required");
+      const limit = Math.min(Math.max(parseInt(args.limit, 10) || 10, 1), 30);
+      const data = await mcpApi(req, `/api/search/all?q=${encodeURIComponent(q)}&limit=${limit}`);
+      const modes = args.kind ? [args.kind] : ["live", "movie", "series", "disk"];
+      const results = [];
+      for (const m of modes) for (const it of (data[m] || []).slice(0, limit)) results.push(mcpHit(m, it));
+      return { query: q, count: results.length, results };
+    },
+  },
+  {
+    name: "whats_on",
+    description: "What's on live TV: for channels whose name matches `query`, the programme on now "
+      + "and next; plus programmes (on now or starting within `hours`, default 3) whose TITLE "
+      + "matches `query` on any channel — use that for 'put on the Yankees game'. Each has a "
+      + "channel `ref` for resolve_playback.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        hours: { type: "integer", minimum: 1, maximum: 12 },
+      },
+      required: ["query"],
+    },
+    async handler(args, req) {
+      const q = String(args.query || "").trim();
+      if (!q) throw new Error("query is required");
+      const hours = Math.min(Math.max(parseInt(args.hours, 10) || 3, 1), 12);
+      const now = mcpNow();
+      const data = await mcpApi(req, `/api/search/all?q=${encodeURIComponent(q)}&limit=6`);
+      const channels = [];
+      for (const it of (data.live || []).slice(0, 6)) {
+        const hit = mcpHit("live", it);
+        try {
+          const epg = await mcpApi(req, `/api/epg/short/${encodeURIComponent(it.id ?? it.stream_id)}?hours=${hours}`);
+          const progs = (epg.programs || []).filter(p => p.stop_ts > now);
+          const cur = progs.find(p => p.start_ts <= now);
+          hit.now = cur ? mcpProgram(cur) : null;
+          hit.next = progs.filter(p => p.start_ts > now).slice(0, 2).map(mcpProgram);
+        } catch { hit.now = null; hit.next = []; }
+        channels.push(hit);
+      }
+      // Programme-title scan over the in-memory XMLTV index. Skipped for
+      // kid profiles: live channels carry no certificate to filter by.
+      const programmes = [];
+      const prof = findProfile(req.profileId);
+      if (!prof?.kidsBirthYear) {
+        const needle = q.toLowerCase();
+        const acct = currentAccount();
+        const byChannel = isOwnerAccount(acct) ? epgIndex : getEpgIndexFor(acct).byChannel;
+        const untilMs = (now + hours * 3600) * 1000;
+        const nowMs = now * 1000;
+        for (const s of getIndexesFor(acct).live.byId?.values?.() || []) {
+          if (programmes.length >= 15) break;
+          const list = s.epg_channel_id ? byChannel.get(s.epg_channel_id) : null;
+          if (!list) continue;
+          for (const p of list) {
+            if (p.start >= untilMs) break;
+            if (p.stop <= nowMs) continue;
+            if (!(p.title || "").toLowerCase().includes(needle)) continue;
+            programmes.push({
+              ...mcpProgram({ title: p.title, start_ts: p.start / 1000, stop_ts: p.stop / 1000 }),
+              on_now: p.start <= nowMs,
+              channel: s.name,
+              ref: mcpHit("live", s).ref,
+            });
+            break;
+          }
+        }
+        programmes.sort((a, b) => a.start.localeCompare(b.start));
+      }
+      return { query: q, channels, programmes };
+    },
+  },
+  {
+    name: "continue_watching",
+    description: "This profile's Continue Watching: movies and series episodes with a saved "
+      + "position (seconds), most recent first. Each `ref` resumes that exact item; pass "
+      + "`position` to the player to seek.",
+    inputSchema: {
+      type: "object",
+      properties: { limit: { type: "integer", minimum: 1, maximum: 20 } },
+    },
+    async handler(args, req) {
+      const limit = Math.min(Math.max(parseInt(args.limit, 10) || 10, 1), 20);
+      const st = getProfileState(req.profileId);
+      const ix = getIndexesFor(currentAccount());
+      const items = [];
+      const seenEpisodes = new Set();
+      for (const [seriesId, le] of Object.entries(st.lastEpisode || {})) {
+        if (le?.episode_id == null || !/^\d+$/.test(String(le.episode_id))) continue;
+        seenEpisodes.add(String(le.episode_id));
+        const pr = st.progress?.[`series:${le.episode_id}`];
+        items.push({
+          ref: `episode:${le.episode_id}:${String(le.container || "mp4").toLowerCase()}`,
+          kind: "episode",
+          title: le.series_name || ix.series.byId?.get(parseInt(seriesId, 10))?.name || "",
+          season: le.season ?? null, episode: le.episode_num ?? null, episode_title: le.title || null,
+          position: pr?.p ?? 0, duration: pr?.d ?? null,
+          t: pr?.t || le.when || 0,
+        });
+      }
+      for (const [key, pr] of Object.entries(st.progress || {})) {
+        const [mode, id] = key.split(":", 2);
+        if (mode === "series" || !/^\d+$/.test(id || "")) continue;
+        if (mode !== "movie" && mode !== "disk") continue;
+        const item = ix[mode]?.byId?.get(parseInt(id, 10));
+        if (!item) continue;
+        items.push({ ...mcpHit(mode, item), position: pr.p, duration: pr.d ?? null, t: pr.t || 0 });
+      }
+      items.sort((a, b) => b.t - a.t);
+      return { items: items.slice(0, limit).map(({ t, ...rest }) => rest) };
+    },
+  },
+  {
+    name: "resolve_playback",
+    description: "Turn a `ref` (from search/whats_on/continue_watching) into a cast-ready URL for "
+      + "a media player. For a series ref, optionally give season+episode; otherwise it picks the "
+      + "episode last watched on this profile (with its saved position), else S1E1. Does not "
+      + "start playback — hand the url to the player.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ref: { type: "string" },
+        season: { type: "integer", minimum: 0 },
+        episode: { type: "integer", minimum: 0 },
+      },
+      required: ["ref"],
+    },
+    async handler(args, req) {
+      const ref = parseRef(args.ref);
+      if (!ref) throw new Error("invalid ref — use one returned by search/whats_on/continue_watching");
+      let { mode, id, ext } = ref;
+      let label = null;
+      let position = 0;
+      const st = getProfileState(req.profileId);
+      if (mode === "series") {
+        const info = await mcpApi(req, `/api/series/info/${id}`);
+        const seasons = info?.episodes && typeof info.episodes === "object" ? info.episodes : {};
+        const all = Object.entries(seasons).flatMap(([s, eps]) =>
+          (Array.isArray(eps) ? eps : []).map(e => ({ ...e, season: Number(e.season ?? s) })));
+        let ep = null;
+        if (args.season != null || args.episode != null) {
+          ep = all.find(e => (args.season == null || e.season === Number(args.season))
+            && (args.episode == null || Number(e.episode_num) === Number(args.episode)));
+          if (!ep) throw new Error("no such season/episode for that series");
+        } else {
+          const le = st.lastEpisode?.[id];
+          ep = (le && all.find(e => String(e.id) === String(le.episode_id)))
+            || all.sort((a, b) => a.season - b.season || Number(a.episode_num) - Number(b.episode_num))[0];
+        }
+        if (!ep) throw new Error("series has no episodes");
+        id = String(ep.id);
+        ext = String(ep.container_extension || "mp4").toLowerCase();
+        label = `S${ep.season}E${ep.episode_num}${ep.title ? ` — ${ep.title}` : ""}`;
+        mode = "episode";
+      }
+      if (mode === "episode") {
+        position = st.progress?.[`series:${id}`]?.p || 0;
+        mode = "series"; // /api/stream serves episodes under the series mode
+      } else if (mode === "movie" || mode === "disk") {
+        position = st.progress?.[`${mode}:${id}`]?.p || 0;
+      }
+      if (!/^[a-z0-9]{1,6}$/.test(ext)) throw new Error("bad container");
+      const data = await mcpApi(req, `/api/stream/${mode}/${id}.${ext}`);
+      let url = data?.url || data?.direct || data?.transcode;
+      if (!url) throw new Error("no playable url");
+      if (url.startsWith("/")) {
+        const base = (process.env.MCP_PUBLIC_URL || "").replace(/\/+$/, "");
+        if (!base) throw new Error("MCP_PUBLIC_URL must be set for same-origin (transcode/disk) urls");
+        url = base + url;
+      }
+      const isHls = /\.m3u8(\?|$)/.test(url);
+      return {
+        url,
+        content_type: isHls ? "application/x-mpegURL" : "video/mp4",
+        live: mode === "live",
+        position: mode === "live" ? 0 : Math.floor(position),
+        episode: label,
+      };
+    },
+  },
+];
+
+const mcpServer = createMcpServer({ name: "khouch", version: require("./package.json").version, tools: MCP_TOOLS });
+
+app.post("/mcp", express.json({ limit: "64kb" }), async (req, res) => {
+  const out = await mcpServer(req.body, req);
+  if (out === null) return res.status(202).end();
+  res.json(out);
+});
+// Stateless server: no SSE stream, no sessions to delete.
+app.get("/mcp", (_req, res) => res.status(405).set("Allow", "POST").end());
+app.delete("/mcp", (_req, res) => res.status(405).set("Allow", "POST").end());
 
 app.post("/api/assistant", express.json(), async (req, res) => {
   try {
