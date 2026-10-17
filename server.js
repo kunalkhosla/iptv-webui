@@ -10333,10 +10333,22 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     // software fallback below, whose fresh-dir wipe deleted the whole
     // already-encoded episode out from under the viewer mid-playback.
     if (!isLocalMode(mode) && mode !== "live" && connectFail && entry.everConnected
-        && !entry.stopping && /received no packets|Nothing was written/.test(stderrBuf)) {
-      console.log(`[transcode ${key}] exit ${code} — respawn past last segment produced nothing, treating as end of title`);
-      finishInert();
-      return;
+        && !entry.stopping && /received no packets|nothing was written/i.test(stderrBuf)) {
+      // Two strikes at the same resume point: one "no packets" could be a
+      // slot-held/short-body reconnect after a real mid-file drop (the normal
+      // retry below handles that); the same result twice is the true end.
+      const resumeAt = liveSegStats(dir).nextNumber;
+      if (entry.noPacketsAt === resumeAt) {
+        console.log(`[transcode ${key}] exit ${code} — respawn past last segment produced nothing twice, treating as end of title`);
+        try {
+          const m3u8 = path.join(dir, "index.m3u8");
+          const text = fs.readFileSync(m3u8, "utf8");
+          if (!text.includes("#EXT-X-ENDLIST")) fs.appendFileSync(m3u8, "#EXT-X-ENDLIST\n");
+        } catch {}
+        finishInert();
+        return;
+      }
+      entry.noPacketsAt = resumeAt;
     }
     // VOD hardware-encode fallback. The boot HW_ENCODE probe only proves a
     // bare nv12→h264 upload works, not that every source encodes: some files
