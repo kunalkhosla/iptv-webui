@@ -10301,30 +10301,42 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     // (a 145m47s film can report as "145") — +65s clears that rounding
     // risk with room to spare; a false "complete" here would truncate the
     // movie's real ending, worse than the runaway respawn this replaces.
+    const finishInert = () => {
+      // No respawn needed (nothing left to encode) but also no
+      // transcoders.delete/fs.rmSync here — a still-connected viewer is
+      // reading already-written segments off this dir. Self-schedule the
+      // same idle check the reaper would otherwise apply, purely for this
+      // now-inert entry.
+      const reapWhenIdle = () => {
+        if (transcoders.get(key) !== entry) return;
+        if (Date.now() - entry.lastAccess > idleWindowMs()) {
+          transcoders.delete(key);
+          fs.rmSync(dir, { recursive: true, force: true });
+          return;
+        }
+        setTimeout(reapWhenIdle, 30_000);
+      };
+      setTimeout(reapWhenIdle, 30_000);
+    };
     if (mode === "movie" && !connectFail) {
       const knownRuntimeMin = tmdbCache[`${mode}:${id}`]?.runtime;
       const knownDurationSecs = Number.isFinite(knownRuntimeMin) ? knownRuntimeMin * 60 : null;
       if (knownDurationSecs && playlistElapsedSecs(dir) >= knownDurationSecs + 65) {
         console.log(`[transcode ${key}] exit ${code} — reached known runtime (${knownRuntimeMin}min), transcode complete`);
-        // No respawn needed (nothing left to encode) but also no
-        // transcoders.delete/fs.rmSync here — a still-connected viewer is
-        // reading already-written segments off this dir. Cleanup normally
-        // happens inside THIS exit handler on a later exit, but ffmpeg has
-        // already exited once and won't fire again, so nothing would ever
-        // reap this entry. Self-schedule the same idle check the reaper
-        // would otherwise apply, purely for this now-inert entry.
-        const reapWhenIdle = () => {
-          if (transcoders.get(key) !== entry) return;
-          if (Date.now() - entry.lastAccess > idleWindowMs()) {
-            transcoders.delete(key);
-            fs.rmSync(dir, { recursive: true, force: true });
-            return;
-          }
-          setTimeout(reapWhenIdle, 30_000);
-        };
-        setTimeout(reapWhenIdle, 30_000);
+        finishInert();
         return;
       }
+    }
+    // A VOD respawn that seeks to where the previous run stopped and gets
+    // "no packets" is the real end of the title (series have no per-episode
+    // runtime to check above). Treating it as a failure used to trigger the
+    // software fallback below, whose fresh-dir wipe deleted the whole
+    // already-encoded episode out from under the viewer mid-playback.
+    if (!isLocalMode(mode) && mode !== "live" && connectFail && entry.everConnected
+        && !entry.stopping && /received no packets|Nothing was written/.test(stderrBuf)) {
+      console.log(`[transcode ${key}] exit ${code} — respawn past last segment produced nothing, treating as end of title`);
+      finishInert();
+      return;
     }
     // VOD hardware-encode fallback. The boot HW_ENCODE probe only proves a
     // bare nv12→h264 upload works, not that every source encodes: some files
@@ -10336,7 +10348,7 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     // recovers. If software also fails, terminal cleanup runs on that exit.
     if (vodSoftwareFallbackEligible({
       mode, exitCode: code, usedHardware: entry.usedHardware,
-      alreadyTriedSoftware: entry.swTried, producedSegment: !connectFail,
+      alreadyTriedSoftware: entry.swTried, producedSegment: !connectFail || !!entry.everConnected,
       viewerPresent: recentViewer, stopping: entry.stopping,
     })) {
       console.log(`[transcode ${key}] exit ${code} — VAAPI produced no output; retrying in software (libx264)${tail ? ": " + tail : ""}`);
