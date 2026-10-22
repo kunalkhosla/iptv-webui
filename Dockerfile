@@ -1,4 +1,4 @@
-FROM node:20-alpine
+FROM node:22-alpine
 
 # ffmpeg + Intel VAAPI stack for Quick Sync hardware H.264 transcoding
 # (intel-media-driver = iHD, for Gen8+ iGPUs like the i5-10500T's UHD 630).
