@@ -5102,6 +5102,8 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // filtered out.
   res.set("Cache-Control", "no-store");
   const mode = req.params.mode;
+  // New shuffle per visit (first fetch after ~8 min idle), stable while browsing.
+  const visitSeed = homeVisitSeed(req.profileId, mode);
   const userState = getProfileState(req.profileId);
   const activeProfile = findProfile(req.profileId);
   const kidsAge = (() => {
@@ -5285,7 +5287,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // Stash the sliced items + the full eligible total per category so
   // rails can render "(N)" next to the title.
   const bucketTotals = new Map();
-  const rotBucketNow = rotationBucket();
+  const rotBucketNow = visitSeed;
   for (const [cid, rawBucket] of byCat) {
     // Rotate WHICH titles surface in each provider category (VOD only —
     // channel order in live categories is meaningful). Soft shuffle
@@ -5482,7 +5484,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       // ~4h) so every open of the app isn't the same 20 in the same order.
       const dp = currentDaypart();
       const fits = (id) => { const w = pickWhen?.[String(id)]; return !w || w === dp ? 0 : 1; };
-      const rngFy = seededRng(`fy:${rotationBucket()}:${req.profileId}:${mode}`);
+      const rngFy = seededRng(`fy:${visitSeed}:${req.profileId}:${mode}`);
       // Jitter inside each fit-group so daypart matches always lead.
       const ordered = [
         ...jitterOrder(pickIds.filter((id) => fits(id) === 0), rngFy, 10),
@@ -5732,14 +5734,14 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // surfaces the top 100.
     const RAIL_CAP = 100;
     const MIN_RAIL = 15;
-    const railSeed = `rails:${rotationBucket()}:${req.profileId}:${mode}`;
+    const railSeed = `rails:${visitSeed}:${req.profileId}:${mode}`;
     const addRail = (title, items, { jitter = true } = {}) => {
       const eligible = items.filter(p => !surfacedIds.has(p.s.id));
       if (eligible.length < MIN_RAIL) return;
       // Soft-shuffle quality-sorted rails so the leading titles rotate;
       // ordered rails (franchise by year, TMDB-ranked recs) opt out.
       const ordered = jitter
-        ? [...jitterOrder(eligible.slice(0, RAIL_CAP + 30), seededRng(`${railSeed}:${title}`), 30), ...eligible.slice(RAIL_CAP + 30)]
+        ? [...jitterOrder(eligible.slice(0, RAIL_CAP + 60), seededRng(`${railSeed}:${title}`), 60), ...eligible.slice(RAIL_CAP + 60)]
         : eligible;
       const filtered = ordered.slice(0, RAIL_CAP);
       for (const p of filtered) surfacedIds.add(p.s.id);
@@ -5914,7 +5916,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     }[currentDaypart()] || {};
     const pinned = (t) => /^(New on Khouch|Because you watched|More from|Starring) /.test(t + " ");
     const wOf = (t) => Object.entries(dpW).find(([k]) => t === k || t.startsWith(k + " "))?.[1] || 0;
-    const orderRng = seededRng(`smart:${rotationBucket()}:${req.profileId}:${mode}`);
+    const orderRng = seededRng(`smart:${visitSeed}:${req.profileId}:${mode}`);
     const front = smart.filter(r => pinned(r.title));
     const rest = smart.filter(r => !pinned(r.title))
       .map((r, i) => ({ r, k: i + orderRng() * 12 - wOf(r.title) * 5 }))
@@ -5955,7 +5957,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     });
   }
   {
-    const catRng = seededRng(`catorder:${rotationBucket()}:${req.profileId}:${mode}`);
+    const catRng = seededRng(`catorder:${visitSeed}:${req.profileId}:${mode}`);
     const isCam = (t) => /\bCAM\b/i.test(t || "");
     const scored = catRails.map((r, i) => ({
       r,
@@ -6044,7 +6046,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // a small fast PRNG, deterministic from the seed.
   const daySeed = (() => {
     const now = new Date();
-    return `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}:${req.profileId || "p1"}:${mode}`;
+    return `${visitSeed}:${now.getFullYear()}-${now.getMonth()}-${now.getDate()}:${req.profileId || "p1"}:${mode}`;
   })();
   let seedState = 0;
   for (const c of daySeed) seedState = (seedState * 31 + c.charCodeAt(0)) | 0;
@@ -7794,6 +7796,19 @@ function jitterOrder(arr, rng, spread = 40) {
     .map((x, i) => ({ x, k: i + rng() * spread }))
     .sort((a, b) => a.k - b.k)
     .map((o) => o.x);
+}
+// A "visit" = first home fetch for a profile+mode after ~8 min idle. The
+// rail seed includes the visit counter, so reopening the app reshuffles
+// while tab-switching / back-navigation within a session stays stable.
+const homeVisits = new Map();
+function homeVisitSeed(profileId, mode) {
+  const key = `${profileId}:${mode}`;
+  const now = Date.now();
+  let v = homeVisits.get(key);
+  if (!v) { v = { n: Math.floor(Math.random() * 1e6), last: 0 }; homeVisits.set(key, v); }
+  if (now - v.last > 8 * 60 * 1000) v.n++;
+  v.last = now;
+  return `${rotationBucket()}:v${v.n}`;
 }
 function currentDaypart(now = new Date()) {
   const { hour: h, dow: d } = zonedParts(now);

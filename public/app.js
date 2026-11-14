@@ -1051,8 +1051,12 @@ function showHome() {
 async function fetchHomeRails(mode) {
   if (mode === "live") return; // live mode renders a TV guide, not rails
   if (state.homeFetching[mode]) return;
-  if (state.home[mode]) return; // already cached this session
+  // Cached per session, but refetch once it's >8 min old so a tab left
+  // open picks up the server's per-visit rail rotation.
+  state.homeAt ||= {};
+  if (state.home[mode] && Date.now() - (state.homeAt[mode] || 0) < 8 * 60 * 1000) return;
   state.homeFetching[mode] = true;
+  const prevHome = state.home[mode]; // keep showing the old rails if a stale refetch fails
   // Retry with backoff: since the full VOD catalog is no longer resident,
   // the client-side fallback rails can't populate for movie/series/disk,
   // so a transient /api/home failure (deploy, cold index) would otherwise
@@ -1062,10 +1066,11 @@ async function fetchHomeRails(mode) {
       const r = await fetch(`/api/home/${mode}`, { cache: "no-store" });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       state.home[mode] = await r.json();
+      state.homeAt[mode] = Date.now();
       break;
     } catch (e) {
       console.warn(`fetchHomeRails failed (attempt ${attempt}/3):`, e.message);
-      state.home[mode] = null;
+      state.home[mode] = prevHome || null;
       if (attempt < 3) await new Promise(res => setTimeout(res, 1500 * attempt));
     }
   }
