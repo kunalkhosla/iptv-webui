@@ -5463,7 +5463,11 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       const dp = currentDaypart();
       const fits = (id) => { const w = pickWhen?.[String(id)]; return !w || w === dp ? 0 : 1; };
       const rngFy = seededRng(`fy:${rotationBucket()}:${req.profileId}:${mode}`);
-      const ordered = jitterOrder([...pickIds].sort((a, b) => fits(a) - fits(b)), rngFy, 14);
+      // Jitter inside each fit-group so daypart matches always lead.
+      const ordered = [
+        ...jitterOrder(pickIds.filter((id) => fits(id) === 0), rngFy, 10),
+        ...jitterOrder(pickIds.filter((id) => fits(id) === 1), rngFy, 10),
+      ];
       const seenFy = new Set();
       const fyTiles = ordered
         .map((id) => ix.byId.get(id) ?? ix.byId.get(parseInt(id, 10)))
@@ -5694,13 +5698,15 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // surfaces the top 100.
     const RAIL_CAP = 100;
     const MIN_RAIL = 15;
-    const railRng = seededRng(`rails:${rotationBucket()}:${req.profileId}:${mode}`);
+    const railSeed = `rails:${rotationBucket()}:${req.profileId}:${mode}`;
     const addRail = (title, items, { jitter = true } = {}) => {
       const eligible = items.filter(p => !surfacedIds.has(p.s.id));
       if (eligible.length < MIN_RAIL) return;
       // Soft-shuffle quality-sorted rails so the leading titles rotate;
       // ordered rails (franchise by year, TMDB-ranked recs) opt out.
-      const ordered = jitter ? jitterOrder(eligible, railRng, 30) : eligible;
+      const ordered = jitter
+        ? [...jitterOrder(eligible.slice(0, RAIL_CAP + 30), seededRng(`${railSeed}:${title}`), 30), ...eligible.slice(RAIL_CAP + 30)]
+        : eligible;
       const filtered = ordered.slice(0, RAIL_CAP);
       for (const p of filtered) surfacedIds.add(p.s.id);
       rails.push({
@@ -7646,8 +7652,22 @@ function seededRng(seedStr) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+// Wall-clock parts in the household timezone (the container runs UTC).
+function zonedParts(now = new Date()) {
+  const f = new Intl.DateTimeFormat("en-US", {
+    timeZone: DISK_DOWNLOAD_WINDOW_TZ, hourCycle: "h23",
+    year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", weekday: "short",
+  });
+  const o = {};
+  for (const x of f.formatToParts(now)) o[x.type] = x.value;
+  return {
+    y: +o.year, m: +o.month, d: +o.day, hour: +o.hour % 24, minute: +o.minute,
+    dow: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(o.weekday),
+  };
+}
 function rotationBucket(now = new Date()) {
-  return `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}:${Math.floor(now.getHours() / 4)}`;
+  const z = zonedParts(now);
+  return `${z.y}-${z.m}-${z.d}:${Math.floor(z.hour / 4)}`;
 }
 // Soft shuffle: keeps a quality bias (rank) but lets items move up to
 // ~`spread` places, so the same titles don't lead forever.
@@ -7658,7 +7678,7 @@ function jitterOrder(arr, rng, spread = 40) {
     .map((o) => o.x);
 }
 function currentDaypart(now = new Date()) {
-  const h = now.getHours(), d = now.getDay();
+  const { hour: h, dow: d } = zonedParts(now);
   if (h >= 22 || h < 5) return "late";
   if (d === 6 || d === 0 || (d === 5 && h >= 17)) return "weekend";
   return "weeknight";
@@ -7930,6 +7950,14 @@ async function buildTasteForProfile(p) {
       if (res.when && Object.keys(res.when).length) (entry.when ||= {})[mode] = res.when;
       if (res.reasons && Object.keys(res.reasons).length) entry.reasons[mode] = res.reasons;
       summaries.push(res.summary);
+    } else if (tasteProfiles[p.id]?.picks?.[mode]) {
+      // Failed/empty rebuild for this mode: keep what we had rather than
+      // dropping picks + the no-repeat history.
+      const prev = tasteProfiles[p.id];
+      entry.picks[mode] = prev.picks[mode];
+      if (prev.reasons?.[mode]) entry.reasons[mode] = prev.reasons[mode];
+      if (prev.when?.[mode]) (entry.when ||= {})[mode] = prev.when[mode];
+      if (prev.history?.[mode]) (entry.history ||= {})[mode] = prev.history[mode];
     }
   }
   if (!Object.keys(entry.picks).length) return null;
@@ -7995,15 +8023,19 @@ function scheduleTasteProfileNightly() {
     nightly();
     setInterval(nightly, 24 * 60 * 60 * 1000);
   }, ms);
-  // Second rebuild at 4:15 PM so the evening shows different picks.
-  const pm = new Date(now);
-  pm.setHours(16, 15, 0, 0);
-  if (pm <= now) pm.setDate(pm.getDate() + 1);
-  setTimeout(() => {
-    const afternoon = () => rebuildTasteProfiles({ reason: "pm" }).catch(e => console.warn(`[ai] taste rebuild failed: ${e.message}`));
-    afternoon();
-    setInterval(afternoon, 24 * 60 * 60 * 1000);
-  }, pm - now);
+  // Second rebuild at ~4:15 PM household time so the evening differs
+  // from the morning. Polled (the container runs UTC; DST-proof).
+  let pmRanOn = "";
+  setInterval(() => {
+    const z = zonedParts();
+    const day = `${z.y}-${z.m}-${z.d}`;
+    if (z.hour === 16 && z.minute >= 15 && pmRanOn !== day) {
+      pmRanOn = day;
+      rebuildTasteProfiles({ reason: "pm" })
+        .then((r) => { if (r && !r.ok) console.warn(`[ai] pm taste rebuild skipped: ${r.error}`); })
+        .catch(e => console.warn(`[ai] taste rebuild failed: ${e.message}`));
+    }
+  }, 5 * 60 * 1000);
   if (!Object.keys(tasteProfiles).length) {
     // 10 min gives the boot index build + TMDB prewarm time to settle.
     // If the index still isn't ready (fresh install, slow panel), keep
