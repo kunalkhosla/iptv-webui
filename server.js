@@ -7950,10 +7950,15 @@ async function buildTasteForProfile(p) {
       if (res.when && Object.keys(res.when).length) (entry.when ||= {})[mode] = res.when;
       if (res.reasons && Object.keys(res.reasons).length) entry.reasons[mode] = res.reasons;
       summaries.push(res.summary);
-    } else if (tasteProfiles[p.id]?.picks?.[mode]) {
-      // Failed/empty rebuild for this mode: keep what we had rather than
-      // dropping picks + the no-repeat history.
-      const prev = tasteProfiles[p.id];
+    }
+  }
+  // Any mode that produced nothing this run (failed call, skipped for
+  // thin signal / empty pool / index not ready) keeps its previous picks,
+  // reasons, when-tags and no-repeat history instead of vanishing.
+  const prev = tasteProfiles[p.id];
+  if (prev) {
+    for (const mode of ["movie", "series"]) {
+      if (entry.picks[mode] || !prev.picks?.[mode]) continue;
       entry.picks[mode] = prev.picks[mode];
       if (prev.reasons?.[mode]) entry.reasons[mode] = prev.reasons[mode];
       if (prev.when?.[mode]) (entry.when ||= {})[mode] = prev.when[mode];
@@ -8030,9 +8035,11 @@ function scheduleTasteProfileNightly() {
     const z = zonedParts();
     const day = `${z.y}-${z.m}-${z.d}`;
     if (z.hour === 16 && z.minute >= 15 && pmRanOn !== day) {
-      pmRanOn = day;
       rebuildTasteProfiles({ reason: "pm" })
-        .then((r) => { if (r && !r.ok) console.warn(`[ai] pm taste rebuild skipped: ${r.error}`); })
+        .then((r) => {
+          if (r && r.ok) pmRanOn = day; // retry next tick if skipped (e.g. already running)
+          else if (r) console.warn(`[ai] pm taste rebuild skipped: ${r.error}`);
+        })
         .catch(e => console.warn(`[ai] taste rebuild failed: ${e.message}`));
     }
   }, 5 * 60 * 1000);
