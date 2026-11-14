@@ -5285,12 +5285,25 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // Stash the sliced items + the full eligible total per category so
   // rails can render "(N)" next to the title.
   const bucketTotals = new Map();
+  const rotBucketNow = rotationBucket();
   for (const [cid, rawBucket] of byCat) {
     // Rotate WHICH titles surface in each provider category (VOD only —
     // channel order in live categories is meaningful). Soft shuffle
     // over the first 200 so the visible 12 change through the day.
-    const bucket = mode === "live" ? rawBucket
-      : [...jitterOrder(rawBucket.slice(0, 200), seededRng(`cat:${rotationBucket()}:${req.profileId}:${mode}:${cid}`), 60), ...rawBucket.slice(200)];
+    // Dedup twins BEFORE shuffling so the surviving variant (stream id —
+    // progress/favorites are keyed by it) doesn't flip between rotations.
+    let bucket = rawBucket;
+    if (mode !== "live") {
+      const sT = new Set(), sK = new Set();
+      bucket = rawBucket.filter((s) => {
+        const tk = dedupTitleKey(s.name);
+        if ((tk && sK.has(tk)) || (s.tmdb_id && sT.has(s.tmdb_id))) return false;
+        if (tk) sK.add(tk);
+        if (s.tmdb_id) sT.add(s.tmdb_id);
+        return true;
+      });
+      bucket = [...jitterOrder(bucket.slice(0, 200), seededRng(`cat:${rotBucketNow}:${req.profileId}:${mode}:${cid}`), 60), ...bucket.slice(200)];
+    }
     const r = sliceBucket(bucket, catName.get(String(cid)));
     byCat.set(cid, r.items);
     bucketTotals.set(cid, r.total);
@@ -5662,6 +5675,19 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // panel taxonomy can still do so.
   if (mode !== "live") {
     const smartStart = rails.length;
+    // This profile's own plays with timestamps, newest first. The play
+    // timestamps live in the household-level lastPlayed store (profile
+    // state has none); intersect with the profile's recents/progress so
+    // another member's titles never name a rail on this profile (kids).
+    const myPlays = (() => {
+      const mine = new Set((userState.recents?.[mode] || []).map(String));
+      for (const k of Object.keys(userState.progress || {})) {
+        if (k.startsWith(mode + ":")) mine.add(k.split(":", 2)[1]);
+      }
+      return Object.entries(getLastPlayedFor(currentAccount())[mode] || {})
+        .filter(([id]) => mine.has(String(id)))
+        .sort((x, y) => y[1] - x[1]);
+    })();
     const tmdbBy = (s) => tmdbFor(s.id);
     // Build the pool, deduplicating by tmdb_id so a movie that the
     // panel ships in 5 quality / language / dub variants doesn't take
@@ -5779,15 +5805,9 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // recommendations are higher-signal than any genre slice.
     // Up to 3 most recent distinct plays, newest first — one "Because
     // you watched" rail each, so the block refreshes after every watch.
-    const lastPlayIds = (() => {
-      const lp = userState.lastPlayed?.[mode];
-      if (!lp || typeof lp !== "object") return [];
-      return Object.entries(lp)
-        .sort((x, y) => y[1] - x[1])
-        .slice(0, 3)
-        .map(([k]) => parseInt(k, 10))
-        .filter(Number.isFinite);
-    })();
+    const lastPlayIds = myPlays.slice(0, 3)
+      .map(([k]) => parseInt(k, 10))
+      .filter(Number.isFinite);
     for (const lastPlayId of lastPlayIds) {
       const lpEntry = tmdbFor(lastPlayId);
       const recIds = lpEntry && Array.isArray(lpEntry.recommendations) ? lpEntry.recommendations : [];
@@ -5835,9 +5855,9 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // directors / runtime for movies): the director and the actor the
     // household's recent plays share most. No AI, rebuilt every request.
     if (mode === "movie") {
-      const recentIds = Object.entries(userState.lastPlayed?.movie || {})
-        .sort((x, y) => y[1] - x[1]).slice(0, 25).map(([k]) => parseInt(k, 10)).filter(Number.isFinite);
+      const recentIds = myPlays.slice(0, 25).map(([k]) => parseInt(k, 10)).filter(Number.isFinite);
       const watchedSet = new Set(recentIds);
+      const watchedTmdb = new Set(recentIds.map(id => tmdbFor(id)?.tmdb_id).filter(Boolean));
       const dirCount = new Map(), actCount = new Map();
       for (const id of recentIds) {
         const t = tmdbFor(id);
@@ -5850,7 +5870,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       const actName = top(actCount, 2);
       const peopleRail = (title, test) => {
         const items = pool
-          .filter(p => !watchedSet.has(p.s.id) && test(p.t))
+          .filter(p => !watchedSet.has(p.s.id) && !watchedTmdb.has(p.t.tmdb_id) && (p.t.vote_count || 0) >= 100 && test(p.t))
           .filter(notTvMovie)
           .sort((a, b) => (b.t.rating || 0) - (a.t.rating || 0));
         if (items.length < 4) return;
@@ -5873,8 +5893,8 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     }
 
     // Long-tail discovery — high-quality stuff most people haven't
-    // heard of (low vote_count). Pinned to the bottom of the smart
-    // block so the user has already seen the safer big-name rails.
+    // heard of (low vote_count). Built last; the smart-block shuffle
+    // below may move it.
     addRail("Hidden Gems", pool
       .filter(p => (p.t.rating || 0) >= 7 && (p.t.vote_count || 0) >= 50 && (p.t.vote_count || 0) < 500)
       .filter(notTvMovie)
@@ -5891,7 +5911,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       weeknight: { Comedy: 2, Drama: 2, Documentary: 1, "Quick watch": 4 },
     }[currentDaypart()] || {};
     const pinned = (t) => /^(New on Khouch|Because you watched|More from|Starring) /.test(t + " ");
-    const wOf = (t) => Object.entries(dpW).find(([k]) => t.startsWith(k))?.[1] || 0;
+    const wOf = (t) => Object.entries(dpW).find(([k]) => t === k || t.startsWith(k + " "))?.[1] || 0;
     const orderRng = seededRng(`smart:${rotationBucket()}:${req.profileId}:${mode}`);
     const front = smart.filter(r => pinned(r.title));
     const rest = smart.filter(r => !pinned(r.title))
@@ -7748,13 +7768,14 @@ function seededRng(seedStr) {
   };
 }
 // Wall-clock parts in the household timezone (the container runs UTC).
+let zonedFmt = null;
 function zonedParts(now = new Date()) {
-  const f = new Intl.DateTimeFormat("en-US", {
+  zonedFmt ||= new Intl.DateTimeFormat("en-US", {
     timeZone: DISK_DOWNLOAD_WINDOW_TZ, hourCycle: "h23",
     year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", weekday: "short",
   });
   const o = {};
-  for (const x of f.formatToParts(now)) o[x.type] = x.value;
+  for (const x of zonedFmt.formatToParts(now)) o[x.type] = x.value;
   return {
     y: +o.year, m: +o.month, d: +o.day, hour: +o.hour % 24, minute: +o.minute,
     dow: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(o.weekday),
