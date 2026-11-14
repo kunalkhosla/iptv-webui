@@ -5103,7 +5103,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   res.set("Cache-Control", "no-store");
   const mode = req.params.mode;
   // New shuffle per visit (first fetch after ~8 min idle), stable while browsing.
-  const visitSeed = homeVisitSeed(req.profileId, mode);
+  const visitSeed = homeVisitSeed(req.profileId, mode, req.get("x-khouch-internal") !== "mcp");
   const userState = getProfileState(req.profileId);
   const activeProfile = findProfile(req.profileId);
   const kidsAge = (() => {
@@ -7801,13 +7801,17 @@ function jitterOrder(arr, rng, spread = 40) {
 // rail seed includes the visit counter, so reopening the app reshuffles
 // while tab-switching / back-navigation within a session stays stable.
 const homeVisits = new Map();
-function homeVisitSeed(profileId, mode) {
+function homeVisitSeed(profileId, mode, touch = true) {
   const key = `${profileId}:${mode}`;
   const now = Date.now();
   let v = homeVisits.get(key);
   if (!v) { v = { n: Math.floor(Math.random() * 1e6), last: 0 }; homeVisits.set(key, v); }
-  if (now - v.last > 8 * 60 * 1000) v.n++;
-  v.last = now;
+  // Non-UI callers (MCP/TARS loopback) read the current seed without
+  // starting a visit or extending one.
+  if (touch) {
+    if (now - v.last > 8 * 60 * 1000) v.n++;
+    v.last = now;
+  }
   return `${rotationBucket()}:v${v.n}`;
 }
 function currentDaypart(now = new Date()) {
@@ -8957,7 +8961,7 @@ async function mcpApi(req, pathAndQuery) {
   const cookie = `${SESSION_COOKIE}=${encodeURIComponent(makeSessionToken(req.user))}; `
     + `${PROFILE_COOKIE}=${encodeURIComponent(makeProfileToken(req.profileId))}`;
   const r = await fetch(`http://127.0.0.1:${PORT}${pathAndQuery}`, {
-    headers: { cookie, accept: "application/json" },
+    headers: { cookie, accept: "application/json", "x-khouch-internal": "mcp" },
   });
   if (!r.ok) throw new Error(`${pathAndQuery.split("?")[0]} returned HTTP ${r.status}`);
   return r.json();
