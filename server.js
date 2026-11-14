@@ -5456,9 +5456,16 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // (lib/ai.js writes them that way). Attached to the tile so the
     // client shows the reason in place of the generic rail-name caption.
     const pickReasons = tasteProfiles[req.profileId]?.reasons?.[mode];
+    const pickWhen = tasteProfiles[req.profileId]?.when?.[mode];
     if (Array.isArray(pickIds) && pickIds.length) {
+      // Daypart-matching picks lead, then a seeded soft shuffle (stable
+      // ~4h) so every open of the app isn't the same 20 in the same order.
+      const dp = currentDaypart();
+      const fits = (id) => { const w = pickWhen?.[String(id)]; return !w || w === dp ? 0 : 1; };
+      const rngFy = seededRng(`fy:${rotationBucket()}:${req.profileId}:${mode}`);
+      const ordered = jitterOrder([...pickIds].sort((a, b) => fits(a) - fits(b)), rngFy, 14);
       const seenFy = new Set();
-      const fyTiles = pickIds
+      const fyTiles = ordered
         .map((id) => ix.byId.get(id) ?? ix.byId.get(parseInt(id, 10)))
         .filter((s) => s && titleLangPasses(s.name))
         .filter((s) => {
@@ -5475,6 +5482,18 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
         })
         .filter((t) => t && !isKidBlocked(t));
       if (fyTiles.length >= 4) {
+        // "Tonight's pick" — the 3 best-fitting picks as their own
+        // short rail, so "just give me something" is one glance away
+        // on every client (phone, TV, web) with no client change.
+        if (fyTiles.length >= 8 && mode !== "live") {
+          const top = fyTiles.splice(0, 3);
+          rails.push({
+            title: "Tonight's pick",
+            total: top.length,
+            items: top,
+            snoozable: true,
+          });
+        }
         rails.push({
           title: "For You",
           total: fyTiles.length,
@@ -5675,10 +5694,14 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // surfaces the top 100.
     const RAIL_CAP = 100;
     const MIN_RAIL = 15;
-    const addRail = (title, items) => {
+    const railRng = seededRng(`rails:${rotationBucket()}:${req.profileId}:${mode}`);
+    const addRail = (title, items, { jitter = true } = {}) => {
       const eligible = items.filter(p => !surfacedIds.has(p.s.id));
       if (eligible.length < MIN_RAIL) return;
-      const filtered = eligible.slice(0, RAIL_CAP);
+      // Soft-shuffle quality-sorted rails so the leading titles rotate;
+      // ordered rails (franchise by year, TMDB-ranked recs) opt out.
+      const ordered = jitter ? jitterOrder(eligible, railRng, 30) : eligible;
+      const filtered = ordered.slice(0, RAIL_CAP);
       for (const p of filtered) surfacedIds.add(p.s.id);
       rails.push({
         title,
@@ -5742,16 +5765,18 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // only the items that exist in our catalog. The personalized rail
     // sits high in the smart block because intent-matched
     // recommendations are higher-signal than any genre slice.
-    const lastPlayId = (() => {
+    // Up to 3 most recent distinct plays, newest first — one "Because
+    // you watched" rail each, so the block refreshes after every watch.
+    const lastPlayIds = (() => {
       const lp = userState.lastPlayed?.[mode];
-      if (!lp || typeof lp !== "object") return null;
-      let bestId = null, bestT = 0;
-      for (const [k, t] of Object.entries(lp)) {
-        if (t > bestT) { bestT = t; bestId = parseInt(k, 10); }
-      }
-      return bestId;
+      if (!lp || typeof lp !== "object") return [];
+      return Object.entries(lp)
+        .sort((x, y) => y[1] - x[1])
+        .slice(0, 3)
+        .map(([k]) => parseInt(k, 10))
+        .filter(Number.isFinite);
     })();
-    if (lastPlayId) {
+    for (const lastPlayId of lastPlayIds) {
       const lpEntry = tmdbFor(lastPlayId);
       const recIds = lpEntry && Array.isArray(lpEntry.recommendations) ? lpEntry.recommendations : [];
       if (recIds.length) {
@@ -5764,7 +5789,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
           .sort((a, b) => recIds.indexOf(a.t.tmdb_id) - recIds.indexOf(b.t.tmdb_id));
         const refName = ix.byId.get(lastPlayId)?.name || lpEntry?.tmdb_title || "what you watched";
         const refClean = lpEntry?.tmdb_title || refName.replace(/\s*\(.*$/, "").trim();
-        addRail(`Because you watched ${refClean}`, recItems);
+        addRail(`Because you watched ${refClean}`, recItems, { jitter: false });
       }
     }
 
@@ -5791,7 +5816,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       // for sagas (Bond 1, Bond 2, ...). Year is a string in the
       // cache so compare via parseInt with a safe fallback.
       c.items.sort((a, b) => (parseInt(a.t.year, 10) || 0) - (parseInt(b.t.year, 10) || 0));
-      addRail(c.name, c.items);
+      addRail(c.name, c.items, { jitter: false });
     }
 
     // Long-tail discovery — high-quality stuff most people haven't
@@ -7607,6 +7632,38 @@ function scheduleTmdbNightlyRetry() {
 // ANTHROPIC_API_KEY the job never runs and the rail never appears
 // (same silent degradation as TMDB enrichment).
 const ai = require("./lib/ai");
+// Rotation helpers — home rails vary through the day instead of serving
+// one frozen order. The bucket is stable within ~4h (so quick re-opens
+// don't reshuffle) and changes with the profile.
+function seededRng(seedStr) {
+  let st = 0;
+  for (const c of String(seedStr)) st = (st * 31 + c.charCodeAt(0)) | 0;
+  return () => {
+    st = (st + 0x6D2B79F5) | 0;
+    let t = st;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function rotationBucket(now = new Date()) {
+  return `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}:${Math.floor(now.getHours() / 4)}`;
+}
+// Soft shuffle: keeps a quality bias (rank) but lets items move up to
+// ~`spread` places, so the same titles don't lead forever.
+function jitterOrder(arr, rng, spread = 40) {
+  return arr
+    .map((x, i) => ({ x, k: i + rng() * spread }))
+    .sort((a, b) => a.k - b.k)
+    .map((o) => o.x);
+}
+function currentDaypart(now = new Date()) {
+  const h = now.getHours(), d = now.getDay();
+  if (h >= 22 || h < 5) return "late";
+  if (d === 6 || d === 0 || (d === 5 && h >= 17)) return "weekend";
+  return "weeknight";
+}
+
 const tasteProfilesFile = path.join(DATA_DIR, "taste-profiles.json");
 // { [profileId]: { updatedAt, summary, picks: { movie:[ids], series:[ids] },
 //   reasons: { movie:{[id]:reason}, series:{[id]:reason} } } }
@@ -7747,7 +7804,17 @@ function tasteCandidatesFor(state, profile, mode, excludeIds, cap = 150) {
     pool.push({ s, t });
   }
   pool.sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0));
-  return pool.slice(0, cap).map(({ s, t }) => ({
+  // Top ~40% by audience size, rest sampled at random from the next
+  // 1500 — a pure top-N pool made every rebuild see the same titles.
+  const head = pool.slice(0, Math.floor(cap * 0.4));
+  const rest = pool.slice(head.length, head.length + 1500);
+  const rng = seededRng(`${rotationBucket()}:${profile?.id || ""}:${mode}:${Date.now() % 997}`);
+  for (let i = rest.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [rest[i], rest[j]] = [rest[j], rest[i]];
+  }
+  const sampled = [...head, ...rest.slice(0, cap - head.length)];
+  return sampled.map(({ s, t }) => ({
     id: s.id,
     line: `${s.name} (${t.year || s.year || "?"}) — ${(t.genres || []).join("/")}` +
       (t.original_language ? ` [${t.original_language}]` : "") +
@@ -7840,7 +7907,13 @@ async function buildTasteForProfile(p) {
     }
     const { signal, excludeIds, disliked } = tasteSignalFor(state, mode);
     if (signal.length + disliked.length < 3) continue; // not enough taste signal (likes/dislikes count)
-    const candidates = tasteCandidatesFor(state, p, mode, excludeIds);
+    // Don't re-pick what the last few rebuilds already surfaced (5d),
+    // unless that would starve the pool.
+    const prevHist = tasteProfiles[p.id]?.history?.[mode] || {};
+    const histCut = Date.now() - 5 * 86400000;
+    const recentShown = new Set(Object.entries(prevHist).filter(([, t]) => t > histCut).map(([id]) => id));
+    let candidates = tasteCandidatesFor(state, p, mode, new Set([...excludeIds, ...recentShown]));
+    if (candidates.length < 60) candidates = tasteCandidatesFor(state, p, mode, excludeIds);
     if (!candidates.length) continue;
     const res = await ai.buildTasteProfile({
       profileName: p.nick || p.id,
@@ -7850,6 +7923,11 @@ async function buildTasteForProfile(p) {
     });
     if (res) {
       entry.picks[mode] = res.picks;
+      const hist = {};
+      for (const [id, t] of Object.entries(prevHist)) if (t > histCut) hist[id] = t;
+      for (const id of res.picks) hist[String(id)] = Date.now();
+      (entry.history ||= {})[mode] = hist;
+      if (res.when && Object.keys(res.when).length) (entry.when ||= {})[mode] = res.when;
       if (res.reasons && Object.keys(res.reasons).length) entry.reasons[mode] = res.reasons;
       summaries.push(res.summary);
     }
@@ -7917,6 +7995,15 @@ function scheduleTasteProfileNightly() {
     nightly();
     setInterval(nightly, 24 * 60 * 60 * 1000);
   }, ms);
+  // Second rebuild at 4:15 PM so the evening shows different picks.
+  const pm = new Date(now);
+  pm.setHours(16, 15, 0, 0);
+  if (pm <= now) pm.setDate(pm.getDate() + 1);
+  setTimeout(() => {
+    const afternoon = () => rebuildTasteProfiles({ reason: "pm" }).catch(e => console.warn(`[ai] taste rebuild failed: ${e.message}`));
+    afternoon();
+    setInterval(afternoon, 24 * 60 * 60 * 1000);
+  }, pm - now);
   if (!Object.keys(tasteProfiles).length) {
     // 10 min gives the boot index build + TMDB prewarm time to settle.
     // If the index still isn't ready (fresh install, slow panel), keep
@@ -8838,6 +8925,41 @@ const MCP_TOOLS = [
       }
       items.sort((a, b) => b.t - a.t);
       return { items: items.slice(0, limit).map(({ t, ...rest }) => rest) };
+    },
+  },
+  {
+    name: "for_you",
+    description: "Personalised suggestions for this profile, the same ones the Khouch home screen shows "
+      + "right now: `tonights_pick` (3 best fits for this time of day) and `for_you` (more), each with a "
+      + "`ref` and a short `why`. Rotates through the day. For live TV also returns `tonight` "
+      + "(highlights). Use for 'what should we watch', 'put on something good'. `kind` movie or series "
+      + "(default movie).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["movie", "series", "live"] },
+        limit: { type: "integer", minimum: 1, maximum: 20 },
+      },
+    },
+    async handler(args, req) {
+      const kind = ["movie", "series", "live"].includes(args.kind) ? args.kind : "movie";
+      const limit = Math.min(Math.max(parseInt(args.limit, 10) || 8, 1), 20);
+      const home = await mcpApi(req, `/api/home/${kind}`);
+      const pick = (titles) => {
+        const r = (home.rails || []).find(x => titles.includes(x.title));
+        return (r?.items || []).slice(0, limit).map(t => {
+          const o = mcpHit(kind, t);
+          if (t.pickReason) o.why = t.pickReason;
+          return o;
+        });
+      };
+      const out = { kind };
+      if (kind === "live") out.tonight = pick(["Tonight"]);
+      else {
+        out.tonights_pick = pick(["Tonight's pick"]);
+        out.for_you = pick(["For You"]);
+      }
+      return out;
     },
   },
   {
