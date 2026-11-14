@@ -5285,7 +5285,12 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // Stash the sliced items + the full eligible total per category so
   // rails can render "(N)" next to the title.
   const bucketTotals = new Map();
-  for (const [cid, bucket] of byCat) {
+  for (const [cid, rawBucket] of byCat) {
+    // Rotate WHICH titles surface in each provider category (VOD only —
+    // channel order in live categories is meaningful). Soft shuffle
+    // over the first 200 so the visible 12 change through the day.
+    const bucket = mode === "live" ? rawBucket
+      : [...jitterOrder(rawBucket.slice(0, 200), seededRng(`cat:${rotationBucket()}:${req.profileId}:${mode}:${cid}`), 60), ...rawBucket.slice(200)];
     const r = sliceBucket(bucket, catName.get(String(cid)));
     byCat.set(cid, r.items);
     bucketTotals.set(cid, r.total);
@@ -5656,6 +5661,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // data ultimately land, and where users who *want* to browse by
   // panel taxonomy can still do so.
   if (mode !== "live") {
+    const smartStart = rails.length;
     const tmdbBy = (s) => tmdbFor(s.id);
     // Build the pool, deduplicating by tmdb_id so a movie that the
     // panel ships in 5 quality / language / dub variants doesn't take
@@ -5825,6 +5831,47 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       addRail(c.name, c.items, { jitter: false });
     }
 
+    // Taste-driven people rails (movies only — TMDB cache carries cast /
+    // directors / runtime for movies): the director and the actor the
+    // household's recent plays share most. No AI, rebuilt every request.
+    if (mode === "movie") {
+      const recentIds = Object.entries(userState.lastPlayed?.movie || {})
+        .sort((x, y) => y[1] - x[1]).slice(0, 25).map(([k]) => parseInt(k, 10)).filter(Number.isFinite);
+      const watchedSet = new Set(recentIds);
+      const dirCount = new Map(), actCount = new Map();
+      for (const id of recentIds) {
+        const t = tmdbFor(id);
+        if (!t) continue;
+        for (const d of (t.directors || []).slice(0, 2)) dirCount.set(d, (dirCount.get(d) || 0) + 1);
+        for (const a of (t.cast || []).slice(0, 3)) if (a?.name) actCount.set(a.name, (actCount.get(a.name) || 0) + 1);
+      }
+      const top = (m, min) => [...m.entries()].filter(([, n]) => n >= min).sort((a, b) => b[1] - a[1])[0]?.[0];
+      const dirName = top(dirCount, 1);
+      const actName = top(actCount, 2);
+      const peopleRail = (title, test) => {
+        const items = pool
+          .filter(p => !watchedSet.has(p.s.id) && test(p.t))
+          .filter(notTvMovie)
+          .sort((a, b) => (b.t.rating || 0) - (a.t.rating || 0));
+        if (items.length < 4) return;
+        rails.push({ title, total: items.length, items: items.slice(0, 40).map(p => p.tile) });
+      };
+      if (dirName) peopleRail(`More from ${dirName}`, t => (t.directors || []).includes(dirName));
+      if (actName && actName !== dirName) {
+        peopleRail(`Starring ${actName}`, t => (t.cast || []).slice(0, 6).some(a => a?.name === actName));
+      }
+      // Runtime-shaped rails — the daypart weights below decide which
+      // one leads (weeknights: quick; weekends: epics).
+      addRail("Quick watch · under 100 min", pool
+        .filter(p => p.t.runtime >= 70 && p.t.runtime <= 100 && (p.t.rating || 0) >= 6.3 && (p.t.vote_count || 0) >= 300)
+        .filter(notTvMovie)
+        .sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0)));
+      addRail("Weekend epics · 2.5h+", pool
+        .filter(p => p.t.runtime >= 150 && (p.t.rating || 0) >= 7 && (p.t.vote_count || 0) >= 500)
+        .filter(notTvMovie)
+        .sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0)));
+    }
+
     // Long-tail discovery — high-quality stuff most people haven't
     // heard of (low vote_count). Pinned to the bottom of the smart
     // block so the user has already seen the safer big-name rails.
@@ -5832,14 +5879,50 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       .filter(p => (p.t.rating || 0) >= 7 && (p.t.vote_count || 0) >= 50 && (p.t.vote_count || 0) < 500)
       .filter(notTvMovie)
       .sort((a, b) => (b.t.rating || 0) - (a.t.rating || 0)));
+
+    // Reorder the smart block: personal rails (new releases, because-you-
+    // watched, people rails) stay up front; the rest are shuffled with a
+    // seeded soft jitter, biased by time of day (late = thrillers/horror,
+    // weekend = family/epics, weeknight = comedy/drama/quick watches).
+    const smart = rails.splice(smartStart);
+    const dpW = {
+      late: { Horror: 3, Thriller: 3, Comedy: 2, "Science Fiction": 1 },
+      weekend: { Family: 3, Animation: 3, Action: 2, Documentary: 1, "Weekend epics": 4 },
+      weeknight: { Comedy: 2, Drama: 2, Documentary: 1, "Quick watch": 4 },
+    }[currentDaypart()] || {};
+    const pinned = (t) => /^(New on Khouch|Because you watched|More from|Starring) /.test(t + " ");
+    const wOf = (t) => Object.entries(dpW).find(([k]) => t.startsWith(k))?.[1] || 0;
+    const orderRng = seededRng(`smart:${rotationBucket()}:${req.profileId}:${mode}`);
+    const front = smart.filter(r => pinned(r.title));
+    const rest = smart.filter(r => !pinned(r.title))
+      .map((r, i) => ({ r, k: i + orderRng() * 12 - wOf(r.title) * 5 }))
+      .sort((a, b) => a.k - b.k).map(o => o.r);
+    rails.push(...front, ...rest);
   }
 
-  // Per-category rails, ordered by the original category list so the
-  // sequence is stable across reloads.
+  // Per-category rails. Order: categories the profile actually plays
+  // from first (by play count), then the rest in a seeded soft shuffle
+  // (VOD) or panel order (live), with CAM / screener categories last.
+  const catAffinity = new Map();
+  {
+    const bump = (id) => {
+      const it = ix.byId.get(id) ?? ix.byId.get(parseInt(id, 10));
+      if (it?.category_id != null) {
+        const k = String(it.category_id);
+        catAffinity.set(k, (catAffinity.get(k) || 0) + 1);
+      }
+    };
+    (userState.recents?.[mode] || []).forEach(bump);
+    (userState.favorites?.[mode] || []).forEach(bump);
+    for (const k of Object.keys(userState.progress || {})) {
+      if (k.startsWith(mode + ":")) bump(k.split(":", 2)[1]);
+    }
+  }
+  const catRails = [];
   for (const c of cats) {
     const items = byCat.get(String(c.category_id));
     if (!items?.length) continue;
-    rails.push({
+    catRails.push({
       title: c.category_name,
       // category_id lets the Android / phone clients open a "See all"
       // view for that rail. The web client doesn't use this — it has
@@ -5848,6 +5931,18 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       total: bucketTotals.get(String(c.category_id)) || items.length,
       items: items.map(s => tileFor(s, c.category_name)),
     });
+  }
+  {
+    const catRng = seededRng(`catorder:${rotationBucket()}:${req.profileId}:${mode}`);
+    const isCam = (t) => /\bCAM\b/i.test(t || "");
+    const scored = catRails.map((r, i) => ({
+      r,
+      aff: catAffinity.get(r.category_id) || 0,
+      cam: isCam(r.title),
+      k: mode === "live" ? i : i + catRng() * 25,
+    }));
+    scored.sort((a, b) => (a.cam - b.cam) || (b.aff - a.aff) || (a.k - b.k));
+    for (const o of scored) rails.push(o.r);
   }
 
   // Adult-content filter for the hero. Independent of the kids-cert
@@ -8156,6 +8251,16 @@ function scheduleEditorialRailsWeekly() {
     run();
     setInterval(run, WEEK);
   }, ms);
+  // Second weekly run mid-week (Wednesday) so the themed rails turn over
+  // twice a week instead of once.
+  const wed = new Date(now);
+  wed.setHours(4, 30, 0, 0);
+  wed.setDate(wed.getDate() + ((3 - wed.getDay() + 7) % 7));
+  if (wed <= now) wed.setDate(wed.getDate() + 7);
+  setTimeout(() => {
+    run();
+    setInterval(run, WEEK);
+  }, wed - now);
   if (!editorialRails.rails?.length) {
     let tries = 0;
     const warm = () => {
