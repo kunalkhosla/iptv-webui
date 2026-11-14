@@ -5293,7 +5293,9 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // Dedup twins BEFORE shuffling so the surviving variant (stream id —
     // progress/favorites are keyed by it) doesn't flip between rotations.
     let bucket = rawBucket;
-    if (mode !== "live") {
+    // Kid profiles skip the pre-dedup: sliceBucket applies the cert filter
+    // before its dedup, and deduping first could keep an uncertified twin.
+    if (mode !== "live" && allowedKidCerts === null) {
       const sT = new Set(), sK = new Set();
       bucket = rawBucket.filter((s) => {
         const tk = dedupTitleKey(s.name);
