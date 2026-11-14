@@ -5104,6 +5104,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   const mode = req.params.mode;
   // New shuffle per visit (first fetch after ~8 min idle), stable while browsing.
   const visitSeed = homeVisitSeed(req.profileId, mode, req.get("x-khouch-internal") !== "mcp");
+  console.log(`[home] ${mode} profile=${req.profileId || "-"} ${visitSeed} ua=${String(req.get("user-agent") || "-").slice(0, 40)}${req.get("x-khouch-internal") ? " internal" : ""}`);
   const userState = getProfileState(req.profileId);
   const activeProfile = findProfile(req.profileId);
   const kidsAge = (() => {
@@ -5487,8 +5488,8 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       const rngFy = seededRng(`fy:${visitSeed}:${req.profileId}:${mode}`);
       // Jitter inside each fit-group so daypart matches always lead.
       const ordered = [
-        ...jitterOrder(pickIds.filter((id) => fits(id) === 0), rngFy, 10),
-        ...jitterOrder(pickIds.filter((id) => fits(id) === 1), rngFy, 10),
+        ...jitterOrder(pickIds.filter((id) => fits(id) === 0), rngFy, 40),
+        ...jitterOrder(pickIds.filter((id) => fits(id) === 1), rngFy, 40),
       ];
       const seenFy = new Set();
       const fyTiles = ordered
@@ -5600,11 +5601,15 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       .map((x) => tileFor(x.s))
       .filter((t) => t && isKidSafe(t));
     if (familyTiles.length) {
+      const famOrdered = [
+        ...jitterOrder(familyTiles.slice(0, 160), seededRng(`fam:${visitSeed}:${req.profileId}:${mode}`), 80),
+        ...familyTiles.slice(160),
+      ];
       rails.push({
         title: "Family Friendly",
         category_id: "__rail-family",
         total: familyTiles.length,
-        items: familyTiles.slice(0, 100),
+        items: famOrdered.slice(0, 100),
       });
     }
   }
@@ -5656,7 +5661,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
           title: er.title,
           blurb: er.blurb || null,
           total: edTiles.length,
-          items: edTiles.slice(0, 20),
+          items: jitterOrder(edTiles, seededRng(`ed:${visitSeed}:${req.profileId}:${er.title}`), 30).slice(0, 20),
         });
       }
     }
