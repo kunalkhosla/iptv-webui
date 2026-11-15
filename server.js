@@ -4658,7 +4658,11 @@ app.get("/api/bootstrap", async (req, res, next) => {
         username: req.user.username,
         role: req.user.role,
       },
-      userState: getProfileState(activeProfile ? activeProfile.id : "p1"),
+      userState: (() => {
+        const pid = activeProfile ? activeProfile.id : "p1";
+        clearPendingListAdds(pid); // this client now sees the current lists
+        return getProfileState(pid);
+      })(),
       // Authoritative chip-filter and kids-cert configuration. Both
       // web and Android TV clients consume this — they hold a fallback
       // table for graceful degradation against an older server, but
@@ -6369,6 +6373,7 @@ app.put("/api/user-state", express.json({ limit: "256kb" }), (req, res) => {
       }
     }
   }
+  mergePendingListAdds(req.profileId, userState);
   if (b.feedback && typeof b.feedback === "object") {
     for (const dir of ["up", "down"]) {
       const src = b.feedback[dir];
@@ -8988,6 +8993,32 @@ function mcpProgram(p) {
   return { title: p.title, start: new Date(p.start_ts * 1000).toISOString(), end: new Date(p.stop_ts * 1000).toISOString() };
 }
 
+// Items added to Watch Later / Favorites through MCP (TARS). Clients PUT
+// whole lists, so a tab that loaded before the add would otherwise erase it
+// on its next change. Until some client loads /api/bootstrap (i.e. has SEEN
+// the list) or 24h pass, a PUT that lacks a pending add gets it re-merged.
+// In-memory; a restart just drops the protection.
+const pendingListAdds = new Map(); // profileId -> Map("key|mode|id" -> ts)
+function notePendingListAdd(profileId, key, mode, id) {
+  let m = pendingListAdds.get(profileId);
+  if (!m) { m = new Map(); pendingListAdds.set(profileId, m); }
+  m.set(`${key}|${mode}|${id}`, Date.now());
+}
+function clearPendingListAdds(profileId) { pendingListAdds.delete(profileId); }
+function mergePendingListAdds(profileId, userState) {
+  const m = pendingListAdds.get(profileId);
+  if (!m) return;
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [k, t] of m) {
+    if (t < cutoff) { m.delete(k); continue; }
+    const [key, mode, idStr] = k.split("|");
+    const id = parseInt(idStr, 10);
+    const list = (userState[key][mode] ||= []);
+    if (!list.some((x) => String(x) === String(id))) list.unshift(id);
+  }
+  if (!m.size) pendingListAdds.delete(profileId);
+}
+
 const MCP_TOOLS = [
   {
     name: "search",
@@ -9193,12 +9224,14 @@ const MCP_TOOLS = [
         const list = (st[key][ref.mode] ||= []);
         const at = list.findIndex((x) => String(x) === String(id));
         if (remove) {
+          pendingListAdds.get(req.profileId)?.delete(`${key}|${ref.mode}|${id}`);
           if (at >= 0) list.splice(at, 1);
           results.push({ ref: raw, title: item.name, status: at >= 0 ? "removed" : "not_in_list" });
         } else if (at >= 0) {
           results.push({ ref: raw, title: item.name, status: "already_there" });
         } else {
           list.unshift(id); // newest first — the home rail shows only the first 12
+          notePendingListAdd(req.profileId, key, ref.mode, id);
           results.push({ ref: raw, title: item.name, status: "added" });
         }
       }
