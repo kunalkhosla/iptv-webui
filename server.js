@@ -4660,7 +4660,9 @@ app.get("/api/bootstrap", async (req, res, next) => {
       },
       userState: (() => {
         const pid = activeProfile ? activeProfile.id : "p1";
-        clearPendingListAdds(pid); // this client now sees the current lists
+        // This client now sees the current lists — unless it asked for a
+        // categories-only refresh (?lite=1) and ignores userState.
+        if (!req.query.lite) clearPendingListAdds(pid);
         return getProfileState(pid);
       })(),
       // Authoritative chip-filter and kids-cert configuration. Both
@@ -9009,13 +9011,17 @@ function mergePendingListAdds(profileId, userState) {
   const m = pendingListAdds.get(profileId);
   if (!m) return;
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  const restore = [];
   for (const [k, t] of m) {
     if (t < cutoff) { m.delete(k); continue; }
     const [key, mode, idStr] = k.split("|");
     const id = parseInt(idStr, 10);
     const list = (userState[key][mode] ||= []);
-    if (!list.some((x) => String(x) === String(id))) list.unshift(id);
+    if (!list.some((x) => String(x) === String(id))) restore.push({ list, id });
   }
+  // Insertion order is oldest-first; unshift in that order so the newest
+  // add ends up at the front, as update_list leaves it.
+  for (const r of restore) r.list.unshift(r.id);
   if (!m.size) pendingListAdds.delete(profileId);
 }
 

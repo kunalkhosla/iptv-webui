@@ -6694,7 +6694,7 @@ el.refresh.onclick = async () => {
       state.modes[m].streams = [];
       state.modes[m].indexReady = false;
     }
-    const r = await fetch("/api/bootstrap");
+    const r = await fetch("/api/bootstrap?lite=1");
     const d = await r.json();
     state.modes.live.categories   = Array.isArray(d.categories.live)   ? d.categories.live   : [];
     state.modes.movie.categories  = Array.isArray(d.categories.movie)  ? d.categories.movie  : [];
@@ -7245,7 +7245,7 @@ async function savePanelConfig() {
       // call pulls categories; pollIndex() picks up the rebuilt indexes
       // once they're ready (status endpoint will flip ready=true).
       try {
-        const r2 = await fetch("/api/bootstrap");
+        const r2 = await fetch("/api/bootstrap?lite=1");
         const d2 = await r2.json();
         for (const m of MODES) {
           state.modes[m].byCat = new Map();
