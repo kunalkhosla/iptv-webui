@@ -9154,6 +9154,56 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: "update_list",
+    description: "Add or remove items on this profile's Watch Later (`watch_later`) or Favorites "
+      + "(`favorites`) list. `refs` are refs from search / for_you / whats_on (movie, series, live, "
+      + "disk; not episodes). Lists show as the 'Watch Later' / 'Favorites' rails on the Khouch home "
+      + "on every device. Default action is add. Returns per-ref status (added / already_there / "
+      + "removed / not_found / invalid).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        refs: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 30 },
+        list: { type: "string", enum: ["watch_later", "favorites"] },
+        action: { type: "string", enum: ["add", "remove"] },
+      },
+      required: ["refs", "list"],
+    },
+    async handler(args, req) {
+      const refs = Array.isArray(args.refs) ? args.refs.slice(0, 30) : [];
+      if (!refs.length) throw new Error("refs is required");
+      const key = args.list === "favorites" ? "favorites" : args.list === "watch_later" ? "myList" : null;
+      if (!key) throw new Error("list must be watch_later or favorites");
+      const remove = args.action === "remove";
+      const st = getProfileState(req.profileId);
+      const ix = getIndexesFor(currentAccount());
+      const results = [];
+      for (const raw of refs) {
+        const ref = parseRef(raw);
+        if (!ref || !["live", "movie", "series", "disk"].includes(ref.mode)) {
+          results.push({ ref: raw, status: "invalid" });
+          continue;
+        }
+        const id = parseInt(ref.id, 10);
+        const item = ix[ref.mode]?.byId?.get(id);
+        if (!item) { results.push({ ref: raw, status: "not_found" }); continue; }
+        const list = (st[key][ref.mode] ||= []);
+        const at = list.findIndex((x) => String(x) === String(id));
+        if (remove) {
+          if (at >= 0) list.splice(at, 1);
+          results.push({ ref: raw, title: item.name, status: at >= 0 ? "removed" : "not_found" });
+        } else if (at >= 0) {
+          results.push({ ref: raw, title: item.name, status: "already_there" });
+        } else {
+          list.unshift(id); // newest first — the home rail shows only the first 12
+          results.push({ ref: raw, title: item.name, status: "added" });
+        }
+      }
+      scheduleUserStateSave();
+      return { list: args.list, action: remove ? "remove" : "add", results };
+    },
+  },
+  {
     name: "resolve_playback",
     description: "Turn a `ref` (from search/whats_on/continue_watching) into a cast-ready URL for "
       + "a media player. For a series ref, optionally give season+episode; otherwise it picks the "
