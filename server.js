@@ -2512,6 +2512,29 @@ async function fetchCategoriesResilient(mode, m, actx) {
   return null;
 }
 
+// The provider allows ONE connection per account and panel API calls count
+// against it: a catalog rebuild (hundreds of get_*_streams calls) during a
+// stream gets the stream 403'd / the calls 500'd. So rebuilds yield: before
+// each panel call, wait while any viewer is active (stream seen within the
+// idle grace and not displaced). `streams` is declared further down; only
+// read inside functions that run after startup.
+function streamingNow() {
+  const now = Date.now();
+  for (const v of streams.values()) {
+    if (!v.displaced && now - v.lastSeen < LIVE_IDLE_GRACE_MS) return true;
+  }
+  return false;
+}
+async function yieldToViewers(label) {
+  let waited = 0;
+  while (streamingNow()) {
+    if (waited === 0) console.log(`[index] ${label}: viewer active — pausing panel calls until the stream ends`);
+    await new Promise((r) => setTimeout(r, 15_000));
+    waited += 15;
+  }
+  if (waited) console.log(`[index] ${label}: resumed after ${waited}s`);
+}
+
 async function buildIndex(mode, actx = currentAccount()) {
   const ix = getIndexesFor(actx)[mode];
   if (ix.running) return;
@@ -2519,6 +2542,7 @@ async function buildIndex(mode, actx = currentAccount()) {
   const m = MODES[mode];
   const t = Date.now();
   try {
+    await yieldToViewers(`${mode} build`);
     const cats = await fetchCategoriesResilient(mode, m, actx);
     if (!cats) {
       console.warn(`[${mode}] index build aborted: no categories from panel or disk (will retry on next refresh tick)`);
@@ -2561,6 +2585,7 @@ async function buildIndex(mode, actx = currentAccount()) {
     for (const c of cats) {
       const beforeSize = ix.byId.size;
       let failed = false;
+      await yieldToViewers(`${mode} build`);
       try {
         const list = await xtream(m.list, { category_id: c.category_id }, { timeout: 60_000, actx });
         for (const s of list) {
@@ -11245,6 +11270,7 @@ app.post("/api/probe-channels", express.json({ limit: "32kb" }), (req, res) => {
 });
 
 app.post("/api/refresh", async (_req, res) => {
+  console.log(`[refresh] /api/refresh from ${_req.ip} ua=${String(_req.get("user-agent") || "-").slice(0, 40)}`);
   const actx = getOwnerAccount();
   const picked = await pickPanel(actx);
   cache.clear();
