@@ -1095,6 +1095,7 @@ async function prewarmAudioInfoCache(actx = currentAccount()) {
   await Promise.all(Array.from({ length: AUDIO_PREWARM_CONCURRENCY }, async () => {
     while (i < candidates.length) {
       const s = candidates[i++];
+      await yieldToViewers("audio prewarm", actx);
       const v = await verifyQuality4k(s.id, actx).catch(() => null);
       if (!v) { failed++; continue; }
       probed++;
@@ -1138,6 +1139,7 @@ async function prewarmQualityCache(actx = currentAccount()) {
   await Promise.all(Array.from({ length: QUALITY_PREWARM_CONCURRENCY }, async () => {
     while (i < candidates.length) {
       const s = candidates[i++];
+      await yieldToViewers("quality prewarm", actx);
       const v = await verifyQuality4k(s.id, actx).catch(() => null);
       if (!v) { failed++; continue; }
       verified++;
@@ -1800,6 +1802,7 @@ async function saveEpgIndexToDisk(actx = currentAccount()) {
 }
 async function prewarmEpg(actx = currentAccount()) {
   if (!actx.host) return false;
+  await yieldToViewers("xmltv", actx);
   const url = `${actx.host}/xmltv.php?username=${encodeURIComponent(actx.user)}&password=${encodeURIComponent(actx.pass)}`;
   console.log(`[epg] fetching xmltv.php …`);
   const t0 = Date.now();
@@ -2518,31 +2521,36 @@ async function fetchCategoriesResilient(mode, m, actx) {
 // each panel call, wait while any viewer is active (stream seen within the
 // idle grace and not displaced). `streams` is declared further down; only
 // read inside functions that run after startup.
-function streamingNow() {
+function streamingNow(actx) {
   const now = Date.now();
+  const key = actx ? accountKeyOf(actx) : null;
   for (const v of streams.values()) {
-    if (!v.displaced && now - v.lastSeen < LIVE_IDLE_GRACE_MS) return true;
+    if (v.displaced || now - v.lastSeen >= LIVE_IDLE_GRACE_MS) continue;
+    if (key && v.accountKey !== key) continue; // the 1-connection cap is per panel account
+    if (v.mode === "disk") continue; // local files never touch the panel
+    return true;
   }
   return false;
 }
-async function yieldToViewers(label) {
-  let waited = 0;
-  while (streamingNow()) {
-    if (waited === 0) console.log(`[index] ${label}: viewer active — pausing panel calls until the stream ends`);
+async function yieldToViewers(label, actx) {
+  const t0 = Date.now();
+  let paused = false;
+  while (streamingNow(actx)) {
+    if (!paused) console.log(`[index] ${label}: viewer active — pausing panel calls until the stream ends`);
+    paused = true;
     await new Promise((r) => setTimeout(r, 15_000));
-    waited += 15;
   }
-  if (waited) console.log(`[index] ${label}: resumed after ${waited}s`);
+  if (paused) console.log(`[index] ${label}: resumed after ${Math.round((Date.now() - t0) / 1000)}s`);
 }
 
-async function buildIndex(mode, actx = currentAccount()) {
+async function buildIndex(mode, actx = currentAccount(), { noYield = false } = {}) {
   const ix = getIndexesFor(actx)[mode];
   if (ix.running) return;
   ix.running = true;
   const m = MODES[mode];
   const t = Date.now();
   try {
-    await yieldToViewers(`${mode} build`);
+    if (!noYield) await yieldToViewers(`${mode} build`, actx);
     const cats = await fetchCategoriesResilient(mode, m, actx);
     if (!cats) {
       console.warn(`[${mode}] index build aborted: no categories from panel or disk (will retry on next refresh tick)`);
@@ -2552,7 +2560,12 @@ async function buildIndex(mode, actx = currentAccount()) {
     rebuildCategoryTags(mode, cats, actx);
     ix.total = cats.length;
     ix.done = 0;
-    ix.byId = new Map();
+    // A warm index (ready) keeps serving the previous catalog while the
+    // rebuild fills a private map, swapped in at the end — a rebuild that
+    // pauses for a viewer must not expose a half-filled catalog. A cold
+    // build (not ready) fills in place so partial results show progress.
+    const warm = ix.ready;
+    const nextById = warm ? new Map() : (ix.byId = new Map());
     console.log(`[${mode}] indexing ${cats.length} categories…`);
     // Snapshot how many items each category contributed so a panel
     // hiccup that returned an empty list for a usually-populated
@@ -2583,20 +2596,20 @@ async function buildIndex(mode, actx = currentAccount()) {
     } catch { /* no prior — first build */ }
     const beforeCats = [];
     for (const c of cats) {
-      const beforeSize = ix.byId.size;
+      const beforeSize = nextById.size;
       let failed = false;
-      await yieldToViewers(`${mode} build`);
+      if (!noYield) await yieldToViewers(`${mode} build`, actx);
       try {
         const list = await xtream(m.list, { category_id: c.category_id }, { timeout: 60_000, actx });
         for (const s of list) {
           const p = projectStream(mode, s, actx);
-          if (!ix.byId.has(p.id)) ix.byId.set(p.id, p);
+          if (!nextById.has(p.id)) nextById.set(p.id, p);
         }
       } catch (e) {
         failed = true;
         console.warn(`  [${mode}] cat ${c.category_id} (${c.category_name}) failed: ${e.message}`);
       }
-      let added = ix.byId.size - beforeSize;
+      let added = nextById.size - beforeSize;
       // Backfill from the last good snapshot when the panel errored, or
       // returned nothing for a category that previously had titles. A
       // transient 500 / [] must not delete content; fresh data wins on
@@ -2604,8 +2617,8 @@ async function buildIndex(mode, actx = currentAccount()) {
       if (added === 0) {
         const prev = priorByCat.get(String(c.category_id));
         if (prev && prev.length) {
-          for (const s of prev) if (!ix.byId.has(s.id)) ix.byId.set(s.id, s);
-          added = ix.byId.size - beforeSize;
+          for (const s of prev) if (!nextById.has(s.id)) nextById.set(s.id, s);
+          added = nextById.size - beforeSize;
           if (added) {
             console.warn(`  [${mode}] cat ${c.category_id} (${c.category_name}) ${failed ? "failed" : "empty"}; backfilled ${added} from last snapshot`);
           }
@@ -2626,7 +2639,7 @@ async function buildIndex(mode, actx = currentAccount()) {
     // than the one we had on disk, keep the old one. A 5% loss is
     // worth investigating; 15% (what we saw with the GWH incident)
     // would silently bury thousands of titles.
-    const newSize = ix.byId.size;
+    const newSize = nextById.size;
     let priorSize = 0;
     try {
       const prior = JSON.parse(fs.readFileSync(dataPathFor(actx, "index", mode), "utf8"));
@@ -2638,9 +2651,11 @@ async function buildIndex(mode, actx = currentAccount()) {
         `(${(((newSize - priorSize) / priorSize) * 100).toFixed(1)}%). Refusing to save; ` +
         `the in-memory index will serve but disk keeps the prior snapshot.`,
       );
+      if (warm) ix.byId = nextById;
       ix.ready = true;
       return;
     }
+    if (warm) ix.byId = nextById;
     ix.ready = true;
     console.log(`[${mode}] index ready: ${ix.byId.size} items in ${Date.now() - t}ms`);
     saveIndexToDisk(mode, actx);
@@ -2670,8 +2685,8 @@ async function buildIndex(mode, actx = currentAccount()) {
   }
 }
 
-async function buildAllIndexes(actx = currentAccount()) {
-  await Promise.all(PANEL_MODES.map((m) => buildIndex(m, actx)));
+async function buildAllIndexes(actx = currentAccount(), opts) {
+  await Promise.all(PANEL_MODES.map((m) => buildIndex(m, actx, opts)));
 }
 
 // ===========================================================================
@@ -9875,7 +9890,7 @@ app.post("/api/admin/reindex-account", express.json(), async (req, res) => {
   const actx = getAccountForUser(target);
   try {
     await pickPanel(actx);
-    await buildAllIndexes(actx);
+    await buildAllIndexes(actx, { noYield: true });
     res.json({ ok: true, userId, host: actx.host });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -11295,7 +11310,7 @@ app.post("/api/refresh", async (_req, res) => {
     ix.done = 0;
     ix.total = 0;
   }
-  buildAllIndexes(actx);
+  buildAllIndexes(actx, { noYield: true }); // manual refresh already wiped the catalog — don't wait
   res.json({ ok: true, active_host: picked.active, ...(skipped.length ? { alreadyRefreshing: skipped } : {}) });
 });
 
