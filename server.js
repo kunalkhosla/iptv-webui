@@ -9159,7 +9159,7 @@ const MCP_TOOLS = [
       + "(`favorites`) list. `refs` are refs from search / for_you / whats_on (movie, series, live, "
       + "disk; not episodes). Lists show as the 'Watch Later' / 'Favorites' rails on the Khouch home "
       + "on every device. Default action is add. Returns per-ref status (added / already_there / "
-      + "removed / not_found / invalid).",
+      + "removed / not_in_list / not_found / invalid).",
     inputSchema: {
       type: "object",
       properties: {
@@ -9174,6 +9174,9 @@ const MCP_TOOLS = [
       if (!refs.length) throw new Error("refs is required");
       const key = args.list === "favorites" ? "favorites" : args.list === "watch_later" ? "myList" : null;
       if (!key) throw new Error("list must be watch_later or favorites");
+      if (args.action != null && args.action !== "add" && args.action !== "remove") {
+        throw new Error("action must be add or remove");
+      }
       const remove = args.action === "remove";
       const st = getProfileState(req.profileId);
       const ix = getIndexesFor(currentAccount());
@@ -9191,13 +9194,16 @@ const MCP_TOOLS = [
         const at = list.findIndex((x) => String(x) === String(id));
         if (remove) {
           if (at >= 0) list.splice(at, 1);
-          results.push({ ref: raw, title: item.name, status: at >= 0 ? "removed" : "not_found" });
+          results.push({ ref: raw, title: item.name, status: at >= 0 ? "removed" : "not_in_list" });
         } else if (at >= 0) {
           results.push({ ref: raw, title: item.name, status: "already_there" });
         } else {
           list.unshift(id); // newest first — the home rail shows only the first 12
           results.push({ ref: raw, title: item.name, status: "added" });
         }
+      }
+      for (const m of ["live", "movie", "series", "disk"]) {
+        if (st[key][m] && st[key][m].length > 5000) st[key][m].length = 5000;
       }
       scheduleUserStateSave();
       return { list: args.list, action: remove ? "remove" : "add", results };
