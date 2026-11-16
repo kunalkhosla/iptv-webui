@@ -1399,7 +1399,7 @@ function tmdbToResponse(entry) {
 // 64% of the unmatched series ("3 Body Problem (English)") were queried
 // against TMDB with the tag in the title.
 const PANEL_PAREN_TAG_RE = new RegExp(
-  "\\((?:(?:hindi|tamil|telugu|teugu|malayalam|malyalam|kannada|kannda|bengali|bangla|gujarati|gujrati|marathi|punjabi|urdu|english|turkish|korean|japanese|chinese|mandarin|cantonese|arabic|spanish|french|german|russian|italian|portuguese|thai|indonesian|malay|persian|farsi|nepali|sinhala|bhojpuri|odia|assamese|pashto|vietnamese|filipino|tagalog|dutch|polish|swedish|multi(?:\\s*audio)?|dual(?:\\s*audio)?|hindi\\s*dubbed|dubbed|subbed?|subs|dvd|bluray|hdr|hevc10?|x26[45]|org|original)(?:\\s*[,/&+-]\\s*(?:hindi|tamil|telugu|english|malayalam|kannada))*)\\)",
+  "\\((?:(?:hindi|tamil|telugu|teugu|malayalam|malyalam|kannada|kannda|bengali|bangla|gujarati|gujrati|marathi|punjabi|urdu|english|turkish|korean|japanese|chinese|mandarin|cantonese|arabic|spanish|french|german|russian|italian|portuguese|thai|indonesian|malay|persian|farsi|nepali|sinhala|bhojpuri|odia|assamese|pashto|vietnamese|filipino|tagalog|dutch|polish|swedish|multi(?:\\s*audio)?|dual(?:\\s*audio)?|dubbed|sub|subbed|subs|dvd|bluray|hdr|hevc(?:10)?|x26[45]|org|original)(?:\\s+(?:dubbed|dub|subbed|subs?|audio))?(?:\\s+(?:hindi|tamil|telugu|english))?(?:\\s*[,/&+-]\\s*(?:hindi|tamil|telugu|english|malayalam|kannada))*)\\)",
   "gi",
 );
 function cleanPanelTitle(name, opts = {}) {
@@ -1419,6 +1419,7 @@ function cleanPanelTitle(name, opts = {}) {
   // the year-in-name is redundant noise.
   s = s.replace(/\s+(19|20)\d{2}\s*$/, "");
   // Tidy
+  s = s.replace(/\(\s*\)/g, " ");
   s = s.replace(/\s+/g, " ").replace(/^[-\s.]+|[-\s.]+$/g, "").trim();
   return s;
 }
@@ -1481,18 +1482,28 @@ const tmdbTitleWords = (t) => String(t || "").normalize("NFKD").replace(/[\u0300
 // Kingdom"). For short queries a longer candidate is accepted only if it IS
 // the title, or the query followed by a subtitle ("Dune" -> "Dune: Part Two").
 function tmdbTitleOk(query, r) {
-  const q = tmdbTitleWords(query);
+  const q = tmdbTitleWords(query).replace(/^the /, "");
   if (!q) return true;
   const names = [r.title, r.name, r.original_title, r.original_name].filter(Boolean);
-  if (names.some((n) => tmdbTitleWords(n) === q)) return true;
-  if (q.split(" ").length > 2) return true; // long queries are specific enough
-  return [r.title, r.name].filter(Boolean).some((n) => {
-    const raw = String(n).normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-    const w = tmdbTitleWords(n);
-    if (!w.startsWith(q + " ")) return false;
-    // Subtitle separator right after the query in the raw title
-    return /^\s*[:\-–—]/.test(raw.replace(/&/g, "and").slice(raw.toLowerCase().indexOf(q.split(" ")[0]) + q.length));
+  // Reject only the clearly-wrong class: a SHORT query that appears inside
+  // a longer candidate title but not at its start ("Mark" -> "Question
+  // Mark", "Lost" -> "Aquaman and the Lost Kingdom", "Home" -> "Spider-Man:
+  // No Way Home"). Prefix extensions ("Harry Potter" -> "Harry Potter and
+  // the Sorcerer's Stone", "Rocky" -> "Rocky II") and unrelated/alternate
+  // titles (translations) pass, as they did before.
+  if (q.split(" ").length > 2) return true;
+  for (const n of names) {
+    const w = tmdbTitleWords(n).replace(/^the /, "");
+    if (!w || w === q || w.startsWith(q + " ") || w.startsWith(q)) return true;
+  }
+  const containsInner = names.some((n) => {
+    // "Dirilis: Ertugrul" — the query IS the whole subtitle: fine.
+    const after = String(n).split(":").slice(1).join(":");
+    if (after && tmdbTitleWords(after).replace(/^the /, "") === q) return false;
+    const w = " " + tmdbTitleWords(n) + " ";
+    return w.includes(" " + q + " ");
   });
+  return !containsInner;
 }
 const tmdbExactTitle = (query, r) => {
   const q = tmdbTitleWords(query);
@@ -1539,6 +1550,7 @@ async function findTmdbMatch(mode, name, hintYear, langHint, forcedKind) {
   // a looser one. Many panel titles use ".Title.YYYY" style filenames
   // that the strict pass leaves as garbage; the loose pass collapses
   // dot-separators into spaces and tries again.
+  const widePassDone = new Set();
   for (const strict of [true, false]) {
     const cleaned = cleanPanelTitle(queryName, { strict });
     if (!cleaned) continue;
@@ -1574,17 +1586,24 @@ async function findTmdbMatch(mode, name, hintYear, langHint, forcedKind) {
     // nothing — retry WITHOUT TMDB's exact-year filter and accept a neighbour
     // year only when the TITLE matches exactly, so a buzzy neighbour-year
     // film with a different title still can't hijack the entry.
-    if (effYear && yearFromName && !pool.length) {
+    if (effYear && yearFromName && !pool.length && !widePassDone.has(cleaned)) {
+      widePassDone.add(cleaned);
       const wide = await tmdb(action, { query: cleaned });
       const wr = wide && Array.isArray(wide.results) ? wide.results : [];
-      pool = wr.filter((r) => { const y = yearOf(r); return Number.isFinite(y) && Math.abs(y - effYear) === 1 && tmdbExactTitle(cleaned, r); });
+      // Neighbour year only on an exact title AND a compatible language (a
+      // generic title absent from TMDB must not grab a same-named film).
+      pool = wr.filter((r) => {
+        const y = yearOf(r);
+        if (!Number.isFinite(y) || Math.abs(y - effYear) !== 1 || !tmdbExactTitle(cleaned, r)) return false;
+        return !(langHint && r.original_language && r.original_language !== langHint);
+      });
     }
-    if (effYear && !pool.length) continue;
     if (!pool.length) continue;
     // Prefer an exact-title candidate, then the profile language, then rank.
     const exact = pool.filter((r) => tmdbExactTitle(cleaned, r));
-    const ranked = exact.length ? exact : pool;
-    const pick = (langHint && ranked.find((r) => r.original_language === langHint)) || ranked[0];
+    const pick = (langHint && exact.find((r) => r.original_language === langHint))
+      || (langHint && pool.find((r) => r.original_language === langHint))
+      || exact[0] || pool[0];
     // Fetch the full detail so runtime/genres etc. populate.
     // append_to_response folds certification + credits + videos +
     // reviews + keywords + recommendations + similar + external_ids
