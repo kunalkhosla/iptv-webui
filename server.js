@@ -2449,17 +2449,26 @@ function assignVariants(mode, actx = currentAccount()) {
   for (const c of (loadCategoriesFromDiskSync(mode, actx) || [])) catNames.set(String(c.category_id), c.category_name);
   const groups = new Map();
   for (const s of ix.byId.values()) {
-    delete s.isAlt; delete s.canonicalId; delete s.variants;
+    delete s.isAlt; delete s.canonicalId; delete s.variants; delete s.audioLang;
     const t = tmdbCache[`${mode}:${s.id}`];
     if (!t || t.source === "no-match" || !t.tmdb_id) continue;
     s.audioLang = streamAudioLang(s, catNames.get(String(s.category_id)));
-    const arr = groups.get(t.tmdb_id);
-    if (arr) arr.push(s); else groups.set(t.tmdb_id, [s]);
+    // A panel title year more than one year off TMDB's means a wrong match:
+    // never fold it into another film's group.
+    const ny = /\(((?:19|20)\d{2})\)/.exec(s.name || "");
+    const ty = parseInt(t.year, 10);
+    if (ny && Number.isFinite(ty) && Math.abs(parseInt(ny[1], 10) - ty) > 1) continue;
+    // Series dubs can carry partial seasons and no episode counts are known
+    // here, so series fold only same-language twins (platform/quality
+    // duplicates); movies fold across languages.
+    const gkey = mode === "series" ? `${t.tmdb_id}|${s.audioLang || "?"}` : t.tmdb_id;
+    const arr = groups.get(gkey);
+    if (arr) arr.push(s); else groups.set(gkey, [s]);
   }
   let grouped = 0, hidden = 0;
   for (const [tmdbId, members] of groups) {
     if (members.length < 2) continue;
-    const orig = tmdbCache[`${mode}:${members[0].id}`]?.original_language || null;
+    const orig = members.map((m) => tmdbCache[`${mode}:${m.id}`]?.original_language).find(Boolean) || null;
     const quality = (s) => {
       const tags = s.tags || [];
       if (tags.includes("4k")) return 0;
@@ -2470,7 +2479,7 @@ function assignVariants(mode, actx = currentAccount()) {
     const isCam = (s) => (s.tags || []).includes("cam") || /\bCAM\b/i.test(s.name);
     const langRank = (s) => {
       if (!orig || !s.audioLang) return 1;
-      return s.audioLang === orig ? 0 : s.audioLang === "multi" ? 2 : 2;
+      return s.audioLang === orig ? 0 : s.audioLang === "multi" ? 3 : 2;
     };
     const score = (s) => [langRank(s), s.audioLang === "multi" ? 1 : 0, isCam(s) ? 1 : 0, quality(s), (s.tags || []).includes("surround") ? 0 : 1, s.id];
     members.sort((a, b) => {
@@ -5639,9 +5648,13 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
 
   const titleLangPasses = onboarded ? makeTitleLangFilter(onboardedKeys) : () => true;
   // One tile per title: hide non-chosen language/quality variants (see assignVariants).
+  const variantCatName = new Map(cats.map((c) => [String(c.category_id), c.category_name]));
   const variantHidden = makeVariantHider(
     ix,
-    (x) => titleLangPasses(x.name) && allowedCatIds.has(String(x.category_id)),
+    // Kid gate included (with the category soft-NR rescue tileFor applies), so
+    // the variant chosen is one the profile can actually see.
+    (x) => titleLangPasses(x.name) && allowedCatIds.has(String(x.category_id))
+      && (allowedKidCerts === null || !isKidBlocked(tileFor(x, variantCatName.get(String(x.category_id))))),
     onboarded ? new Set([...onboardedKeys].map((k) => LANG_TAG_TO_ISO[k]).filter(Boolean)) : null,
   );
 
@@ -9122,8 +9135,10 @@ function makeAssistantTools(req) {
         // variants ("devgan"/"devgn") still hit cast names.
         const prefixes = qTokens.map((tok) => (tok.length >= 5 ? tok.slice(0, 4) : tok));
         const ranked = [];
+        const vHidden = makeVariantHider(ix, (x) => !blocked(x) && langPass(x.name), null);
         for (const s of ix.byId.values()) {
           if (blocked(s) || !langPass(s.name)) continue;
+          if (vHidden(s)) continue; // one candidate per title (native-language canonical)
           let rank = nameMatchRank(normalizeForSearch(s.name), normQ, qTokens);
           let vc = 0;
           if (mode !== "live") {
