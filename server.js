@@ -10428,6 +10428,10 @@ const TRANSCODE_DIR = path.join(os.tmpdir(), "iptv-transcode");
 fs.mkdirSync(TRANSCODE_DIR, { recursive: true });
 const transcoders = new Map();
 
+// Titles whose hardware run died with no output and needed the software
+// fallback (10-bit H.264, AV1, ...). Remembered so later sessions/seeks start
+// straight in software instead of failing on the GPU first.
+const hwDecodeFailed = new Set();
 // When a VOD run using VAAPI dies with no output, retry it once in software.
 const { vodSoftwareFallbackEligible, transcodeSourceUnavailable } = require("./lib/transcode-fallback");
 
@@ -10878,7 +10882,7 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
   audioTrack = normalizeAudioTrack(audioTrack);
   // Hardware encode for this run: the global VAAPI capability, unless this is
   // a software fallback retry (a prior VAAPI run was rejected by this source).
-  const hw = HW_ENCODE && !swFallback;
+  const hw = HW_ENCODE && !swFallback && !hwDecodeFailed.has(`${mode}:${id}`);
   const dir = path.join(TRANSCODE_DIR, key);
   if (!respawn) {
     // Quality switch (or stale entry) → drain any other transcoders for
@@ -11027,7 +11031,8 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     }
     if (!hw && !preset.copy && mode !== "live") {
       // Software VOD encode: don't race through the whole file at full CPU.
-      args.push("-readrate", "2", "-readrate_initial_burst", "30");
+      // 4x keeps the panel connection from being held for half the movie.
+      args.push("-readrate", "4", "-readrate_initial_burst", "30");
     }
     if (effectiveOffsetSecs > 0 && mode !== "live") {
       args.push("-ss", String(effectiveOffsetSecs));
@@ -11108,7 +11113,8 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
   }
   args.push(path.join(dir, "index.m3u8"));
   const ffmpeg = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
-  // Transcodes must never starve the API / stream proxy / other containers.
+  // Lower priority so a transcode yields to the API / stream proxy inside this
+  // container (it does not limit other containers — the GPU path is the real fix).
   try { require("os").setPriority(ffmpeg.pid, 10); } catch {}
   let stderrBuf = "";
   ffmpeg.stderr.on("data", (b) => { stderrBuf = (stderrBuf + b.toString()).slice(-4000); });
@@ -11230,6 +11236,7 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
       viewerPresent: recentViewer, stopping: entry.stopping,
     })) {
       console.log(`[transcode ${key}] exit ${code} — VAAPI produced no output; retrying in software (libx264)${tail ? ": " + tail : ""}`);
+      hwDecodeFailed.add(`${mode}:${id}`);
       transcoders.delete(key);
       fs.rmSync(dir, { recursive: true, force: true });
       spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel, null, audioTrack, true)
