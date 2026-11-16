@@ -1708,6 +1708,8 @@ async function prewarmTmdbCache(mode, actx = currentAccount()) {
 // round-trip per visible TV-Guide row. Falls back gracefully to the
 // per-channel get_simple_data_table path when a channel isn't covered.
 // ──────────────────────────────────────────────────────────────────
+const zlib = require("zlib");
+const { promisify } = require("util");
 const epgIndex = new Map(); // epg_channel_id → sorted [{ start, stop, title, desc }]
 let epgIndexBuiltAt = 0;
 const epgIndexFile = path.join(DATA_DIR, "epg-xmltv.json");
@@ -1731,8 +1733,30 @@ function saveEpgNormalized() {
   }
 }
 const EPG_XMLTV_TIMEOUT_MS = 5 * 60 * 1000;   // 5 min — file can be 5–15 MB
-const EPG_XMLTV_STALE_MS   = 24 * 60 * 60 * 1000; // 24h — re-fetch if older
-const EPG_NIGHTLY_HOUR     = 3; // 3 AM local for the daily refresh
+const EPG_XMLTV_STALE_MS   = 6 * 60 * 60 * 1000; // 6h — re-fetch if older
+const EPG_REFRESH_MS       = 6 * 60 * 60 * 1000; // polled refresh cadence
+// Extra XMLTV sources. The provider's own xmltv.php is nearly empty and
+// stale (110 programmes, mostly already aired, as of Nov 2026), so guide
+// data comes mainly from free community XMLTV feeds, matched to provider
+// channels by id/name (applyEpgMatching). Override with EPG_SOURCES=url,url
+// (empty string disables externals).
+const EPG_SOURCES_DEFAULT = [
+  "https://epgshare01.online/epgshare01/epg_ripper_IN1.xml.gz",
+  "https://epgshare01.online/epgshare01/epg_ripper_IN2.xml.gz",
+  "https://epgshare01.online/epgshare01/epg_ripper_PK1.xml.gz",
+  "https://epgshare01.online/epgshare01/epg_ripper_UK1.xml.gz",
+  "https://epgshare01.online/epgshare01/epg_ripper_US_SPORTS1.xml.gz",
+  "https://epgshare01.online/epgshare01/epg_ripper_CA2.xml.gz",
+  "https://epg.pw/xmltv/epg_IN.xml.gz",
+];
+const EPG_SOURCES = (process.env.EPG_SOURCES ?? EPG_SOURCES_DEFAULT.join(","))
+  .split(",").map((x) => x.trim()).filter(Boolean);
+const EPG_PAST_MS = 2 * 60 * 60 * 1000;      // keep programmes that ended <2h ago
+const EPG_FUTURE_MS = 72 * 60 * 60 * 1000;   // ...and those starting <72h ahead
+// External channel metadata (id -> {names, country}) for name matching;
+// persisted alongside the programmes. Status is surfaced in /api/bootstrap.
+let epgChannelMeta = new Map();
+let epgStatus = { builtAt: 0, channels: 0, programmes: 0, matchedStreams: 0, sources: {} };
 
 function xmltvToMs(str) {
   if (!str || str.length < 14) return 0;
@@ -1757,7 +1781,125 @@ function decodeXmlEntities(s) {
     .replace(/&gt;/g, ">")
     .replace(/&apos;/g, "'")
     .replace(/&quot;/g, '"')
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => { try { return String.fromCodePoint(parseInt(n, 16)); } catch { return ""; } })
+    .replace(/&#(\d+);/g, (_, n) => { try { return String.fromCodePoint(+n); } catch { return ""; } });
+}
+const unCdata = (t) => String(t).replace(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/, "$1");
+
+// Tolerant XMLTV parse: attribute order / quote style / extra attributes /
+// CDATA all vary by provider (the panel emits `channel="x" >`, which the
+// old strict regex missed). Returns {chans: Map(id -> [displayNames]),
+// progs: Map(id -> [{start, stop, title, desc}])} limited to the window.
+function parseXmltv(text, now = Date.now()) {
+  const chans = new Map();
+  const CH_RE = /<channel\s+([^>]*?)>([\s\S]*?)<\/channel>/g;
+  const ATTR_RE = /([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  const attrsOf = (str) => {
+    const o = {};
+    let a;
+    ATTR_RE.lastIndex = 0;
+    while ((a = ATTR_RE.exec(str)) !== null) o[a[1]] = a[2] ?? a[3] ?? "";
+    return o;
+  };
+  let m;
+  while ((m = CH_RE.exec(text)) !== null) {
+    const id = attrsOf(m[1]).id;
+    if (!id) continue;
+    const names = [];
+    const DN_RE = /<display-name[^>]*>([\s\S]*?)<\/display-name>/g;
+    let d;
+    while ((d = DN_RE.exec(m[2])) !== null) names.push(decodeXmlEntities(unCdata(d[1]).trim()));
+    chans.set(id, names);
+  }
+  const progs = new Map();
+  const PROG_RE = /<programme\s+([^>]*?)\s*>([\s\S]*?)<\/programme>/g;
+  const TITLE_RE = /<title[^>]*>([\s\S]*?)<\/title>/;
+  const DESC_RE = /<desc[^>]*>([\s\S]*?)<\/desc>/;
+  const lo = now - EPG_PAST_MS, hi = now + EPG_FUTURE_MS;
+  while ((m = PROG_RE.exec(text)) !== null) {
+    const a = attrsOf(m[1]);
+    const startMs = xmltvToMs(a.start), stopMs = xmltvToMs(a.stop);
+    if (!startMs || !stopMs || !a.channel) continue;
+    if (stopMs < lo || startMs > hi) continue;
+    const tM = TITLE_RE.exec(m[2]);
+    const dM = DESC_RE.exec(m[2]);
+    const arr = progs.get(a.channel) || [];
+    arr.push({
+      start: startMs, stop: stopMs,
+      title: tM ? decodeXmlEntities(unCdata(tM[1]).trim()) : "",
+      desc: dM ? decodeXmlEntities(unCdata(dM[1]).trim()) : "",
+    });
+    progs.set(a.channel, arr);
+  }
+  return { chans, progs };
+}
+async function fetchXmltvText(url, timeoutMs) {
+  const r = await fetch(url, {
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 12; Smart TV) AppleWebKit/537.36" },
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length > 120 * 1024 * 1024) throw new Error("body too large");
+  const isGz = buf[0] === 0x1f && buf[1] === 0x8b;
+  return (isGz ? await promisify(zlib.gunzip)(buf) : buf).toString("utf8");
+}
+
+// ── Channel matching (provider stream <-> external XMLTV channel) ──
+const EPG_COUNTRY_OF_PREFIX = { IN: "in", UK: "uk", GB: "uk", US: "us", CA: "ca", PK: "pk", AU: "au", BD: "bd", ZA: "za", AE: "ae" };
+function epgNameKey(name) {
+  let n = String(name || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+  n = n.replace(/^\|?\s*[A-Za-z]{2,3}\s*(?:\||:)+\s*/, "");        // "IN:" / "|FR|"
+  n = n.replace(/\b(?:HD|FHD|UHD|SD|4K|HEVC|BACKUP|RAW|50FPS|1080P?|720P?)\b/gi, " ");
+  return n.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+function epgPrefixCountry(name) {
+  const m = /^\|?\s*([A-Za-z]{2,3})\s*(?:\||:)+\s*/.exec(String(name || ""));
+  return m ? (EPG_COUNTRY_OF_PREFIX[m[1].toUpperCase()] || m[1].toLowerCase()) : null;
+}
+const epgIdCountry = (id) => { const m = /\.([a-z]{2,3})(?:@[^.]*)?$/i.exec(String(id)); return m ? m[1].toLowerCase() : null; };
+const epgIdKey = (id) => String(id).toLowerCase().replace(/[^a-z0-9]+/g, "");
+
+// Point live streams at an external channel that has programme data.
+// Streams whose own epg_channel_id already has programmes are left alone.
+// Idempotent; re-run after a live index build and after each EPG refresh.
+function applyEpgMatching(actx = currentAccount()) {
+  if (!isOwnerAccount(actx)) return 0;
+  const ix = getIndexesFor(actx).live;
+  if (!ix?.byId?.size || !epgIndex.size) return 0;
+  const byName = new Map(), byId = new Map();
+  for (const [id, names] of epgChannelMeta) {
+    if (!epgIndex.has(id)) continue;
+    const country = epgIdCountry(id);
+    byId.set(epgIdKey(id), id);
+    for (const nm of names) {
+      const k = epgNameKey(nm);
+      if (!k) continue;
+      const arr = byName.get(k) || [];
+      arr.push({ id, country });
+      byName.set(k, arr);
+    }
+  }
+  let matched = 0;
+  for (const s of ix.byId.values()) {
+    if (s.epg_channel_id && epgIndex.has(s.epg_channel_id) && !s._epgMatched) continue;
+    let hit = s.epg_channel_id ? byId.get(epgIdKey(s.epg_channel_id)) : null;
+    if (!hit) {
+      const cands = byName.get(epgNameKey(s.name));
+      if (cands?.length) {
+        const pc = epgPrefixCountry(s.name);
+        const best = (pc && cands.find((c) => c.country === pc)) || (!pc ? cands[0] : null);
+        if (best) hit = best.id;
+      }
+    }
+    if (hit) {
+      if (!s._epgMatched && s.epg_channel_id && !s._epgOrig) s._epgOrig = s.epg_channel_id;
+      s.epg_channel_id = hit; s._epgMatched = true; matched++;
+    }
+  }
+  epgStatus.matchedStreams = matched;
+  console.log(`[epg] matched ${matched} live streams to external guide channels`);
+  return matched;
 }
 async function loadEpgIndexFromDisk(actx = currentAccount()) {
   try {
@@ -1770,6 +1912,8 @@ async function loadEpgIndexFromDisk(actx = currentAccount()) {
         if (Array.isArray(v)) epgIndex.set(k, v);
       }
       epgIndexBuiltAt = data.builtAt || 0;
+      if (data.channels && typeof data.channels === "object") epgChannelMeta = new Map(Object.entries(data.channels));
+      if (data.status && typeof data.status === "object") epgStatus = data.status;
       const totalProgs = [...epgIndex.values()].reduce((a, b) => a + b.length, 0);
       console.log(`[epg] loaded ${epgIndex.size} channels / ${totalProgs} programmes from disk`);
     } else {
@@ -1789,7 +1933,7 @@ async function saveEpgIndexToDisk(actx = currentAccount()) {
     const p0 = dataPathFor(actx, "epg");
     let obj;
     if (isOwnerAccount(actx)) {
-      obj = { builtAt: epgIndexBuiltAt, byChannel: Object.fromEntries(epgIndex) };
+      obj = { builtAt: epgIndexBuiltAt, byChannel: Object.fromEntries(epgIndex), channels: Object.fromEntries(epgChannelMeta), status: epgStatus };
     } else {
       const e = getEpgIndexFor(actx);
       obj = { builtAt: e.builtAt, byChannel: Object.fromEntries(e.byChannel) };
@@ -1802,76 +1946,80 @@ async function saveEpgIndexToDisk(actx = currentAccount()) {
 }
 async function prewarmEpg(actx = currentAccount()) {
   if (!actx.host) return false;
-  await yieldToViewers("xmltv", actx);
-  const url = `${actx.host}/xmltv.php?username=${encodeURIComponent(actx.user)}&password=${encodeURIComponent(actx.pass)}`;
-  console.log(`[epg] fetching xmltv.php …`);
   const t0 = Date.now();
-  let response;
+  const owner = isOwnerAccount(actx);
+  const next = new Map();       // channel id -> sorted programmes
+  const meta = new Map();       // channel id -> display names (external + provider)
+  const sources = {};
+  const mergeIn = (label, parsed) => {
+    let n = 0;
+    for (const [id, names] of parsed.chans) if (!meta.has(id)) meta.set(id, names);
+    for (const [id, arr] of parsed.progs) {
+      if (!next.has(id)) { next.set(id, arr); n += arr.length; }
+    }
+    sources[label] = { channels: parsed.progs.size, programmes: n };
+  };
+  // 1) the panel's own xmltv.php
   try {
-    response = await fetch(url, {
-      signal: AbortSignal.timeout(EPG_XMLTV_TIMEOUT_MS),
-      headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 12; Smart TV) AppleWebKit/537.36" },
-    });
+    await yieldToViewers("xmltv", actx);
+    const url = `${actx.host}/xmltv.php?username=${encodeURIComponent(actx.user)}&password=${encodeURIComponent(actx.pass)}`;
+    console.log(`[epg] fetching provider xmltv.php …`);
+    const text = await fetchXmltvText(url, EPG_XMLTV_TIMEOUT_MS);
+    const parsed = parseXmltv(text);
+    if (!parsed.progs.size) console.warn(`[epg] provider xmltv parsed 0 programmes from ${(text.length / 1024).toFixed(0)} KB; head: ${text.slice(0, 200).replace(/\s+/g, " ")}`);
+    mergeIn("provider", parsed);
   } catch (e) {
-    console.warn(`[epg] xmltv fetch failed: ${e.message}`);
-    return false;
+    console.warn(`[epg] provider xmltv failed: ${e.message}`);
+    sources.provider = { error: e.message };
   }
-  if (!response.ok) {
-    console.warn(`[epg] xmltv returned HTTP ${response.status}`);
-    return false;
-  }
-  let text;
-  try { text = await response.text(); }
-  catch (e) {
-    console.warn(`[epg] xmltv body read failed: ${e.message}`);
-    return false;
-  }
-  console.log(`[epg] downloaded ${(text.length / 1024 / 1024).toFixed(1)} MB in ${((Date.now() - t0) / 1000).toFixed(1)}s — parsing …`);
-
-  // Single-pass regex scan. XMLTV is well-formed enough that this is
-  // dramatically faster (and dependency-free) vs. a SAX parser.
-  const PROG_RE = /<programme start="([^"]+)" stop="([^"]+)" channel="([^"]+)">([\s\S]*?)<\/programme>/g;
-  const TITLE_RE = /<title[^>]*>([\s\S]*?)<\/title>/;
-  const DESC_RE  = /<desc[^>]*>([\s\S]*?)<\/desc>/;
-  const next = new Map();
-  let total = 0;
-  let m;
-  while ((m = PROG_RE.exec(text)) !== null) {
-    const startMs = xmltvToMs(m[1]);
-    const stopMs  = xmltvToMs(m[2]);
-    if (!startMs || !stopMs) continue;
-    const channelId = m[3];
-    if (!channelId) continue;
-    const body = m[4];
-    const tM = TITLE_RE.exec(body);
-    const dM = DESC_RE.exec(body);
-    const arr = next.get(channelId) || [];
-    arr.push({
-      start: startMs,
-      stop:  stopMs,
-      title: tM ? decodeXmlEntities(tM[1].trim()) : "",
-      desc:  dM ? decodeXmlEntities(dM[1].trim()) : "",
-    });
-    next.set(channelId, arr);
-    total++;
+  // 2) community XMLTV feeds (owner guide only; no provider connection)
+  if (owner) {
+    for (const url of EPG_SOURCES) {
+      const label = url.split("/").pop().replace(/\.xml(\.gz)?$/, "");
+      try {
+        const text = await fetchXmltvText(url, 90_000);
+        const parsed = parseXmltv(text);
+        if (!parsed.progs.size) console.warn(`[epg] ${label}: 0 programmes parsed from ${(text.length / 1024).toFixed(0)} KB`);
+        mergeIn(label, parsed);
+        await new Promise((r) => setImmediate(r)); // let the loop breathe between big parses
+      } catch (e) {
+        console.warn(`[epg] ${label} failed: ${e.message}`);
+        sources[label] = { error: e.message };
+      }
+    }
   }
   for (const arr of next.values()) arr.sort((a, b) => a.start - b.start);
-  if (isOwnerAccount(actx)) {
+  let total = 0;
+  for (const arr of next.values()) total += arr.length;
+  // Never replace a populated guide with an empty one (a failed/odd
+  // download used to wipe the index and nothing noticed).
+  const oldCount = owner ? epgIndex.size : getEpgIndexFor(actx).byChannel.size;
+  if (total === 0) {
+    console.warn(`[epg] refresh produced 0 programmes — keeping the existing guide (${oldCount} channels)`);
+    if (owner) epgStatus = { ...epgStatus, sources, lastAttempt: Date.now(), lastError: "0 programmes" };
+    return false;
+  }
+  if (owner) {
     epgIndex.clear();
     for (const [k, v] of next) epgIndex.set(k, v);
     epgIndexBuiltAt = Date.now();
+    epgChannelMeta = meta;
   } else {
     const e = getEpgIndexFor(actx);
     e.byChannel.clear();
     for (const [k, v] of next) e.byChannel.set(k, v);
     e.builtAt = Date.now();
   }
-  console.log(`[epg] indexed ${next.size} channels / ${total} programmes in ${((Date.now() - t0) / 1000).toFixed(1)}s total`);
+  console.log(`[epg] indexed ${next.size} channels / ${total} programmes in ${((Date.now() - t0) / 1000).toFixed(1)}s total (${Object.entries(sources).map(([k, v]) => `${k}:${v.programmes ?? "err"}`).join(", ")})`);
+  if (owner) {
+    epgStatus = { builtAt: epgIndexBuiltAt, channels: next.size, programmes: total, matchedStreams: 0, sources, lastAttempt: Date.now() };
+    applyEpgMatching(actx);
+  }
   saveEpgIndexToDisk(actx);
   // Clean any newly-seen programme titles for keyword matching. Owner
   // EPG only (that's what `epgIndex` holds); fire-and-forget so the
   // refresh return isn't gated on the AI batch. No-op without a key.
-  if (isOwnerAccount(actx) && ai.aiEnabled()) {
+  if (owner && ai.aiEnabled()) {
     normalizeNewEpgTitles({ reason: "epg-refresh" }).catch(e => console.warn(`[epg] normalize failed: ${e.message}`));
   }
   return true;
@@ -1884,14 +2032,12 @@ function msUntilNextLocalHour(targetHour) {
   return target - now;
 }
 function scheduleEpgNightlyRefresh() {
-  const ms = msUntilNextLocalHour(EPG_NIGHTLY_HOUR);
-  console.log(`[epg] next xmltv refresh in ${Math.round(ms / 60000)} min`);
-  setTimeout(() => {
-    prewarmEpg().catch(e => console.warn(`[epg] nightly: ${e.message}`));
-    setInterval(() => {
-      prewarmEpg().catch(e => console.warn(`[epg] nightly: ${e.message}`));
-    }, 24 * 60 * 60 * 1000);
-  }, ms);
+  // Polled every 6h (guide data is short-horizon, so once a night left most
+  // of the day stale). Each run yields to viewers before touching the panel.
+  console.log(`[epg] refresh every ${EPG_REFRESH_MS / 3600000}h (${EPG_SOURCES.length} external feeds)`);
+  setInterval(() => {
+    prewarmEpg().catch(e => console.warn(`[epg] refresh: ${e.message}`));
+  }, EPG_REFRESH_MS);
 }
 
 // User state PER PROFILE. Netflix-style profiles share one household
@@ -2657,6 +2803,7 @@ async function buildIndex(mode, actx = currentAccount(), { noYield = false } = {
     }
     if (warm) ix.byId = nextById;
     ix.ready = true;
+    if (mode === "live") { try { applyEpgMatching(actx); } catch (e) { console.warn(`[epg] match after live build: ${e.message}`); } }
     console.log(`[${mode}] index ready: ${ix.byId.size} items in ${Date.now() - t}ms`);
     saveIndexToDisk(mode, actx);
     // Fire-and-forget TMDB pre-warm so the home endpoint's tiles get
@@ -4687,6 +4834,9 @@ app.get("/api/bootstrap", async (req, res, next) => {
         };
       })(),
       lastPlayed: getLastPlayedFor(currentAccount()),
+      epg: isOwnerAccount(currentAccount())
+        ? { builtAt: epgStatus.builtAt || epgIndexBuiltAt, channels: epgIndex.size, programmes: epgStatus.programmes || 0, matchedStreams: epgStatus.matchedStreams || 0 }
+        : undefined,
       profile: activeProfile && {
         id: activeProfile.id,
         nick: activeProfile.nick,
@@ -11568,6 +11718,7 @@ app.listen(PORT, async () => {
   // gracefully falls back to per-channel get_simple_data_table while
   // the xmltv download / parse is in flight.
   loadEpgIndexFromDisk().then(() => {
+    try { applyEpgMatching(actx); } catch (e) { console.warn(`[epg] boot match: ${e.message}`); }
     if (Date.now() - epgIndexBuiltAt > EPG_XMLTV_STALE_MS) {
       prewarmEpg(actx).catch(e => console.warn(`[epg] boot prewarm: ${e.message}`));
     }
