@@ -1393,6 +1393,15 @@ function tmdbToResponse(entry) {
 // Tried in two passes — strict (drop everything after the first
 // year), then loose (just normalize separators) — so findTmdbMatch
 // can retry if the first pass yields no hits.
+// Parenthesised tags the panel appends: audio language ("(English)",
+// "(Turkish)", "(Bangla)" + the panel's own misspellings) and release/quality
+// words. Only the language ones were stripped before, and only a few, so
+// 64% of the unmatched series ("3 Body Problem (English)") were queried
+// against TMDB with the tag in the title.
+const PANEL_PAREN_TAG_RE = new RegExp(
+  "\\((?:(?:hindi|tamil|telugu|teugu|malayalam|malyalam|kannada|kannda|bengali|bangla|gujarati|gujrati|marathi|punjabi|urdu|english|turkish|korean|japanese|chinese|mandarin|cantonese|arabic|spanish|french|german|russian|italian|portuguese|thai|indonesian|malay|persian|farsi|nepali|sinhala|bhojpuri|odia|assamese|pashto|vietnamese|filipino|tagalog|dutch|polish|swedish|multi(?:\\s*audio)?|dual(?:\\s*audio)?|hindi\\s*dubbed|dubbed|subbed?|subs|dvd|bluray|hdr|hevc10?|x26[45]|org|original)(?:\\s*[,/&+-]\\s*(?:hindi|tamil|telugu|english|malayalam|kannada))*)\\)",
+  "gi",
+);
 function cleanPanelTitle(name, opts = {}) {
   let s = String(name || "");
   // Drop everything after first year-in-parens
@@ -1401,7 +1410,7 @@ function cleanPanelTitle(name, opts = {}) {
   }
   // Strip bracketed tags + commonly-appended quality words
   s = s.replace(/\[[^\]]*\]/g, " ")
-       .replace(/\((Hindi|Tamil|Telugu|Malayalam|Kannada|Bengali|Gujarati|Marathi|Punjabi|Urdu|Dubbed|Sub|Subs|Subbed|Multi|Dual|DVD|BluRay|HDR|HEVC|x264|x265|HEVC10)\)/gi, " ")
+       .replace(PANEL_PAREN_TAG_RE, " ")
        .replace(/\b(4K|FHD|UHD|HD|SD|CAM|HDRIP|DVDRIP|BLURAY|WEBRIP|WEBDL|WEB-DL|2160P|1080P|720P|480P|HDR|HEVC|x264|x265|DUAL|MULTI|DUBBED|SUB|SUBS)\b/gi, " ");
   // Dot-separated filename style → spaces (but preserve final ".0" decimals)
   s = s.replace(/\.(?=\D)/g, " ");
@@ -1466,6 +1475,29 @@ function dedupTitleKey(name) {
   return `${cleaned}|${year}`;
 }
 
+const tmdbTitleWords = (t) => String(t || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/&/g, " and ").replace(/[^a-z0-9]+/g, " ").trim();
+// TMDB's search is fuzzy and latches onto longer titles that merely contain
+// the query ("Mark" -> "Question Mark", "Lost" -> "Aquaman and the Lost
+// Kingdom"). For short queries a longer candidate is accepted only if it IS
+// the title, or the query followed by a subtitle ("Dune" -> "Dune: Part Two").
+function tmdbTitleOk(query, r) {
+  const q = tmdbTitleWords(query);
+  if (!q) return true;
+  const names = [r.title, r.name, r.original_title, r.original_name].filter(Boolean);
+  if (names.some((n) => tmdbTitleWords(n) === q)) return true;
+  if (q.split(" ").length > 2) return true; // long queries are specific enough
+  return [r.title, r.name].filter(Boolean).some((n) => {
+    const raw = String(n).normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    const w = tmdbTitleWords(n);
+    if (!w.startsWith(q + " ")) return false;
+    // Subtitle separator right after the query in the raw title
+    return /^\s*[:\-–—]/.test(raw.replace(/&/g, "and").slice(raw.toLowerCase().indexOf(q.split(" ")[0]) + q.length));
+  });
+}
+const tmdbExactTitle = (query, r) => {
+  const q = tmdbTitleWords(query);
+  return !!q && [r.title, r.name, r.original_title, r.original_name].filter(Boolean).some((n) => tmdbTitleWords(n) === q);
+};
 async function findTmdbMatch(mode, name, hintYear, langHint, forcedKind) {
   // Disk-mode Save-to-Disk episodes are named "Series Name SxxEyy - ..."
   // (see diskDownloadDestPath) — genuinely TV content saved into the flat
@@ -1533,11 +1565,26 @@ async function findTmdbMatch(mode, name, hintYear, langHint, forcedKind) {
     // future-dated matches — this catalog carries pre-retail CAM/screener rips
     // of not-yet-released films, which are legitimately in it.)
     const yearTol = yearFromName ? 0 : 1;
-    const pool = effYear
+    let pool = effYear
       ? results.filter((r) => { const y = yearOf(r); return Number.isFinite(y) && Math.abs(y - effYear) <= yearTol; })
       : results;
+    pool = pool.filter((r) => tmdbTitleOk(cleaned, r));
+    // The panel often dates a film one year off (2,000+ cached matches differ
+    // by exactly 1). With an authoritative title year the exact pass found
+    // nothing — retry WITHOUT TMDB's exact-year filter and accept a neighbour
+    // year only when the TITLE matches exactly, so a buzzy neighbour-year
+    // film with a different title still can't hijack the entry.
+    if (effYear && yearFromName && !pool.length) {
+      const wide = await tmdb(action, { query: cleaned });
+      const wr = wide && Array.isArray(wide.results) ? wide.results : [];
+      pool = wr.filter((r) => { const y = yearOf(r); return Number.isFinite(y) && Math.abs(y - effYear) === 1 && tmdbExactTitle(cleaned, r); });
+    }
     if (effYear && !pool.length) continue;
-    const pick = (langHint && pool.find((r) => r.original_language === langHint)) || pool[0];
+    if (!pool.length) continue;
+    // Prefer an exact-title candidate, then the profile language, then rank.
+    const exact = pool.filter((r) => tmdbExactTitle(cleaned, r));
+    const ranked = exact.length ? exact : pool;
+    const pick = (langHint && ranked.find((r) => r.original_language === langHint)) || ranked[0];
     // Fetch the full detail so runtime/genres etc. populate.
     // append_to_response folds certification + credits + videos +
     // reviews + keywords + recommendations + similar + external_ids
