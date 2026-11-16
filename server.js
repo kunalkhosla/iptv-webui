@@ -1764,6 +1764,7 @@ async function prewarmTmdbCache(mode, actx = currentAccount()) {
   const added = Object.keys(tmdbCache).length - startCacheSize;
   const took = Math.round((Date.now() - startedAt) / 1000);
   console.log(`[${mode}] tmdb prewarm done: ${resolved} items checked, ${added} new cache entries, ${took}s`);
+  if (added) { try { assignVariants(mode, actx); } catch {} }
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -2411,6 +2412,115 @@ async function saveIndexToDisk(mode, actx = currentAccount()) {
   }
 }
 
+// ── Canonical variants (one tile per film/show, in its native language) ──
+// The panel lists the same title once per audio language / quality ("TRON:
+// Ares" in English FHD, 4 dubs, a multi-audio bundle). Group streams by TMDB
+// id; rank the members so the NATIVE-language stream (audio language equals
+// TMDB's original_language) wins, then 4K > FHD > HD, non-CAM, surround, not
+// a multi-language bundle. The winner carries `variants`; the rest are
+// flagged `isAlt` with `canonicalId` and hidden from rails/search/taste
+// (variantChoice below can swap the winner per profile language).
+const AUDIO_LANG_WORDS = {
+  english: "en", hindi: "hi", tamil: "ta", telugu: "te", teugu: "te", malayalam: "ml", malyalam: "ml",
+  kannada: "kn", kannda: "kn", bengali: "bn", bangla: "bn", gujarati: "gu", gujrati: "gu", marathi: "mr",
+  punjabi: "pa", urdu: "ur", turkish: "tr", korean: "ko", japanese: "ja", chinese: "zh", mandarin: "zh",
+  arabic: "ar", spanish: "es", french: "fr", german: "de", russian: "ru", thai: "th", indonesian: "id",
+};
+function streamAudioLang(s, catName) {
+  const name = String(s.name || "");
+  if (/\[[^\]]*,[^\]]*\]/.test(name)) return "multi";                  // "[Tel,Tam,Hin,Eng]"
+  const tag = /\(\s*([A-Za-z]+)\s*\)\s*\.?\s*$/.exec(name);
+  if (tag && AUDIO_LANG_WORDS[tag[1].toLowerCase()]) return AUDIO_LANG_WORDS[tag[1].toLowerCase()];
+  const cn = String(catName || "");
+  if (/dubbed/i.test(cn)) {
+    if (/hindi/i.test(cn)) return "hi";
+    if (/multi/i.test(cn)) return "multi";
+    return null;
+  }
+  if (/multi/i.test(cn) && /language|audio/i.test(cn)) return "multi";
+  const langs = (Array.isArray(s.tags) ? s.tags : []).filter((t) => LANG_TAG_TO_ISO[t]);
+  return langs.length === 1 ? LANG_TAG_TO_ISO[langs[0]] : null;
+}
+function assignVariants(mode, actx = currentAccount()) {
+  if (mode !== "movie" && mode !== "series") return;
+  const ix = getIndexesFor(actx)[mode];
+  if (!ix?.byId?.size) return;
+  const catNames = new Map();
+  for (const c of (loadCategoriesFromDiskSync(mode, actx) || [])) catNames.set(String(c.category_id), c.category_name);
+  const groups = new Map();
+  for (const s of ix.byId.values()) {
+    delete s.isAlt; delete s.canonicalId; delete s.variants;
+    const t = tmdbCache[`${mode}:${s.id}`];
+    if (!t || t.source === "no-match" || !t.tmdb_id) continue;
+    s.audioLang = streamAudioLang(s, catNames.get(String(s.category_id)));
+    const arr = groups.get(t.tmdb_id);
+    if (arr) arr.push(s); else groups.set(t.tmdb_id, [s]);
+  }
+  let grouped = 0, hidden = 0;
+  for (const [tmdbId, members] of groups) {
+    if (members.length < 2) continue;
+    const orig = tmdbCache[`${mode}:${members[0].id}`]?.original_language || null;
+    const quality = (s) => {
+      const tags = s.tags || [];
+      if (tags.includes("4k")) return 0;
+      if (/\b(FHD|1080P?)\b/i.test(s.name)) return 1;
+      if (/\b(HD|720P?)\b/i.test(s.name)) return 2;
+      return 3;
+    };
+    const isCam = (s) => (s.tags || []).includes("cam") || /\bCAM\b/i.test(s.name);
+    const langRank = (s) => {
+      if (!orig || !s.audioLang) return 1;
+      return s.audioLang === orig ? 0 : s.audioLang === "multi" ? 2 : 2;
+    };
+    const score = (s) => [langRank(s), s.audioLang === "multi" ? 1 : 0, isCam(s) ? 1 : 0, quality(s), (s.tags || []).includes("surround") ? 0 : 1, s.id];
+    members.sort((a, b) => {
+      const x = score(a), y = score(b);
+      for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+      return 0;
+    });
+    const canon = members[0];
+    canon.variants = members.map((m) => ({ id: m.id, lang: m.audioLang || null, q: quality(m), cam: isCam(m) }));
+    for (const m of members.slice(1)) { m.isAlt = true; m.canonicalId = canon.id; hidden++; }
+    grouped++;
+  }
+  console.log(`[${mode}] variants: ${grouped} multi-version titles, ${hidden} alternates folded`);
+}
+// Per-request: should stream `s` be hidden because another variant of the same
+// title is the one this profile should see? `passes(stream)` = the profile's
+// language + category gates. A profile whose onboarded languages exclude the
+// native one gets the best variant in a language it chose (kids watching the
+// Hindi dub); otherwise the native-first canonical wins. If the canonical is
+// gated out, the best surviving alternate shows instead.
+function makeVariantHider(ix, passes, profileIso) {
+  const chosen = new Map(); // canonicalId -> chosen stream id
+  const decide = (canon) => {
+    if (chosen.has(canon.id)) return chosen.get(canon.id);
+    const list = (canon.variants || []).map((v) => ix.byId.get(v.id)).filter(Boolean).filter(passes);
+    let pick = list[0];
+    if (profileIso && profileIso.size && pick && pick.audioLang && !profileIso.has(pick.audioLang)) {
+      pick = list.find((m) => m.audioLang && profileIso.has(m.audioLang)) || pick;
+    }
+    chosen.set(canon.id, pick ? pick.id : null);
+    return chosen.get(canon.id);
+  };
+  const hider = (s) => {
+    const canon = s.isAlt ? ix.byId.get(s.canonicalId) : (s.variants ? s : null);
+    if (!canon) return false;
+    const id = decide(canon);
+    return id !== null && id !== s.id;
+  };
+  // The stream to show in place of `s` (AI picks / saved ids may point at an
+  // alternate variant): the chosen variant of its title, else `s` itself.
+  hider.resolve = (s) => {
+    if (!s) return s;
+    const canon = s.isAlt ? ix.byId.get(s.canonicalId) : (s.variants ? s : null);
+    if (!canon) return s;
+    const id = decide(canon);
+    return id !== null ? (ix.byId.get(id) || s) : s;
+  };
+  return hider;
+}
+
 async function loadIndexFromDisk(mode, actx = currentAccount()) {
   try {
     const raw = await fs.promises.readFile(dataPathFor(actx, "index", mode), "utf8");
@@ -2455,6 +2565,7 @@ async function loadIndexFromDisk(mode, actx = currentAccount()) {
     target.total = data.total || data.streams.length;
     target.done = data.done || data.streams.length;
     target.ready = true;
+    try { assignVariants(mode, actx); } catch (e) { console.warn(`[${mode}] variants failed: ${e.message}`); }
     return data;
   } catch {
     return null;
@@ -2894,6 +3005,7 @@ async function buildIndex(mode, actx = currentAccount(), { noYield = false } = {
     }
     if (warm) ix.byId = nextById;
     ix.ready = true;
+    try { assignVariants(mode, actx); } catch (e) { console.warn(`[${mode}] variants failed: ${e.message}`); }
     if (mode === "live") { try { applyEpgMatching(actx); } catch (e) { console.warn(`[epg] match after live build: ${e.message}`); } }
     console.log(`[${mode}] index ready: ${ix.byId.size} items in ${Date.now() - t}ms`);
     saveIndexToDisk(mode, actx);
@@ -5526,6 +5638,12 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   }
 
   const titleLangPasses = onboarded ? makeTitleLangFilter(onboardedKeys) : () => true;
+  // One tile per title: hide non-chosen language/quality variants (see assignVariants).
+  const variantHidden = makeVariantHider(
+    ix,
+    (x) => titleLangPasses(x.name) && allowedCatIds.has(String(x.category_id)),
+    onboarded ? new Set([...onboardedKeys].map((k) => LANG_TAG_TO_ISO[k]).filter(Boolean)) : null,
+  );
 
   // Group eligible items by category in one pass over the index.
   const byCat = new Map();
@@ -5533,6 +5651,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     const cid = String(s.category_id || "");
     if (!allowedCatIds.has(cid)) continue;
     if (!titleLangPasses(s.name)) continue;
+    if (variantHidden(s)) continue;
     let bucket = byCat.get(cid);
     if (!bucket) { bucket = []; byCat.set(cid, bucket); }
     bucket.push(s);
@@ -5780,7 +5899,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       ];
       const seenFy = new Set();
       const fyTiles = ordered
-        .map((id) => ix.byId.get(id) ?? ix.byId.get(parseInt(id, 10)))
+        .map((id) => variantHidden.resolve(ix.byId.get(id) ?? ix.byId.get(parseInt(id, 10))))
         .filter((s) => s && titleLangPasses(s.name))
         .filter((s) => {
           const key = s.tmdb_id || `id:${s.id}`;
@@ -5790,7 +5909,11 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
         })
         .map((s) => {
           const tile = tileFor(s, null);
-          const reason = pickReasons?.[String(s.id)];
+          // Picks may point at another variant of this title: look the
+          // rationale up across the whole group.
+          const canonS = s.isAlt ? ix.byId.get(s.canonicalId) : s;
+          const reason = pickReasons?.[String(s.id)]
+            || (canonS?.variants || []).map((v) => pickReasons?.[String(v.id)]).find(Boolean);
           if (tile && reason) tile.pickReason = reason;
           return tile;
         })
@@ -5837,7 +5960,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       })
       .filter(Boolean)
       .sort((a, b) => b.added - a.added)
-      .filter(({ s }) => titleLangPasses(s.name))
+      .filter(({ s }) => titleLangPasses(s.name) && !variantHidden(s))
       .map(({ s }) => tileFor(s))
       .filter((t) => t && isKidSafe(t));
     if (recentTiles.length) {
@@ -5870,7 +5993,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // the kept copy is the best one: a non-CAM print, then most-voted.
     const seenFamily = new Set();
     const familyTiles = [...indexes[mode].byId.values()]
-      .filter((s) => titleLangPasses(s.name))
+      .filter((s) => titleLangPasses(s.name) && !variantHidden(s))
       .map((s) => ({ s, t: tmdbFor(s.id) }))
       .filter((x) => x.t && x.t.us_cert && FAMILY_CERTS.has(x.t.us_cert))
       .sort((a, b) => {
@@ -5933,7 +6056,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     for (const er of (editorialRails.rails || [])) {
       if (er.mode !== mode) continue;
       const edTiles = (er.picks || [])
-        .map((id) => ix.byId.get(id) ?? ix.byId.get(parseInt(id, 10)))
+        .map((id) => variantHidden.resolve(ix.byId.get(id) ?? ix.byId.get(parseInt(id, 10))))
         .filter((s) => s && titleLangPasses(s.name))
         .filter((s) => {
           const key = s.tmdb_id || `id:${s.id}`;
@@ -5995,6 +6118,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     const seenTmdb = new Set();
     for (const s of ix.byId.values()) {
       if (!titleLangPasses(s.name)) continue;
+      if (variantHidden(s)) continue;
       const t = tmdbBy(s);
       if (!t || t.source === "no-match") continue;
       if (t.tmdb_id) {
@@ -7085,7 +7209,16 @@ app.get("/api/search/all", async (req, res, next) => {
         dubLang: suffixOf(s.name) || null,
       };
     };
+    // One result per title: fold language/quality variants into the native-
+    // language canonical (see assignVariants); a profile whose onboarded
+    // languages exclude it gets the best variant it chose instead.
+    const variantHidden = makeVariantHider(
+      ix,
+      (x) => titleLangPasses(x.name) && !isKidBlocked(x) && !(onboarded && suffixOf(x.name) && !langPref.includes(suffixOf(x.name))),
+      onboarded ? new Set(modeKeys.map((k) => LANG_TAG_TO_ISO[k]).filter(Boolean)) : null,
+    );
     const eligible = (s) => {
+      if (variantHidden(s)) return false;
       if (!titleLangPasses(s.name)) return false;
       if (isKidBlocked(s)) return false;
       const suffix = suffixOf(s.name);
@@ -7914,6 +8047,7 @@ async function retryTmdbNoMatches({ onProgress } = {}) {
     }
   }));
   scheduleTmdbCacheSave();
+  for (const m of ["movie", "series"]) { try { assignVariants(m); } catch {} }
   onProgress?.({ phase: "done", ...tally });
   return { ok: true, ...tally };
 }
@@ -8244,6 +8378,7 @@ function tasteCandidatesFor(state, profile, mode, excludeIds, cap = 150) {
   const pool = [];
   const seenTmdb = new Set();
   for (const s of ix.byId.values()) {
+    if (s.isAlt) continue; // one entry per title
     if (excludeIds.has(String(s.id))) continue;
     if (!langPass(s.name)) continue;
     const t = tmdbCache[`${mode}:${s.id}`];
@@ -8297,6 +8432,7 @@ function refineBatchFor(state, profile, mode, cap = 30) {
   const buckets = new Map();
   const seenTmdb = new Set();
   for (const s of ix.byId.values()) {
+    if (s.isAlt) continue;
     if (rated.has(String(s.id))) continue;
     if (!langPass(s.name)) continue;
     const t = tmdbCache[`${mode}:${s.id}`];
