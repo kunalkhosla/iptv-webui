@@ -11012,8 +11012,22 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
       "-reconnect_streamed", "1",
       "-reconnect_delay_max", "5",
     );
-    if (hw && !preset.copy) {
+    // VOD on the iGPU: decode AND scale on the GPU (0.7 vs 42 CPU-seconds for
+    // a 20s 4K HEVC clip — measured). Decoding in software and only encoding
+    // on the GPU pinned ~7.5 cores per movie and starved everything else on
+    // the box, so playback stalled after a few minutes. Live keeps the old
+    // chain (its sources are small and there is no software fallback to
+    // retry into); a VOD run that fails here falls back to libx264
+    // (vodSoftwareFallbackEligible), where pacing below caps the CPU.
+    const hwFull = hw && !preset.copy && mode !== "live";
+    if (hwFull) {
+      args.push("-hwaccel", "vaapi", "-hwaccel_device", VAAPI_DEVICE, "-hwaccel_output_format", "vaapi");
+    } else if (hw && !preset.copy) {
       args.push("-vaapi_device", VAAPI_DEVICE);
+    }
+    if (!hw && !preset.copy && mode !== "live") {
+      // Software VOD encode: don't race through the whole file at full CPU.
+      args.push("-readrate", "2", "-readrate_initial_burst", "30");
     }
     if (effectiveOffsetSecs > 0 && mode !== "live") {
       args.push("-ss", String(effectiveOffsetSecs));
@@ -11021,6 +11035,16 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     args.push("-i", sourceUrl, "-map", "0:v:0", "-map", `0:a:${audioTrack}?`);
     if (preset.copy) {
       args.push("-c:v", "copy", ...audioArgs);
+    } else if (hwFull) {
+      const maxW = /min\((\d+),\s*iw\)/.exec(preset.vf || "")?.[1] || "1280";
+      args.push(
+        "-vf", `scale_vaapi=w='min(${maxW},iw)':h=-2:format=nv12`,
+        "-c:v", "h264_vaapi", "-qp", String(preset.crf),
+        "-profile:v", "high", "-level", "41",
+        "-g", "48", "-keyint_min", "48",
+        ...audioArgs,
+        "-af", "aresample=async=1000:first_pts=0",
+      );
     } else if (hw) {
       args.push(
         "-vf", `${preset.vf},format=nv12,hwupload`,
@@ -11084,6 +11108,8 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
   }
   args.push(path.join(dir, "index.m3u8"));
   const ffmpeg = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+  // Transcodes must never starve the API / stream proxy / other containers.
+  try { require("os").setPriority(ffmpeg.pid, 10); } catch {}
   let stderrBuf = "";
   ffmpeg.stderr.on("data", (b) => { stderrBuf = (stderrBuf + b.toString()).slice(-4000); });
   // Reuse the entry across respawns so lastAccess, restart history, and the
