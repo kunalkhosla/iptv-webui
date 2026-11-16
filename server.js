@@ -1839,10 +1839,12 @@ async function fetchXmltvText(url, timeoutMs) {
     headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 12; Smart TV) AppleWebKit/537.36" },
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const declared = parseInt(r.headers.get("content-length") || "0", 10);
+  if (declared > 120 * 1024 * 1024) throw new Error("body too large");
   const buf = Buffer.from(await r.arrayBuffer());
   if (buf.length > 120 * 1024 * 1024) throw new Error("body too large");
   const isGz = buf[0] === 0x1f && buf[1] === 0x8b;
-  return (isGz ? await promisify(zlib.gunzip)(buf) : buf).toString("utf8");
+  return (isGz ? await promisify(zlib.gunzip)(buf, { maxOutputLength: 300 * 1024 * 1024 }) : buf).toString("utf8");
 }
 
 // ── Channel matching (provider stream <-> external XMLTV channel) ──
@@ -1888,9 +1890,16 @@ function applyEpgMatching(actx = currentAccount()) {
       const cands = byName.get(epgNameKey(s.name));
       if (cands?.length) {
         const pc = epgPrefixCountry(s.name);
-        const best = (pc && cands.find((c) => c.country === pc)) || (!pc ? cands[0] : null);
+        // No country prefix: only accept an unambiguous (single-candidate) name.
+        const best = (pc && cands.find((c) => c.country === pc)) || (!pc && cands.length === 1 ? cands[0] : null);
         if (best) hit = best.id;
       }
+    }
+    if (!hit && s._epgMatched) {
+      // The guide channel we pointed at is gone — restore the provider's id.
+      s.epg_channel_id = s._epgOrig || "";
+      delete s._epgMatched; delete s._epgOrig;
+      continue;
     }
     if (hit) {
       if (!s._epgMatched && s.epg_channel_id && !s._epgOrig) s._epgOrig = s.epg_channel_id;
@@ -1944,8 +1953,14 @@ async function saveEpgIndexToDisk(actx = currentAccount()) {
     console.warn(`[epg] save failed: ${e.message}`);
   }
 }
+let epgRefreshRunning = false;
 async function prewarmEpg(actx = currentAccount()) {
   if (!actx.host) return false;
+  if (epgRefreshRunning) { console.log("[epg] refresh already running — skipping"); return false; }
+  epgRefreshRunning = true;
+  try { return await prewarmEpgInner(actx); } finally { epgRefreshRunning = false; }
+}
+async function prewarmEpgInner(actx) {
   const t0 = Date.now();
   const owner = isOwnerAccount(actx);
   const next = new Map();       // channel id -> sorted programmes
@@ -1975,6 +1990,7 @@ async function prewarmEpg(actx = currentAccount()) {
   // 2) community XMLTV feeds (owner guide only; no provider connection)
   if (owner) {
     for (const url of EPG_SOURCES) {
+      if (!/^https:\/\//i.test(url)) { console.warn(`[epg] ignoring non-https source ${url}`); continue; }
       const label = url.split("/").pop().replace(/\.xml(\.gz)?$/, "");
       try {
         const text = await fetchXmltvText(url, 90_000);
@@ -1994,6 +2010,14 @@ async function prewarmEpg(actx = currentAccount()) {
   // Never replace a populated guide with an empty one (a failed/odd
   // download used to wipe the index and nothing noticed).
   const oldCount = owner ? epgIndex.size : getEpgIndexFor(actx).byChannel.size;
+  let oldTotal = 0;
+  for (const arr of (owner ? epgIndex : getEpgIndexFor(actx).byChannel).values()) oldTotal += arr.length;
+  const failedSources = Object.values(sources).filter((v) => v.error).length;
+  if (total > 0 && failedSources > 0 && oldTotal > 0 && total < oldTotal * 0.5) {
+    console.warn(`[epg] ${failedSources} source(s) failed and the result (${total}) is under half the current guide (${oldTotal}) — keeping the current guide`);
+    if (owner) epgStatus = { ...epgStatus, sources, lastAttempt: Date.now(), lastError: `${failedSources} source(s) failed` };
+    return false;
+  }
   if (total === 0) {
     console.warn(`[epg] refresh produced 0 programmes — keeping the existing guide (${oldCount} channels)`);
     if (owner) epgStatus = { ...epgStatus, sources, lastAttempt: Date.now(), lastError: "0 programmes" };
@@ -2799,6 +2823,7 @@ async function buildIndex(mode, actx = currentAccount(), { noYield = false } = {
       );
       if (warm) ix.byId = nextById;
       ix.ready = true;
+      if (mode === "live") { try { applyEpgMatching(actx); } catch {} }
       return;
     }
     if (warm) ix.byId = nextById;
