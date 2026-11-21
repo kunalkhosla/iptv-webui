@@ -2418,19 +2418,29 @@ async function saveIndexToDisk(mode, actx = currentAccount()) {
 // popular recent titles; we intersect that with the Khouch catalog (by TMDB
 // id) and surface it as "Popular on Netflix" rails with "#N on Netflix"
 // captions, plus an MCP tool that also lists what's hot but NOT in Khouch.
-const BUZZ_PROVIDERS = [
-  { key: "netflix", label: "Netflix", id: 8, region: "US" },
-  { key: "prime", label: "Prime Video", id: 9, region: "US" },
-  { key: "max", label: "HBO Max", id: 1899, region: "US" },
-  { key: "disney", label: "Disney+", id: 337, region: "US" },
-  { key: "apple", label: "Apple TV+", id: 350, region: "US" },
-  { key: "hulu", label: "Hulu", id: 15, region: "US" },
-  { key: "paramount", label: "Paramount+", id: 531, region: "US" },
-  { key: "peacock", label: "Peacock", id: 386, region: "US" },
-  { key: "hotstar", label: "JioHotstar", id: 2336, region: "IN" },
-  { key: "zee5", label: "ZEE5", id: 232, region: "IN" },
-  { key: "sonyliv", label: "SonyLIV", id: 237, region: "IN" },
+// Only English, Hindi and Punjabi content (the household's languages).
+// English comes from the US catalogs; Hindi and Punjabi from the India
+// catalogs (they differ from the US ones). Filtered by the TITLE's original
+// language, so a Korean show on Netflix never appears.
+const BUZZ_LANG_NAME = { en: "English", hi: "Hindi", pa: "Punjabi" };
+const BUZZ_PLATFORMS_US = [
+  ["netflix", "Netflix", 8], ["prime", "Prime Video", 9], ["max", "HBO Max", 1899], ["disney", "Disney+", 337],
+  ["apple", "Apple TV+", 350], ["hulu", "Hulu", 15], ["paramount", "Paramount+", 531], ["peacock", "Peacock", 386],
 ];
+const BUZZ_PLATFORMS_IN_HI = [
+  ["netflix", "Netflix", 8], ["prime", "Prime Video", 119], ["hotstar", "JioHotstar", 2336],
+  ["zee5", "ZEE5", 232], ["sonyliv", "SonyLIV", 237], ["mxplayer", "MX Player", 515],
+];
+const BUZZ_PLATFORMS_IN_PA = [["prime", "Prime Video", 119], ["zee5", "ZEE5", 232], ["netflix", "Netflix", 8]];
+const BUZZ_SOURCES = [
+  ...BUZZ_PLATFORMS_US.map(([k, label, id]) => ({ key: `${k}-en`, platform: k, label, id, region: "US", lang: "en", title: `Popular on ${label}` })),
+  ...BUZZ_PLATFORMS_IN_HI.map(([k, label, id]) => ({ key: `${k}-hi`, platform: k, label, id, region: "IN", lang: "hi", title: `Hindi on ${label}` })),
+  ...BUZZ_PLATFORMS_IN_PA.map(([k, label, id]) => ({ key: `${k}-pa`, platform: k, label, id, region: "IN", lang: "pa", title: `Punjabi on ${label}` })),
+  // Language-wide popularity across all India platforms.
+  { key: "trending-hi", platform: "trending", label: "Hindi trending", id: null, region: "IN", lang: "hi", title: "Trending Hindi" },
+  { key: "trending-pa", platform: "trending", label: "Punjabi trending", id: null, region: "IN", lang: "pa", title: "Trending Punjabi" },
+];
+const BUZZ_LANGS = new Set(Object.keys(BUZZ_LANG_NAME));
 const streamingBuzzFile = path.join(DATA_DIR, "streaming-buzz.json");
 let streamingBuzz = (() => {
   try { return JSON.parse(fs.readFileSync(streamingBuzzFile, "utf8")) || {}; } catch { return {}; }
@@ -2443,33 +2453,36 @@ async function buildStreamingBuzz({ reason = "cron" } = {}) {
   try {
     const now = new Date();
     const since = (years) => new Date(now.getFullYear() - years, now.getMonth(), now.getDate()).toISOString().slice(0, 10);
-    const rows = (res, kind) => (res?.results || []).map((r) => ({
+    const rows = (res, kind) => (res?.results || []).filter((r) => BUZZ_LANGS.has(r.original_language)).map((r) => ({
       id: r.id,
       title: kind === "movie" ? r.title : r.name,
       year: String((kind === "movie" ? r.release_date : r.first_air_date) || "").slice(0, 4) || null,
+      lang: r.original_language,
     }));
     // tmdb() caches 24h; drop the discover/trending pages so a 12h refresh is real.
     for (const k of [...tmdbMemCache.keys()]) if (k.startsWith("/discover/") || k.startsWith("/trending/")) tmdbMemCache.delete(k);
-    const out = { updatedAt: Date.now(), providers: {}, trending: {} };
+    const out = { v: 2, updatedAt: Date.now(), providers: {}, trending: {} };
+    const prevOk = streamingBuzz.v === 2; // older data had a different (unfiltered) shape
     // Keep the previous list when a fresh one comes back empty/much shorter
     // (a TMDB hiccup mid-run must not wipe the rails).
     const keepIfBetter = (fresh, prev, what) => {
-      if (prev?.length && fresh.length < prev.length * 0.5) {
+      if (prevOk && prev?.length && fresh.length < prev.length * 0.5) {
         console.warn(`[buzz] ${what}: got ${fresh.length} vs ${prev.length} before — keeping the previous list`);
         return prev;
       }
       return fresh;
     };
-    for (const p of BUZZ_PROVIDERS) {
-      out.providers[p.key] = { label: p.label, region: p.region, movie: [], tv: [] };
+    for (const p of BUZZ_SOURCES) {
+      out.providers[p.key] = { label: p.label, platform: p.platform, lang: p.lang, region: p.region, title: p.title, movie: [], tv: [] };
       for (const kind of ["movie", "tv"]) {
         const list = [];
-        for (let page = 1; page <= 5; page++) {
+        for (let page = 1; page <= (p.id ? 5 : 3); page++) {
           const params = {
-            watch_region: p.region, with_watch_providers: String(p.id),
-            with_watch_monetization_types: "flatrate", sort_by: "popularity.desc", page: String(page),
+            watch_region: p.region, with_watch_monetization_types: "flatrate",
+            with_original_language: p.lang, sort_by: "popularity.desc", page: String(page),
           };
-          // Recent buzz, not the whole back catalogue: titles from the last 3 years.
+          if (p.id) params.with_watch_providers = String(p.id);
+          // Recent buzz, not the whole back catalogue.
           params[kind === "movie" ? "primary_release_date.gte" : "first_air_date.gte"] = since(kind === "movie" ? 3 : 5);
           const res = await tmdb(`/discover/${kind}`, params);
           if (!res) break;
@@ -2497,7 +2510,7 @@ async function buildStreamingBuzz({ reason = "cron" } = {}) {
       fs.writeFileSync(streamingBuzzFile + ".tmp", JSON.stringify(out));
       fs.renameSync(streamingBuzzFile + ".tmp", streamingBuzzFile);
     } catch (e) { console.warn(`[buzz] save failed: ${e.message}`); }
-    console.log(`[buzz] (${reason}) ${total} provider titles across ${BUZZ_PROVIDERS.length} platforms`);
+    console.log(`[buzz] (${reason}) ${total} provider titles across ${BUZZ_SOURCES.length} sources`);
     return { ok: true, total };
   } finally {
     streamingBuzzRunning = false;
@@ -6067,56 +6080,63 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   if ((mode === "movie" || mode === "series") && streamingBuzz.providers && ix.byTmdb) {
     const kind = mode === "movie" ? "movie" : "tv";
     const buzzRails = [];
-    const tileForBuzz = (entry, label) => {
+    const tileForBuzz = (entry, label, lang) => {
       const members = ix.byTmdb.get(entry.id);
       if (!members?.length) return null;
       // First member that survives this profile's gates (language, category,
       // kid) — the title may exist in several languages/categories.
       let tile = null;
-      for (const m of members) {
+      // Prefer the stream whose audio matches the rail's language.
+      const ordered = lang && lang !== "all"
+        ? [...members].sort((a, b) => (b.audioLang === lang) - (a.audioLang === lang))
+        : members;
+      for (const m of ordered) {
         const s = variantHidden.resolve(m);
         if (!s || !titleLangPasses(s.name) || !allowedCatIds.has(String(s.category_id))) continue;
         const tl = tileFor(s, null);
         if (tl && !isKidBlocked(tl)) { tile = tl; break; }
       }
       if (!tile) return null;
-      tile.pickReason = label === "trending this week" ? `#${entry.rank} trending this week` : `#${entry.rank} on ${label}`;
+      tile.pickReason = /trending/.test(label) ? `#${entry.rank} ${label}` : `#${entry.rank} on ${label}`;
       return tile;
     };
-    const entries = [
-      ...BUZZ_PROVIDERS.map((p) => ({ key: p.key, label: p.label, list: streamingBuzz.providers[p.key]?.[kind] || [], title: `Popular on ${p.label}` })),
-    ];
-    for (const e of entries) {
+    const makeRail = (title, list, label, srcLang) => {
       const seen = new Set();
       const tiles = [];
-      for (const entry of e.list) {
-        const t = tileForBuzz(entry, e.label);
+      for (const entry of list) {
+        const t = tileForBuzz(entry, label, srcLang);
         if (!t || seen.has(t.id)) continue;
         seen.add(t.id);
         tiles.push(t);
         if (tiles.length >= 20) break;
       }
-      if (tiles.length >= 6) buzzRails.push({ title: e.title, total: tiles.length, items: tiles });
-    }
-    // Trending this week (all platforms).
-    {
-      const seen = new Set();
-      const tiles = [];
-      for (const entry of streamingBuzz.trending?.[kind] || []) {
-        const t = tileForBuzz(entry, "trending this week");
-        if (!t || seen.has(t.id)) continue;
-        seen.add(t.id);
-        tiles.push(t);
-        if (tiles.length >= 20) break;
+      return tiles.length >= 6 ? { title, total: tiles.length, items: tiles, _lang: srcLang } : null;
+    };
+    // Trending this week (all platforms; English/Hindi/Punjabi titles only).
+    const trendingRail = makeRail("Trending this week", streamingBuzz.trending?.[kind] || [], "trending this week", "all");
+    const langTrending = [];
+    const platformRails = [];
+    for (const src of BUZZ_SOURCES) {
+      const data = streamingBuzz.providers[src.key]?.[kind] || [];
+      if (src.platform === "trending") {
+        const r = makeRail(src.title, data, `${BUZZ_LANG_NAME[src.lang]} trending`, src.lang);
+        if (r) langTrending.push(r);
+      } else {
+        const r = makeRail(src.title, data, src.label, src.lang);
+        if (r) platformRails.push(r);
       }
-      if (tiles.length >= 6) buzzRails.unshift({ title: "Trending this week", total: tiles.length, items: tiles });
     }
-    // Keep the home manageable: Trending + up to 4 platform rails, a
-    // different set each visit.
+    // Keep the home manageable: the trending rails always, plus 2 English,
+    // 2 Hindi and 1 Punjabi platform rail, a different set each visit.
     const rngBuzz = seededRng(`buzz:${visitSeed}:${req.profileId}:${mode}`);
-    const head = buzzRails.filter((r) => r.title === "Trending this week");
-    const platforms = jitterOrder(buzzRails.filter((r) => r.title !== "Trending this week"), rngBuzz, 8).slice(0, 4);
-    rails.push(...head, ...platforms);
+    const shuffled = jitterOrder(platformRails, rngBuzz, 12);
+    const pick = (lang, n) => shuffled.filter((r) => r._lang === lang).slice(0, n);
+    const chosen = new Set([...pick("en", 2), ...pick("hi", 2), ...pick("pa", 1)]);
+    for (const r of shuffled) { if (chosen.size >= 5) break; chosen.add(r); } // fill if a language is short
+    const platforms = shuffled.filter((r) => chosen.has(r));
+    const out = [trendingRail, ...langTrending, ...platforms].filter(Boolean);
+    for (const r of out) delete r._lang;
+    rails.push(...out);
   }
 
   // Recently Added — items whose panel-side `added` timestamp falls
@@ -9786,17 +9806,20 @@ const MCP_TOOLS = [
   },
   {
     name: "streaming_buzz",
-    description: "What's popular right now on the big streaming platforms (Netflix, Prime Video, Max, "
-      + "Disney+, Apple TV+, Hulu, Paramount+, Peacock, JioHotstar, ZEE5, SonyLIV) and this week's "
-      + "global trending — and whether each title is available in Khouch. The household has no "
-      + "subscriptions, so use this for 'what's everyone watching on Netflix', 'what's the hit show "
-      + "right now'. `platform` is a platform key or name (omit for trending + every platform), `kind` "
-      + "movie|series (default movie). Each item has `rank` (popularity rank on that platform) and, when "
-      + "in Khouch, a `ref`; `not_in_khouch` lists the top hits it does not have.",
+    description: "What's popular right now on the big streaming platforms and whether each title is "
+      + "available in Khouch. Covers English (US catalogs: Netflix, Prime Video, HBO Max, Disney+, Apple "
+      + "TV+, Hulu, Paramount+, Peacock), Hindi (India catalogs: Netflix, Prime Video, JioHotstar, ZEE5, "
+      + "SonyLIV, MX Player) and Punjabi (Prime Video, ZEE5) titles only. The household has no "
+      + "subscriptions, so use this for 'what's everyone watching on Netflix', 'what's the big Hindi "
+      + "show right now'. `platform` = a platform name (omit for this week's trending + Hindi/Punjabi "
+      + "trending), `language` = english|hindi|punjabi (omit for all), `kind` movie|series (default "
+      + "movie). Each item has `rank` (popularity rank on that platform) and, when in Khouch, a `ref`; "
+      + "`not_in_khouch` lists top hits it does not have.",
     inputSchema: {
       type: "object",
       properties: {
         platform: { type: "string" },
+        language: { type: "string", enum: ["english", "hindi", "punjabi"] },
         kind: { type: "string", enum: ["movie", "series"] },
         limit: { type: "integer", minimum: 1, maximum: 20 },
       },
@@ -9812,21 +9835,31 @@ const MCP_TOOLS = [
         amazon: "prime", amazonprime: "prime", primevideo: "prime", disneyplus: "disney", disney: "disney",
         hbo: "max", hbomax: "max", appletv: "apple", appletvplus: "apple", paramountplus: "paramount",
         jio: "hotstar", jiohotstar: "hotstar", disneyhotstar: "hotstar", sony: "sonyliv", zee: "zee5",
+        mx: "mxplayer",
       };
+      const LANG_ALIASES = { english: "en", en: "en", hindi: "hi", hi: "hi", punjabi: "pa", pa: "pa" };
+      const wantLang = LANG_ALIASES[norm(args.language)] || null;
+      if (args.language && !wantLang) return { error: `unknown language "${args.language}"`, valid_languages: ["english", "hindi", "punjabi"] };
       const want = norm(args.platform);
       const sources = [];
       if (!want || /^trend/.test(want)) {
-        sources.push({ name: "Trending this week", list: streamingBuzz.trending?.[kind] || [] });
+        if (!wantLang || wantLang === "en") sources.push({ name: "Trending this week", list: streamingBuzz.trending?.[kind] || [] });
+        for (const src of BUZZ_SOURCES) {
+          if (src.platform !== "trending" || (wantLang && src.lang !== wantLang)) continue;
+          sources.push({ name: src.title, list: streamingBuzz.providers[src.key]?.[kind] || [] });
+        }
       }
-      if (!/^trend/.test(want)) {
+      if (want && !/^trend/.test(want)) {
         const wantKey = ALIASES[want] || want;
-        for (const p of BUZZ_PROVIDERS) {
-          if (!want || p.key === wantKey || norm(p.label) === want) {
-            sources.push({ name: p.label, list: streamingBuzz.providers[p.key]?.[kind] || [] });
+        for (const src of BUZZ_SOURCES) {
+          if (src.platform === "trending" || (wantLang && src.lang !== wantLang)) continue;
+          if (src.platform === wantKey || norm(src.label) === want) {
+            sources.push({ name: `${src.title}`, list: streamingBuzz.providers[src.key]?.[kind] || [] });
           }
         }
-        if (want && sources.length === 0) {
-          return { error: `unknown platform "${args.platform}"`, valid_platforms: ["trending", ...BUZZ_PROVIDERS.map((p) => p.label)] };
+        if (sources.length === 0) {
+          return { error: `no data for platform "${args.platform}"${wantLang ? ` in ${args.language}` : ""}`,
+            valid_platforms: [...new Set(BUZZ_SOURCES.filter((p) => p.platform !== "trending").map((p) => `${p.label} (${BUZZ_LANG_NAME[p.lang]})`))] };
         }
       }
       // A kid profile gets the same gates as the home screen (rated-only titles,
