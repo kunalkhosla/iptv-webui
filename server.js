@@ -2412,6 +2412,92 @@ async function saveIndexToDisk(mode, actx = currentAccount()) {
   }
 }
 
+// ── Streaming buzz: what's popular on the big platforms ─────────────
+// The household has no Netflix/Prime/etc, so it never sees what's famous
+// there. TMDB (JustWatch data) tells us, per platform and region, the most
+// popular recent titles; we intersect that with the Khouch catalog (by TMDB
+// id) and surface it as "Popular on Netflix" rails with "#N on Netflix"
+// captions, plus an MCP tool that also lists what's hot but NOT in Khouch.
+const BUZZ_PROVIDERS = [
+  { key: "netflix", label: "Netflix", id: 8, region: "US" },
+  { key: "prime", label: "Prime Video", id: 9, region: "US" },
+  { key: "max", label: "Max", id: 1899, region: "US" },
+  { key: "disney", label: "Disney+", id: 337, region: "US" },
+  { key: "apple", label: "Apple TV+", id: 350, region: "US" },
+  { key: "hulu", label: "Hulu", id: 15, region: "US" },
+  { key: "paramount", label: "Paramount+", id: 531, region: "US" },
+  { key: "peacock", label: "Peacock", id: 386, region: "US" },
+  { key: "hotstar", label: "JioHotstar", id: 2336, region: "IN" },
+  { key: "zee5", label: "ZEE5", id: 232, region: "IN" },
+  { key: "sonyliv", label: "SonyLIV", id: 237, region: "IN" },
+];
+const streamingBuzzFile = path.join(DATA_DIR, "streaming-buzz.json");
+let streamingBuzz = (() => {
+  try { return JSON.parse(fs.readFileSync(streamingBuzzFile, "utf8")) || {}; } catch { return {}; }
+})();
+let streamingBuzzRunning = false;
+async function buildStreamingBuzz({ reason = "cron" } = {}) {
+  if (!TMDB_API_KEY) return { ok: false, error: "no TMDB_API_KEY" };
+  if (streamingBuzzRunning) return { ok: false, error: "already running" };
+  streamingBuzzRunning = true;
+  try {
+    const now = new Date();
+    const since = (years) => new Date(now.getFullYear() - years, now.getMonth(), now.getDate()).toISOString().slice(0, 10);
+    const rows = (res, kind) => (res?.results || []).map((r) => ({
+      id: r.id,
+      title: kind === "movie" ? r.title : r.name,
+      year: String((kind === "movie" ? r.release_date : r.first_air_date) || "").slice(0, 4) || null,
+    }));
+    const out = { updatedAt: Date.now(), providers: {}, trending: {} };
+    for (const p of BUZZ_PROVIDERS) {
+      out.providers[p.key] = { label: p.label, region: p.region, movie: [], tv: [] };
+      for (const kind of ["movie", "tv"]) {
+        const list = [];
+        for (let page = 1; page <= 5; page++) {
+          const params = {
+            watch_region: p.region, with_watch_providers: String(p.id),
+            with_watch_monetization_types: "flatrate", sort_by: "popularity.desc", page: String(page),
+          };
+          // Recent buzz, not the whole back catalogue: titles from the last 3 years.
+          params[kind === "movie" ? "primary_release_date.gte" : "first_air_date.gte"] = since(3);
+          const res = await tmdb(`/discover/${kind}`, params);
+          if (!res) break;
+          list.push(...rows(res, kind));
+          if (page >= (res.total_pages || 1)) break;
+        }
+        out.providers[p.key][kind] = list.map((r, i) => ({ ...r, rank: i + 1 }));
+      }
+    }
+    for (const kind of ["movie", "tv"]) {
+      const list = [];
+      for (let page = 1; page <= 3; page++) {
+        const res = await tmdb(`/trending/${kind}/week`, { page: String(page) });
+        if (!res) break;
+        list.push(...rows(res, kind));
+      }
+      out.trending[kind] = list.map((r, i) => ({ ...r, rank: i + 1 }));
+    }
+    const total = Object.values(out.providers).reduce((n, p) => n + p.movie.length + p.tv.length, 0);
+    if (!total) { console.warn("[buzz] TMDB returned nothing — keeping the previous data"); return { ok: false, error: "empty" }; }
+    streamingBuzz = out;
+    try {
+      fs.writeFileSync(streamingBuzzFile + ".tmp", JSON.stringify(out));
+      fs.renameSync(streamingBuzzFile + ".tmp", streamingBuzzFile);
+    } catch (e) { console.warn(`[buzz] save failed: ${e.message}`); }
+    console.log(`[buzz] (${reason}) ${total} provider titles across ${BUZZ_PROVIDERS.length} platforms`);
+    return { ok: true, total };
+  } finally {
+    streamingBuzzRunning = false;
+  }
+}
+function scheduleStreamingBuzz() {
+  if (!TMDB_API_KEY) return;
+  const age = Date.now() - (streamingBuzz.updatedAt || 0);
+  setTimeout(() => buildStreamingBuzz({ reason: "boot" }).catch((e) => console.warn(`[buzz] ${e.message}`)),
+    age > 20 * 3600 * 1000 ? 3 * 60 * 1000 : 30 * 60 * 1000);
+  setInterval(() => buildStreamingBuzz().catch((e) => console.warn(`[buzz] ${e.message}`)), 12 * 3600 * 1000);
+}
+
 // ── Canonical variants (one tile per film/show, in its native language) ──
 // The panel lists the same title once per audio language / quality ("TRON:
 // Ares" in English FHD, 4 dubs, a multi-audio bundle). Group streams by TMDB
@@ -2448,10 +2534,12 @@ function assignVariants(mode, actx = currentAccount()) {
   const catNames = new Map();
   for (const c of (loadCategoriesFromDiskSync(mode, actx) || [])) catNames.set(String(c.category_id), c.category_name);
   const groups = new Map();
+  const byTmdb = new Map(); // tmdb_id -> every catalog stream for it (streaming-buzz lookup)
   for (const s of ix.byId.values()) {
     delete s.isAlt; delete s.canonicalId; delete s.variants; delete s.audioLang;
     const t = tmdbCache[`${mode}:${s.id}`];
     if (!t || t.source === "no-match" || !t.tmdb_id) continue;
+    { const bt = byTmdb.get(t.tmdb_id); if (bt) bt.push(s); else byTmdb.set(t.tmdb_id, [s]); }
     s.audioLang = streamAudioLang(s, catNames.get(String(s.category_id)));
     // A panel title year more than one year off TMDB's means a wrong match:
     // never fold it into another film's group.
@@ -2492,6 +2580,7 @@ function assignVariants(mode, actx = currentAccount()) {
     for (const m of members.slice(1)) { m.isAlt = true; m.canonicalId = canon.id; hidden++; }
     grouped++;
   }
+  ix.byTmdb = byTmdb;
   console.log(`[${mode}] variants: ${grouped} multi-version titles, ${hidden} alternates folded`);
 }
 // Per-request: should stream `s` be hidden because another variant of the same
@@ -5955,6 +6044,60 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
         });
       }
     }
+  }
+
+  // Streaming buzz — "Popular on Netflix / Prime / Max / …" from TMDB's
+  // per-platform popularity (buildStreamingBuzz), limited to titles Khouch
+  // actually has. Each tile is captioned "#N on <platform>" (N = rank among
+  // everything popular there, not just what Khouch carries). Movies/series
+  // only; kid/language gates and the native-language variant choice apply.
+  if ((mode === "movie" || mode === "series") && streamingBuzz.providers && ix.byTmdb) {
+    const kind = mode === "movie" ? "movie" : "tv";
+    const buzzRails = [];
+    const tileForBuzz = (entry, label) => {
+      const members = ix.byTmdb.get(entry.id);
+      if (!members?.length) return null;
+      const s = variantHidden.resolve(members[0]);
+      if (!s || !titleLangPasses(s.name)) return null;
+      const tile = tileFor(s, null);
+      if (!tile || isKidBlocked(tile)) return null;
+      tile.pickReason = label === "trending this week" ? `#${entry.rank} trending this week` : `#${entry.rank} on ${label}`;
+      return tile;
+    };
+    const entries = [
+      ...BUZZ_PROVIDERS.map((p) => ({ key: p.key, label: p.label, list: streamingBuzz.providers[p.key]?.[kind] || [], title: `Popular on ${p.label}` })),
+    ];
+    for (const e of entries) {
+      const seen = new Set();
+      const tiles = [];
+      for (const entry of e.list) {
+        const t = tileForBuzz(entry, e.label);
+        if (!t || seen.has(t.id)) continue;
+        seen.add(t.id);
+        tiles.push(t);
+        if (tiles.length >= 20) break;
+      }
+      if (tiles.length >= 6) buzzRails.push({ title: e.title, total: tiles.length, items: tiles });
+    }
+    // Trending this week (all platforms).
+    {
+      const seen = new Set();
+      const tiles = [];
+      for (const entry of streamingBuzz.trending?.[kind] || []) {
+        const t = tileForBuzz(entry, "trending this week");
+        if (!t || seen.has(t.id)) continue;
+        seen.add(t.id);
+        tiles.push(t);
+        if (tiles.length >= 20) break;
+      }
+      if (tiles.length >= 6) buzzRails.unshift({ title: "Trending this week", total: tiles.length, items: tiles });
+    }
+    // Keep the home manageable: Trending + up to 5 platform rails, a
+    // different set each visit.
+    const rngBuzz = seededRng(`buzz:${visitSeed}:${req.profileId}:${mode}`);
+    const head = buzzRails.filter((r) => r.title === "Trending this week");
+    const platforms = jitterOrder(buzzRails.filter((r) => r.title !== "Trending this week"), rngBuzz, 8).slice(0, 5);
+    rails.push(...head, ...platforms);
   }
 
   // Recently Added — items whose panel-side `added` timestamp falls
@@ -9623,6 +9766,56 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: "streaming_buzz",
+    description: "What's popular right now on the big streaming platforms (Netflix, Prime Video, Max, "
+      + "Disney+, Apple TV+, Hulu, Paramount+, Peacock, JioHotstar, ZEE5, SonyLIV) and this week's "
+      + "global trending — and whether each title is available in Khouch. The household has no "
+      + "subscriptions, so use this for 'what's everyone watching on Netflix', 'what's the hit show "
+      + "right now'. `platform` is a platform key or name (omit for trending + every platform), `kind` "
+      + "movie|series (default movie). Each item has `rank` (popularity rank on that platform) and, when "
+      + "in Khouch, a `ref`; `not_in_khouch` lists the top hits it does not have.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        platform: { type: "string" },
+        kind: { type: "string", enum: ["movie", "series"] },
+        limit: { type: "integer", minimum: 1, maximum: 20 },
+      },
+    },
+    async handler(args, req) {
+      const kind = args.kind === "series" ? "tv" : "movie";
+      const mode = kind === "tv" ? "series" : "movie";
+      const limit = Math.min(Math.max(parseInt(args.limit, 10) || 8, 1), 20);
+      if (!streamingBuzz.providers) throw new Error("streaming buzz not built yet — try again in a few minutes");
+      const ix = getIndexesFor(currentAccount())[mode];
+      const want = String(args.platform || "").toLowerCase().replace(/[^a-z0-9+]/g, "");
+      const sources = [];
+      if (!want || /trend/.test(want)) sources.push({ name: "Trending this week", list: streamingBuzz.trending?.[kind] || [] });
+      for (const p of BUZZ_PROVIDERS) {
+        const k = p.label.toLowerCase().replace(/[^a-z0-9+]/g, "");
+        if (!want || /trend/.test(want) ? !want : (k.includes(want) || want.includes(k) || p.key === want)) {
+          sources.push({ name: p.label, list: streamingBuzz.providers[p.key]?.[kind] || [] });
+        }
+      }
+      const platforms = sources.map((src) => {
+        const items = [], missing = [];
+        for (const e of src.list) {
+          if (items.length >= limit && missing.length >= 5) break;
+          const members = ix?.byTmdb?.get(e.id);
+          const s = members?.length ? members[0] : null;
+          if (s && items.length < limit) {
+            const hit = mcpHit(mode, s);
+            items.push({ rank: e.rank, title: e.title, year: e.year, ref: hit.ref });
+          } else if (!s && missing.length < 5 && e.rank <= 30) {
+            missing.push({ rank: e.rank, title: e.title, year: e.year });
+          }
+        }
+        return { platform: src.name, in_khouch: items, not_in_khouch: missing };
+      });
+      return { kind: mode, updated: new Date(streamingBuzz.updatedAt || 0).toISOString(), platforms };
+    },
+  },
+  {
     name: "update_list",
     description: "Add or remove items on this profile's Watch Later (`watch_later`) or Favorites "
       + "(`favorites`) list. `refs` are refs from search / for_you / whats_on (movie, series, live, "
@@ -10322,6 +10515,10 @@ app.post("/api/admin/retry-tmdb-no-matches", (req, res) => {
 // Rebuild the AI taste profiles ("For You" rail) on demand — for
 // testing and for warming a fresh deploy without waiting for the
 // 4:15 AM cron. Runs the exact same job.
+app.post("/api/admin/rebuild-streaming-buzz", async (req, res) => {
+  if (!requireOwner(req, res)) return;
+  res.json(await buildStreamingBuzz({ reason: "admin" }));
+});
 app.post("/api/admin/rebuild-taste-profiles", async (req, res) => {
   if (!requireOwner(req, res)) return;
   try {
@@ -12016,4 +12213,5 @@ app.listen(PORT, async () => {
   // without ANTHROPIC_API_KEY and boot-warm on a fresh deploy.
   scheduleEditorialRailsWeekly();
   scheduleTonightNightly();
+  scheduleStreamingBuzz();
 });
