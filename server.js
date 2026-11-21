@@ -7050,6 +7050,21 @@ const normalizeForSearch = (s) =>
 // 3 = contiguous full-query substring (exact stays on top),
 // 2 = all tokens present (order-independent), 0 = no match.
 // An empty query matches everything at a neutral rank.
+// Per-title normalized search text (title words, cast+director words), cached
+// by stream object and invalidated when its TMDB entry object is replaced.
+// Each text is space-padded (" w1 w2 ") so word-start checks are `includes(" p")`.
+const searchTextsCache = new WeakMap();
+function searchTextsFor(s, t) {
+  const c = searchTextsCache.get(s);
+  if (c && c.t === t) return c;
+  const tj = normalizeForSearch(cleanPanelTitle(s.name || "") || s.name || "");
+  const other = [];
+  if (Array.isArray(t?.cast)) for (const m of t.cast) other.push(normalizeForSearch(m.name || ""));
+  if (Array.isArray(t?.directors)) for (const d of t.directors) other.push(normalizeForSearch(d || ""));
+  const out = { t, tj, title: ` ${tj} `, other: ` ${other.join(" ")} ` };
+  searchTextsCache.set(s, out);
+  return out;
+}
 const nameMatchRank = (normName, normQuery, queryTokens) => {
   if (!normQuery) return 1;
   if (normName.includes(normQuery)) return 3;
@@ -7483,24 +7498,19 @@ app.get("/api/search/all", async (req, res, next) => {
         let titleScore = 0;
         if (nameLow) {
           const userTokens = nameLow.split(/\s+/).filter(Boolean);
-          const tokHit = (tok, wordsArr) => {
-            const p = tok.length >= 5 ? tok.slice(0, 4) : tok;
-            return tok.length <= 2 ? wordsArr.includes(tok) : wordsArr.some((w) => w.startsWith(p));
-          };
-          const titleWords = normalizeForSearch(cleanPanelTitle(s.name || "") || s.name || "").split(" ").filter(Boolean);
-          const otherWords = [];
-          if (Array.isArray(t.cast)) for (const c of t.cast) otherWords.push(...normalizeForSearch(c.name || "").split(" ").filter(Boolean));
-          if (Array.isArray(t.directors)) for (const d of t.directors) otherWords.push(...normalizeForSearch(d || "").split(" ").filter(Boolean));
-          const allWords = titleWords.concat(otherWords);
-          if (!userTokens.every((tok) => tokHit(tok, allWords))) continue;
+          const st = searchTextsFor(s, t);
+          // Word-start prefix (4 chars max) for tokens >2 chars; whole word for 1-2 letters.
+          const tokHit = (tok, text) => (tok.length <= 2
+            ? text.includes(" " + tok + " ")
+            : text.includes(" " + (tok.length >= 5 ? tok.slice(0, 4) : tok)));
+          if (!userTokens.every((tok) => tokHit(tok, st.title) || tokHit(tok, st.other))) continue;
           // How well does the TITLE itself match? (cast-only hits rank last)
           const qj = userTokens.join(" ");
-          const tj = titleWords.join(" ");
-          if (tj === qj) titleScore = 5;
-          else if (tj.startsWith(qj + " ")) titleScore = 4;
-          else if (userTokens.every((tok) => titleWords.includes(tok))) titleScore = 3;
-          else if (userTokens.every((tok) => tokHit(tok, titleWords))) titleScore = 2;
-          else if (userTokens.some((tok) => tokHit(tok, titleWords))) titleScore = 1;
+          if (st.tj === qj) titleScore = 5;
+          else if (st.tj.startsWith(qj + " ")) titleScore = 4;
+          else if (userTokens.every((tok) => st.title.includes(" " + tok + " "))) titleScore = 3;
+          else if (userTokens.every((tok) => tokHit(tok, st.title))) titleScore = 2;
+          else if (userTokens.some((tok) => tokHit(tok, st.title))) titleScore = 1;
         }
         // Title hits are always kept; cast/director-only hits are capped so a
         // generic name query can't balloon the list. (The old early break
