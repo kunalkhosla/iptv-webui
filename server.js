@@ -2421,7 +2421,7 @@ async function saveIndexToDisk(mode, actx = currentAccount()) {
 const BUZZ_PROVIDERS = [
   { key: "netflix", label: "Netflix", id: 8, region: "US" },
   { key: "prime", label: "Prime Video", id: 9, region: "US" },
-  { key: "max", label: "Max", id: 1899, region: "US" },
+  { key: "max", label: "HBO Max", id: 1899, region: "US" },
   { key: "disney", label: "Disney+", id: 337, region: "US" },
   { key: "apple", label: "Apple TV+", id: 350, region: "US" },
   { key: "hulu", label: "Hulu", id: 15, region: "US" },
@@ -2448,7 +2448,18 @@ async function buildStreamingBuzz({ reason = "cron" } = {}) {
       title: kind === "movie" ? r.title : r.name,
       year: String((kind === "movie" ? r.release_date : r.first_air_date) || "").slice(0, 4) || null,
     }));
+    // tmdb() caches 24h; drop the discover/trending pages so a 12h refresh is real.
+    for (const k of [...tmdbMemCache.keys()]) if (k.startsWith("/discover/") || k.startsWith("/trending/")) tmdbMemCache.delete(k);
     const out = { updatedAt: Date.now(), providers: {}, trending: {} };
+    // Keep the previous list when a fresh one comes back empty/much shorter
+    // (a TMDB hiccup mid-run must not wipe the rails).
+    const keepIfBetter = (fresh, prev, what) => {
+      if (prev?.length && fresh.length < prev.length * 0.5) {
+        console.warn(`[buzz] ${what}: got ${fresh.length} vs ${prev.length} before — keeping the previous list`);
+        return prev;
+      }
+      return fresh;
+    };
     for (const p of BUZZ_PROVIDERS) {
       out.providers[p.key] = { label: p.label, region: p.region, movie: [], tv: [] };
       for (const kind of ["movie", "tv"]) {
@@ -2459,13 +2470,14 @@ async function buildStreamingBuzz({ reason = "cron" } = {}) {
             with_watch_monetization_types: "flatrate", sort_by: "popularity.desc", page: String(page),
           };
           // Recent buzz, not the whole back catalogue: titles from the last 3 years.
-          params[kind === "movie" ? "primary_release_date.gte" : "first_air_date.gte"] = since(3);
+          params[kind === "movie" ? "primary_release_date.gte" : "first_air_date.gte"] = since(kind === "movie" ? 3 : 5);
           const res = await tmdb(`/discover/${kind}`, params);
           if (!res) break;
           list.push(...rows(res, kind));
           if (page >= (res.total_pages || 1)) break;
         }
-        out.providers[p.key][kind] = list.map((r, i) => ({ ...r, rank: i + 1 }));
+        out.providers[p.key][kind] = keepIfBetter(
+          list.map((r, i) => ({ ...r, rank: i + 1 })), streamingBuzz.providers?.[p.key]?.[kind], `${p.key}/${kind}`);
       }
     }
     for (const kind of ["movie", "tv"]) {
@@ -2475,7 +2487,8 @@ async function buildStreamingBuzz({ reason = "cron" } = {}) {
         if (!res) break;
         list.push(...rows(res, kind));
       }
-      out.trending[kind] = list.map((r, i) => ({ ...r, rank: i + 1 }));
+      out.trending[kind] = keepIfBetter(
+        list.map((r, i) => ({ ...r, rank: i + 1 })), streamingBuzz.trending?.[kind], `trending/${kind}`);
     }
     const total = Object.values(out.providers).reduce((n, p) => n + p.movie.length + p.tv.length, 0);
     if (!total) { console.warn("[buzz] TMDB returned nothing — keeping the previous data"); return { ok: false, error: "empty" }; }
@@ -2539,13 +2552,13 @@ function assignVariants(mode, actx = currentAccount()) {
     delete s.isAlt; delete s.canonicalId; delete s.variants; delete s.audioLang;
     const t = tmdbCache[`${mode}:${s.id}`];
     if (!t || t.source === "no-match" || !t.tmdb_id) continue;
-    { const bt = byTmdb.get(t.tmdb_id); if (bt) bt.push(s); else byTmdb.set(t.tmdb_id, [s]); }
     s.audioLang = streamAudioLang(s, catNames.get(String(s.category_id)));
     // A panel title year more than one year off TMDB's means a wrong match:
-    // never fold it into another film's group.
+    // never fold it into another film's group (or surface it as the hit).
     const ny = /\(((?:19|20)\d{2})\)/.exec(s.name || "");
     const ty = parseInt(t.year, 10);
     if (ny && Number.isFinite(ty) && Math.abs(parseInt(ny[1], 10) - ty) > 1) continue;
+    { const bt = byTmdb.get(t.tmdb_id); if (bt) bt.push(s); else byTmdb.set(t.tmdb_id, [s]); }
     // Series dubs can carry partial seasons and no episode counts are known
     // here, so series fold only same-language twins (platform/quality
     // duplicates); movies fold across languages.
@@ -6057,10 +6070,16 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     const tileForBuzz = (entry, label) => {
       const members = ix.byTmdb.get(entry.id);
       if (!members?.length) return null;
-      const s = variantHidden.resolve(members[0]);
-      if (!s || !titleLangPasses(s.name)) return null;
-      const tile = tileFor(s, null);
-      if (!tile || isKidBlocked(tile)) return null;
+      // First member that survives this profile's gates (language, category,
+      // kid) — the title may exist in several languages/categories.
+      let tile = null;
+      for (const m of members) {
+        const s = variantHidden.resolve(m);
+        if (!s || !titleLangPasses(s.name) || !allowedCatIds.has(String(s.category_id))) continue;
+        const tl = tileFor(s, null);
+        if (tl && !isKidBlocked(tl)) { tile = tl; break; }
+      }
+      if (!tile) return null;
       tile.pickReason = label === "trending this week" ? `#${entry.rank} trending this week` : `#${entry.rank} on ${label}`;
       return tile;
     };
@@ -6092,11 +6111,11 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       }
       if (tiles.length >= 6) buzzRails.unshift({ title: "Trending this week", total: tiles.length, items: tiles });
     }
-    // Keep the home manageable: Trending + up to 5 platform rails, a
+    // Keep the home manageable: Trending + up to 4 platform rails, a
     // different set each visit.
     const rngBuzz = seededRng(`buzz:${visitSeed}:${req.profileId}:${mode}`);
     const head = buzzRails.filter((r) => r.title === "Trending this week");
-    const platforms = jitterOrder(buzzRails.filter((r) => r.title !== "Trending this week"), rngBuzz, 8).slice(0, 5);
+    const platforms = jitterOrder(buzzRails.filter((r) => r.title !== "Trending this week"), rngBuzz, 8).slice(0, 4);
     rails.push(...head, ...platforms);
   }
 
@@ -9788,25 +9807,43 @@ const MCP_TOOLS = [
       const limit = Math.min(Math.max(parseInt(args.limit, 10) || 8, 1), 20);
       if (!streamingBuzz.providers) throw new Error("streaming buzz not built yet — try again in a few minutes");
       const ix = getIndexesFor(currentAccount())[mode];
-      const want = String(args.platform || "").toLowerCase().replace(/[^a-z0-9+]/g, "");
+      const norm = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const ALIASES = {
+        amazon: "prime", amazonprime: "prime", primevideo: "prime", disneyplus: "disney", disney: "disney",
+        hbo: "max", hbomax: "max", appletv: "apple", appletvplus: "apple", paramountplus: "paramount",
+        jio: "hotstar", jiohotstar: "hotstar", disneyhotstar: "hotstar", sony: "sonyliv", zee: "zee5",
+      };
+      const want = norm(args.platform);
       const sources = [];
-      if (!want || /trend/.test(want)) sources.push({ name: "Trending this week", list: streamingBuzz.trending?.[kind] || [] });
-      for (const p of BUZZ_PROVIDERS) {
-        const k = p.label.toLowerCase().replace(/[^a-z0-9+]/g, "");
-        if (!want || /trend/.test(want) ? !want : (k.includes(want) || want.includes(k) || p.key === want)) {
-          sources.push({ name: p.label, list: streamingBuzz.providers[p.key]?.[kind] || [] });
+      if (!want || /^trend/.test(want)) {
+        sources.push({ name: "Trending this week", list: streamingBuzz.trending?.[kind] || [] });
+      }
+      if (!/^trend/.test(want)) {
+        const wantKey = ALIASES[want] || want;
+        for (const p of BUZZ_PROVIDERS) {
+          if (!want || p.key === wantKey || norm(p.label) === want) {
+            sources.push({ name: p.label, list: streamingBuzz.providers[p.key]?.[kind] || [] });
+          }
+        }
+        if (want && sources.length === 0) {
+          return { error: `unknown platform "${args.platform}"`, valid_platforms: ["trending", ...BUZZ_PROVIDERS.map((p) => p.label)] };
         }
       }
+      // A kid profile gets the same gates as the home screen (rated-only titles,
+      // no raw TMDB titles of unknown rating).
+      const prof = findProfile(req.profileId);
+      const isKid = !!prof?.kidsBirthYear;
+      const kidBlocked = makeKidsBlocker(prof);
       const platforms = sources.map((src) => {
         const items = [], missing = [];
         for (const e of src.list) {
-          if (items.length >= limit && missing.length >= 5) break;
-          const members = ix?.byTmdb?.get(e.id);
-          const s = members?.length ? members[0] : null;
+          if (items.length >= limit && (isKid || missing.length >= 5)) break;
+          const members = (ix?.byTmdb?.get(e.id) || []).filter((m) => !(isKid && kidBlocked({ us_cert: m.us_cert })));
+          // Prefer the native-language canonical, then any non-alternate.
+          const s = members.find((m) => m.variants) || members.find((m) => !m.isAlt) || members[0] || null;
           if (s && items.length < limit) {
-            const hit = mcpHit(mode, s);
-            items.push({ rank: e.rank, title: e.title, year: e.year, ref: hit.ref });
-          } else if (!s && missing.length < 5 && e.rank <= 30) {
+            items.push({ rank: e.rank, title: e.title, year: e.year, ref: mcpHit(mode, s).ref });
+          } else if (!s && !isKid && missing.length < 5 && e.rank <= 30 && !ix?.byTmdb?.get(e.id)) {
             missing.push({ rank: e.rank, title: e.title, year: e.year });
           }
         }
@@ -10515,9 +10552,11 @@ app.post("/api/admin/retry-tmdb-no-matches", (req, res) => {
 // Rebuild the AI taste profiles ("For You" rail) on demand — for
 // testing and for warming a fresh deploy without waiting for the
 // 4:15 AM cron. Runs the exact same job.
-app.post("/api/admin/rebuild-streaming-buzz", async (req, res) => {
+app.post("/api/admin/rebuild-streaming-buzz", (req, res) => {
   if (!requireOwner(req, res)) return;
-  res.json(await buildStreamingBuzz({ reason: "admin" }));
+  // ~1 min of serial TMDB calls: run in the background (a Cloudflare request would time out).
+  buildStreamingBuzz({ reason: "admin" }).catch((e) => console.warn(`[buzz] ${e.message}`));
+  res.json({ ok: true, started: true });
 });
 app.post("/api/admin/rebuild-taste-profiles", async (req, res) => {
   if (!requireOwner(req, res)) return;
