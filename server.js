@@ -7065,6 +7065,30 @@ function searchTextsFor(s, t) {
   searchTextsCache.set(s, out);
   return out;
 }
+// Sort search candidates by quality then popularity while keeping a title's
+// language/quality siblings (same dedupTitleKey) together and ordered by
+// langRank. Siblings share one (best) score/vote, which keeps the comparator
+// a strict weak ordering (the old mixed comparator was intransitive).
+function rankWithDubClusters(items, scoreOf, voteOf, langRank) {
+  const g = new Map();
+  for (const it of items) {
+    if (!it.dtKey) continue;
+    const sc = scoreOf(it), v = voteOf(it), cur = g.get(it.dtKey);
+    if (!cur) g.set(it.dtKey, { sc, v });
+    else { if (sc > cur.sc) cur.sc = sc; if (v > cur.v) cur.v = v; }
+  }
+  const gs = (it) => (it.dtKey ? g.get(it.dtKey).sc : scoreOf(it));
+  const gv = (it) => (it.dtKey ? g.get(it.dtKey).v : voteOf(it));
+  items.sort((a, b) => {
+    const sa = gs(a), sb = gs(b);
+    if (sa !== sb) return sb - sa;
+    const va = gv(a), vb = gv(b);
+    if (va !== vb) return vb - va;
+    const ka = a.dtKey || "", kb = b.dtKey || "";
+    if (ka !== kb) return ka < kb ? -1 : 1;
+    return langRank(a.s) - langRank(b.s);
+  });
+}
 const nameMatchRank = (normName, normQuery, queryTokens) => {
   if (!normQuery) return 1;
   if (normName.includes(normQuery)) return 3;
@@ -7497,7 +7521,16 @@ app.get("/api/search/all", async (req, res, next) => {
         // every cast list in the catalog ("dil se" returned Inception).
         let titleScore = 0;
         if (nameLow) {
-          const userTokens = nameLow.split(/\s+/).filter(Boolean);
+          // Normalized like the haystack ("dil se.." -> dil se; "mr. & mrs." -> mr mrs).
+          const userTokens = normalizeForSearch(nameLow).split(" ").filter(Boolean);
+          if (!userTokens.length) {
+            // Nothing Latin to normalize (e.g. Devanagari): plain substring match
+            // on the raw title/cast, as before.
+            const raw = nameLow.split(/\s+/).filter(Boolean);
+            const hay = ((s.name || "") + " | " + (t.cast || []).map((c) => c.name || "").join(" ")).toLowerCase();
+            if (!raw.every((tok) => hay.includes(tok))) continue;
+            titleScore = (s.name || "").toLowerCase().includes(nameLow) ? 3 : 1;
+          } else {
           const st = searchTextsFor(s, t);
           // Word-start prefix (4 chars max) for tokens >2 chars; whole word for 1-2 letters.
           const tokHit = (tok, text) => (tok.length <= 2
@@ -7511,6 +7544,7 @@ app.get("/api/search/all", async (req, res, next) => {
           else if (userTokens.every((tok) => st.title.includes(" " + tok + " "))) titleScore = 3;
           else if (userTokens.every((tok) => tokHit(tok, st.title))) titleScore = 2;
           else if (userTokens.some((tok) => tokHit(tok, st.title))) titleScore = 1;
+          }
         }
         // Title hits are always kept; cast/director-only hits are capped so a
         // generic name query can't balloon the list. (The old early break
@@ -7529,11 +7563,7 @@ app.get("/api/search/all", async (req, res, next) => {
       // Same-titleKey candidates (dub variants of one show) tiebreak on
       // langRank instead — see the comment on langRank above — so eligible()
       // below sees the profile's onboarded-language dub first.
-      matches.sort((a, b) => {
-        if (a.dtKey && a.dtKey === b.dtKey) return langRank(a.s) - langRank(b.s);
-        if (a.titleScore !== b.titleScore) return b.titleScore - a.titleScore;
-        return (b.t.vote_count || 0) - (a.t.vote_count || 0);
-      });
+      rankWithDubClusters(matches, (m) => m.titleScore, (m) => m.t.vote_count || 0, langRank);
       for (const m of matches) {
         if (results.length >= limit) break;
         if (!eligible(m.s)) continue;
@@ -7563,12 +7593,8 @@ app.get("/api/search/all", async (req, res, next) => {
     // langRank instead of raw rank — see the comment on langRank above —
     // so the profile's onboarded-language dub is what eligible() sees
     // first and keeps. Different titles keep the existing rank order.
-    ranked.sort((a, b) => {
-      if (a.dtKey && a.dtKey === b.dtKey) return langRank(a.s) - langRank(b.s);
-      if (b.rank !== a.rank) return b.rank - a.rank;
-      // Same title quality: the more-watched (TMDB vote count) title first.
-      return (tmdbCache[`${mode}:${b.s.id}`]?.vote_count || 0) - (tmdbCache[`${mode}:${a.s.id}`]?.vote_count || 0);
-    });
+    // Same title quality: the more-watched (TMDB vote count) title first.
+    rankWithDubClusters(ranked, (r) => r.rank, (r) => tmdbCache[`${mode}:${r.s.id}`]?.vote_count || 0, langRank);
     for (const { s } of ranked) {
       if (results.length >= limit) break;
       if (!eligible(s)) continue;
