@@ -7456,6 +7456,7 @@ app.get("/api/search/all", async (req, res, next) => {
     if ((hasFacets || couldBeName) && mode !== "live") {
       const nameLow = parsed.name || "";
       const matches = [];
+      let castOnly = 0;
       for (const s of ix.byId.values()) {
         const t = tmdbCache[`${mode}:${s.id}`];
         if (!t || t.source === "no-match") continue;
@@ -7474,43 +7475,53 @@ app.get("/api/search/all", async (req, res, next) => {
           // the v2 backfill, also accept the panel-derived tag.
           if (!(Array.isArray(s.tags) && s.tags.includes(parsed.lang === "hi" ? "hindi" : parsed.lang))) continue;
         }
-        // Name residual — fuzzy AND-match against the panel title
-        // + TMDB cast names + TMDB director names. Each user token
-        // becomes a 4-char prefix (full token if shorter) so spelling
-        // variants like "Ajay Devgan" → "Ajay Devgn" still match.
-        // Every token must hit somewhere in the haystack; this avoids
-        // "ajay devgan" matching every film that has either a random
-        // "Ajay X" or "Y Devgan" in any role.
+        // Name residual — AND-match every query token against WORDS of the
+        // panel title + TMDB cast + directors. A token is a word PREFIX (4
+        // chars max, so "Devgan"/"Devgn" still meet), and 1-2 letter tokens
+        // ("se", "ek") must be whole words — as loose substrings they matched
+        // every cast list in the catalog ("dil se" returned Inception).
+        let titleScore = 0;
         if (nameLow) {
           const userTokens = nameLow.split(/\s+/).filter(Boolean);
-          const prefixes = userTokens.map(tok => tok.length >= 5 ? tok.slice(0, 4) : tok);
-          const haystackParts = [(s.name || "").toLowerCase()];
-          if (Array.isArray(t.cast)) {
-            for (const c of t.cast) haystackParts.push((c.name || "").toLowerCase());
-          }
-          if (Array.isArray(t.directors)) {
-            for (const d of t.directors) haystackParts.push((d || "").toLowerCase());
-          }
-          const haystack = haystackParts.join(" | ");
-          if (!prefixes.every(p => haystack.includes(p))) continue;
+          const tokHit = (tok, wordsArr) => {
+            const p = tok.length >= 5 ? tok.slice(0, 4) : tok;
+            return tok.length <= 2 ? wordsArr.includes(tok) : wordsArr.some((w) => w.startsWith(p));
+          };
+          const titleWords = normalizeForSearch(cleanPanelTitle(s.name || "") || s.name || "").split(" ").filter(Boolean);
+          const otherWords = [];
+          if (Array.isArray(t.cast)) for (const c of t.cast) otherWords.push(...normalizeForSearch(c.name || "").split(" ").filter(Boolean));
+          if (Array.isArray(t.directors)) for (const d of t.directors) otherWords.push(...normalizeForSearch(d || "").split(" ").filter(Boolean));
+          const allWords = titleWords.concat(otherWords);
+          if (!userTokens.every((tok) => tokHit(tok, allWords))) continue;
+          // How well does the TITLE itself match? (cast-only hits rank last)
+          const qj = userTokens.join(" ");
+          const tj = titleWords.join(" ");
+          if (tj === qj) titleScore = 5;
+          else if (tj.startsWith(qj + " ")) titleScore = 4;
+          else if (userTokens.every((tok) => titleWords.includes(tok))) titleScore = 3;
+          else if (userTokens.every((tok) => tokHit(tok, titleWords))) titleScore = 2;
+          else if (userTokens.some((tok) => tokHit(tok, titleWords))) titleScore = 1;
         }
-        matches.push({ s, t, dtKey: dedupTitleKey(s.name) });
-        // Collect well past the limit, NOT just eligible() survivors —
-        // dedup now runs after the sort below (was inline here before),
-        // so a title's dub-cluster siblings must all still be in this
-        // list when the language tiebreak runs, not thinned by whichever
-        // happened to be scanned first.
-        if (matches.length >= limit * 10) break;
+        // Title hits are always kept; cast/director-only hits are capped so a
+        // generic name query can't balloon the list. (The old early break
+        // stopped at the first limit*10 hits in index order, BEFORE ranking,
+        // so the real title could be cut off.) Facet-only queries (no name
+        // residual) keep every match so the popularity sort sees them all.
+        if (nameLow && titleScore === 0) {
+          if (castOnly >= limit * 10) continue;
+          castOnly++;
+        }
+        matches.push({ s, t, dtKey: dedupTitleKey(s.name), titleScore });
+        if (matches.length >= 60000) break;
       }
-      // Sort by audience size (vote_count) — bigger / more-watched titles
-      // first. Same-titleKey candidates (dub variants of one show)
-      // tiebreak on langRank instead — see the comment on langRank above
-      // — so eligible() below sees the profile's onboarded-language dub
-      // first and keeps THAT one, not whichever the raw catalog scan
-      // happened to reach first (previously: dedup ran inline during the
-      // scan, before any vote_count sort even applied).
+      // Rank: how well the title matches first (exact > prefix > whole words
+      // > word prefixes > partial > cast-only), then audience size.
+      // Same-titleKey candidates (dub variants of one show) tiebreak on
+      // langRank instead — see the comment on langRank above — so eligible()
+      // below sees the profile's onboarded-language dub first.
       matches.sort((a, b) => {
         if (a.dtKey && a.dtKey === b.dtKey) return langRank(a.s) - langRank(b.s);
+        if (a.titleScore !== b.titleScore) return b.titleScore - a.titleScore;
         return (b.t.vote_count || 0) - (a.t.vote_count || 0);
       });
       for (const m of matches) {
@@ -7531,7 +7542,12 @@ app.get("/api/search/all", async (req, res, next) => {
     const ranked = [];
     for (const s of ix.byId.values()) {
       const rank = nameMatchRank(normalizeForSearch(s.name), normQ, qTokens);
-      if (rank) ranked.push({ s, rank, dtKey: dedupTitleKey(s.name) });
+      if (!rank) continue;
+      // Title quality bonus: an exact title ("Sholay") beats a title that merely
+      // contains the word ("The Sholay Girl"); a prefix beats a mid-title hit.
+      const tj = normalizeForSearch(cleanPanelTitle(s.name || "") || s.name || "");
+      const bonus = tj === normQ ? 10 : tj.startsWith(normQ + " ") ? 5 : (" " + tj + " ").includes(" " + normQ + " ") ? 2 : 0;
+      ranked.push({ s, rank: rank + bonus, dtKey: dedupTitleKey(s.name) });
     }
     // Same-titleKey candidates (dub variants of one show) tiebreak on
     // langRank instead of raw rank — see the comment on langRank above —
@@ -7539,7 +7555,9 @@ app.get("/api/search/all", async (req, res, next) => {
     // first and keeps. Different titles keep the existing rank order.
     ranked.sort((a, b) => {
       if (a.dtKey && a.dtKey === b.dtKey) return langRank(a.s) - langRank(b.s);
-      return b.rank - a.rank;
+      if (b.rank !== a.rank) return b.rank - a.rank;
+      // Same title quality: the more-watched (TMDB vote count) title first.
+      return (tmdbCache[`${mode}:${b.s.id}`]?.vote_count || 0) - (tmdbCache[`${mode}:${a.s.id}`]?.vote_count || 0);
     });
     for (const { s } of ranked) {
       if (results.length >= limit) break;
