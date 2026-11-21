@@ -2443,7 +2443,10 @@ const BUZZ_SOURCES = [
 const BUZZ_LANGS = new Set(Object.keys(BUZZ_LANG_NAME));
 const streamingBuzzFile = path.join(DATA_DIR, "streaming-buzz.json");
 let streamingBuzz = (() => {
-  try { return JSON.parse(fs.readFileSync(streamingBuzzFile, "utf8")) || {}; } catch { return {}; }
+  try {
+    const d = JSON.parse(fs.readFileSync(streamingBuzzFile, "utf8")) || {};
+    return d.v === 2 ? d : {}; // older shape (unfiltered, per-platform keys): rebuild instead
+  } catch { return {}; }
 })();
 let streamingBuzzRunning = false;
 async function buildStreamingBuzz({ reason = "cron" } = {}) {
