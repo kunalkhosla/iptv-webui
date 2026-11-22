@@ -2428,7 +2428,6 @@ async function saveIndexToDisk(mode, actx = currentAccount()) {
 // `us_cert` now goes through effCert().
 const effCert = (t) => (t ? (t.us_cert || t.cert_alt || "") : "");
 const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
-const { skipBytes } = require("./lib/skip-bytes");
 const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue");
 const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
 const certBackfill = { running: false, done: 0, total: 0 };
@@ -4709,6 +4708,9 @@ function pruneDownloadCache() {
 }
 setInterval(pruneDownloadCache, 30 * 60 * 1000).unref?.();
 
+// Provider URLs carry credentials; never let them reach logs or job.error.
+const redactUrls = (m) => String(m ?? "").replace(/https?:\/\/[^\s'")]+/g, "<url>");
+
 async function runDownloadJob(job) {
   const { mode, id, actx, key } = job;
   const freeBytes = diskDownloadFreeBytes(DL_DIR);
@@ -4762,45 +4764,36 @@ async function runDownloadJob(job) {
       if (!resp.ok && resp.status !== 206) throw new Error(`HTTP ${resp.status}`);
       if (/^text\//i.test(resp.headers.get("content-type") || "")) throw new Error("provider returned an error page instead of video");
       const resumed = resp.status === 206;
-      // We asked for a Range but got the full body (200): keep what we have and
-      // skip the first startByte bytes of the response instead of truncating.
-      const skipAhead = !resumed && startByte > 0;
       const total = resumed ? Number(resp.headers.get("content-range")?.split("/")?.[1]) || null : Number(resp.headers.get("content-length")) || null;
       fetchNo++;
-      console.log(`[download] ${key} fetch attempt ${fetchNo} start=${startByte} status=${resp.status} total=${total ?? "unknown"}${skipAhead ? " (no Range support: skip-ahead)" : ""}${!resumed && !skipAhead && fetchNo > 1 ? " (RESTART FROM ZERO)" : ""}`);
-      if (skipAhead && total != null && total <= startByte) {
-        try { await resp.body?.cancel(); } catch {}
-        fetched = true; continue; // already have the whole file
-      }
+      const restartZero = !resumed && startByte > 0; // Range sent, provider answered 200: file is truncated
+      console.log(`[download] ${key} fetch attempt ${fetchNo} start=${startByte} status=${resp.status} total=${total ?? "unknown"}${restartZero ? " (RESTART FROM ZERO)" : ""}`);
       if (total) {
         const free = diskDownloadFreeBytes(DL_DIR);
-        const need = (total - ((resumed || skipAhead) ? startByte : 0)) * 1.3 + DL_MIN_FREE_BYTES;
+        const need = (total - (resumed ? startByte : 0)) * 1.3 + DL_MIN_FREE_BYTES;
         if (free == null || free < need) throw Object.assign(new Error("not enough server disk for this title"), { fatal: true });
       }
-      const keep = resumed || skipAhead;
-      job.bytes = keep ? startByte : 0;
-      out = fs.createWriteStream(srcPath, { flags: keep ? "a" : "w" });
+      job.bytes = resumed ? startByte : 0;
+      out = fs.createWriteStream(srcPath, { flags: resumed ? "a" : "w" });
       const source = Readable.fromWeb(resp.body);
-      const body = skipAhead ? skipBytes(startByte) : null;
-      const counted = body || source;
-      counted.on("data", (chunk) => { job.bytes += chunk.length; if (total) job.pct = (job.bytes / total) * 50; touchStream(owner); });
-      if (body) await pipeline(source, body, out); else await pipeline(source, out);
+      source.on("data", (chunk) => { job.bytes += chunk.length; if (total) job.pct = (job.bytes / total) * 50; touchStream(owner); });
+      await pipeline(source, out);
       const actual = fs.statSync(srcPath).size;
       if (actual === 0 || (total != null && actual < total)) throw new Error(`truncated transfer: got ${actual} of ${total} bytes`);
       fetched = true;
       console.log(`[download] ${key} fetch done ${mb(actual)} MB in ${Math.round((Date.now() - fetchT0) / 1000)}s over ${fetchNo} attempt(s)`);
     } catch (e) {
-      console.log(`[download] ${key} fetch dropped: ${e.message} (job.bytes=${mb(job.bytes || 0)} MB, attempt ${fetchNo})`);
+      console.log(`[download] ${key} fetch dropped: ${redactUrls(e.message)} (job.bytes=${mb(job.bytes || 0)} MB, attempt ${fetchNo})`);
       if (out) { try { if (!out.closed) await new Promise((r) => { out.once("close", r); out.destroy(); }); } catch {} }
       streams.delete(owner);
       if (job.cancelled) return;
-      if (e.fatal) { job.state = "failed"; job.error = e.message; return; }
+      if (e.fatal) { job.state = "failed"; job.error = redactUrls(e.message); return; }
       if (ac.signal.aborted) { job.state = "waiting"; job.stage = "waiting-for-viewer"; await sleep(DISK_DOWNLOAD_DISPLACED_RETRY_MS); continue; } // a viewer arrived: resume later
       let grew = false;
       try { grew = fs.statSync(srcPath).size > before; } catch {}
       if (grew) attempt = 0; else attempt++;
-      job.error = e.message;
-      if (attempt > DL_MAX_FETCH_RETRIES) { job.state = "failed"; job.error = `download from provider failed: ${e.message}`; try { fs.rmSync(srcPath, { force: true }); } catch {} return; }
+      job.error = redactUrls(e.message);
+      if (attempt > DL_MAX_FETCH_RETRIES) { job.state = "failed"; job.error = `download from provider failed: ${redactUrls(e.message)}`; try { fs.rmSync(srcPath, { force: true }); } catch {} return; }
       await sleep(Math.min(5000 * Math.max(attempt, 1), 30000));
     }
   }
