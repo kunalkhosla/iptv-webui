@@ -1369,7 +1369,7 @@ function tmdbToResponse(entry) {
     tagline:     entry.tagline || null,
     original_language: entry.original_language || null,
     imdb_id:     entry.imdb_id || null,
-    us_cert:     entry.us_cert || "",
+    us_cert:     effCert(entry),
     collection:  entry.collection || null,
     cast,
     directors:   entry.directors || [],
@@ -2412,6 +2412,125 @@ async function saveIndexToDisk(mode, actx = currentAccount()) {
   }
 }
 
+// ── Effective age rating ─────────────────────────────────────────────
+// TMDB's US rating is missing for ~56% of matched titles, which hid them all
+// from kid profiles (strict allow-list). `cert_alt` is a US-scale equivalent
+// derived from other countries' ratings (most restrictive wins) or, failing
+// that, a conservative "PG" for Family-genre titles. Everything that used
+// `us_cert` now goes through effCert().
+const effCert = (t) => (t ? (t.us_cert || t.cert_alt || "") : "");
+const CERT_ORDER_MOVIE = ["G", "PG", "PG-13", "R", "NC-17"];
+const CERT_ORDER_TV = ["TV-G", "TV-PG", "TV-14", "TV-MA"];
+const ALT_CERT_COUNTRIES = ["GB", "DE", "IN", "AU", "CA", "IE", "FR", "NL", "BR"];
+// Map a foreign rating to an age bucket (0, 6, 12, 15/16, 18) then to the US scale.
+function certAgeBucket(country, raw) {
+  const c = String(raw || "").trim().toUpperCase();
+  if (!c) return null;
+  const num = /(\d{1,2})/.exec(c);
+  const tab = {
+    GB: { U: 0, PG: 6, "12": 12, "12A": 12, "15": 15, "18": 18, R18: 18 },
+    DE: { "0": 0, "6": 6, "12": 12, "16": 16, "18": 18 },
+    IN: { U: 0, UA: 12, A: 18, S: 18 },
+    AU: { G: 0, PG: 6, M: 12, "MA15+": 15, "R18+": 18, "X18+": 18 },
+    CA: { G: 0, PG: 6, "14A": 12, "18A": 16, R: 18, A: 18 },
+    IE: { G: 0, PG: 6, "12A": 12, "12": 12, "15A": 15, "16": 16, "18": 18 },
+    FR: { U: 0, "10": 6, "12": 12, "16": 16, "18": 18 },
+    NL: { AL: 0, "6": 6, "9": 6, "12": 12, "14": 12, "16": 16, "18": 18 },
+    BR: { L: 0, "10": 6, "12": 12, "14": 12, "16": 16, "18": 18 },
+  }[country];
+  if (tab && c in tab) return tab[c];
+  if (country === "IN" && /^UA/.test(c)) return num ? (parseInt(num[1], 10) >= 16 ? 16 : parseInt(num[1], 10) >= 13 ? 12 : 6) : 12;
+  if (num) { const n = parseInt(num[1], 10); return n <= 5 ? 0 : n <= 11 ? 6 : n <= 14 ? 12 : n <= 17 ? 16 : 18; }
+  return null;
+}
+function usEquivalent(mode, age) {
+  if (mode === "series") return age === 0 ? "TV-G" : age <= 6 ? "TV-PG" : age <= 12 ? "TV-14" : "TV-MA";
+  return age === 0 ? "G" : age <= 6 ? "PG" : age <= 12 ? "PG-13" : age <= 16 ? "R" : "NC-17";
+}
+function altCertFromTmdb(mode, results) {
+  let worst = null;
+  for (const r of results || []) {
+    if (!ALT_CERT_COUNTRIES.includes(r.iso_3166_1)) continue;
+    const raws = mode === "series" ? [r.rating] : (r.release_dates || []).map((d) => d.certification);
+    for (const raw of raws) {
+      const a = certAgeBucket(r.iso_3166_1, raw);
+      if (a !== null && (worst === null || a > worst)) worst = a;
+    }
+  }
+  return worst === null ? "" : usEquivalent(mode, worst);
+}
+const certBackfill = { running: false, done: 0, total: 0 };
+async function tmdbRaw(pathAndQuery) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await fetch(`https://api.themoviedb.org/3${pathAndQuery}`, {
+        headers: { Authorization: `Bearer ${TMDB_API_KEY}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (res.status === 429) { await new Promise((r) => setTimeout(r, Math.max(parseInt(res.headers.get("Retry-After") || "5", 10), 3) * 1000)); continue; }
+      if (res.status === 404) return { results: [] };
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; }
+  }
+  return null;
+}
+function refreshIndexCerts() {
+  for (const m of ["movie", "series"]) {
+    const ix = indexes[m];
+    if (!ix?.byId) continue;
+    for (const s of ix.byId.values()) {
+      const c = effCert(tmdbCache[`${m}:${s.id}`]);
+      if (c) s.us_cert = c;
+    }
+  }
+}
+async function backfillAltCerts({ reason = "cron" } = {}) {
+  if (!TMDB_API_KEY) return { ok: false, error: "no TMDB_API_KEY" };
+  if (certBackfill.running) return { ok: false, error: "already running" };
+  certBackfill.running = true;
+  try {
+    const todo = [];
+    for (const [key, e] of Object.entries(tmdbCache)) {
+      if (!e || e.source === "no-match" || !e.tmdb_id || e.us_cert || ("cert_alt" in e)) continue;
+      const [mode] = key.split(":");
+      if (mode === "movie" || mode === "series") todo.push({ key, mode, e });
+    }
+    certBackfill.done = 0; certBackfill.total = todo.length;
+    console.log(`[cert] backfilling alternate ratings for ${todo.length} titles (${reason})`);
+    let i = 0, found = 0, genreRated = 0;
+    await Promise.all(Array.from({ length: 4 }, async () => {
+      while (i < todo.length) {
+        const { key, mode, e } = todo[i++];
+        const res = await tmdbRaw(mode === "series" ? `/tv/${e.tmdb_id}/content_ratings` : `/movie/${e.tmdb_id}/release_dates`);
+        if (res === null) { certBackfill.done++; continue; } // transient failure: retry next run
+        let alt = altCertFromTmdb(mode, res.results);
+        let src = "intl";
+        if (alt) found++;
+        else if ((e.genres || []).includes("Family") && !(e.genres || []).some((g) => ["Horror", "Crime", "Thriller", "War", "Mystery"].includes(g))) {
+          alt = mode === "series" ? "TV-PG" : "PG"; genreRated++; src = "genre";
+        }
+        e.cert_alt = alt; // "" = checked, nothing found
+        if (alt) e.cert_src = src;
+        if (++certBackfill.done % 1500 === 0) {
+          scheduleTmdbCacheSave(); refreshIndexCerts();
+          console.log(`[cert] ${certBackfill.done}/${certBackfill.total} (intl ${found}, family-genre ${genreRated})`);
+        }
+      }
+    }));
+    scheduleTmdbCacheSave(); refreshIndexCerts();
+    console.log(`[cert] done: ${certBackfill.done} checked, ${found} rated from other countries, ${genreRated} by Family genre`);
+    return { ok: true, checked: certBackfill.done, found, genreRated };
+  } finally {
+    certBackfill.running = false;
+  }
+}
+function scheduleAltCerts() {
+  if (!TMDB_API_KEY) return;
+  setTimeout(() => backfillAltCerts({ reason: "boot" }).catch((e) => console.warn(`[cert] ${e.message}`)), 8 * 60 * 1000);
+  setInterval(() => backfillAltCerts().catch((e) => console.warn(`[cert] ${e.message}`)), 6 * 3600 * 1000);
+}
+
 // ── Streaming buzz: what's popular on the big platforms ─────────────
 // The household has no Netflix/Prime/etc, so it never sees what's famous
 // there. TMDB (JustWatch data) tells us, per platform and region, the most
@@ -2667,7 +2786,7 @@ async function loadIndexFromDisk(mode, actx = currentAccount()) {
       s.tags = applyQualityDemotion(mode, s.id, streamTagsFor(s.name, cat));
       if (mode !== "live") {
         const tmdbEntry = tmdbCache[`${mode}:${s.id}`];
-        s.us_cert = tmdbEntry?.us_cert || null;
+        s.us_cert = effCert(tmdbEntry) || null;
         s.tmdb_id = tmdbEntry?.tmdb_id || null;
       }
       // Re-attach audio metadata from qualityCache on every boot so
@@ -2819,7 +2938,7 @@ function projectStream(mode, s, actx = currentAccount()) {
   const projectedId = mode === "series" ? s.series_id : (s.stream_id || s.id);
   let tags = applyQualityDemotion(mode, projectedId, streamTagsFor(s.name, catTags));
   const tmdbEntry = mode !== "live" ? tmdbCache[`${mode}:${projectedId}`] : null;
-  const us_cert = tmdbEntry?.us_cert || null;
+  const us_cert = effCert(tmdbEntry) || null;
   const tmdb_id = tmdbEntry?.tmdb_id || null;
   // Audio metadata: surfaced when the quality cache has been populated
   // for this id (currently movie only — series episodes don't go through
@@ -3457,7 +3576,7 @@ async function buildDiskIndex(actx, rootPath) {
         category_id: catId, category_name: catName,
         container,
         rating: null,
-        us_cert: tmdbEntry?.us_cert || null,
+        us_cert: effCert(tmdbEntry) || null,
         tmdb_id: tmdbEntry?.tmdb_id || null,
         audio_channels: maxCh || null,
         audio_codec: a.audioTracks[0]?.codec || null,
@@ -3485,7 +3604,7 @@ async function buildDiskIndex(actx, rootPath) {
         category_id: group.catId, category_name: group.catName,
         container: null,
         rating: null,
-        us_cert: tmdbEntry?.us_cert || null,
+        us_cert: effCert(tmdbEntry) || null,
         tmdb_id: tmdbEntry?.tmdb_id || null,
         audio_channels: null,
         audio_codec: null,
@@ -5672,7 +5791,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   const tileFor = (s, catName) => {
     if (!s) return null;
     const t = tmdbFor(s.id);
-    let cert = t?.us_cert || null;
+    let cert = effCert(t) || null;
     if (!cert && (mode === "movie" || mode === "disk") && catName && KID_CAT_RE.test(catName)) {
       cert = "G";
     }
@@ -5725,7 +5844,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       backdrop: t?.backdrop_path ? `https://image.tmdb.org/t/p/w1280${t.backdrop_path}` : null,
       rating: t?.rating || null,
       runtime: t?.runtime || null,
-      us_cert: t?.us_cert || null,
+      us_cert: effCert(t) || null,
       isSeriesGroup: s.isSeriesGroup || undefined,
     };
   };
@@ -6193,7 +6312,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     const familyTiles = [...indexes[mode].byId.values()]
       .filter((s) => titleLangPasses(s.name) && !variantHidden(s))
       .map((s) => ({ s, t: tmdbFor(s.id) }))
-      .filter((x) => x.t && x.t.us_cert && FAMILY_CERTS.has(x.t.us_cert))
+      .filter((x) => x.t && effCert(x.t) && FAMILY_CERTS.has(effCert(x.t)))
       .sort((a, b) => {
         const ca = (a.s.tags || []).includes("cam") ? 1 : 0;
         const cb = (b.s.tags || []).includes("cam") ? 1 : 0;
@@ -6597,7 +6716,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   const HERO_ADULT_RE = /\b(?:adult|xxx|porn|porno|erotic|18\+|nsfw|hentai|playboy|hustler|brazzers|naked|nude|sex|onlyfans|fetish|kink|swingers?)\b/i;
   const catNameById = new Map(cats.map(c => [String(c.category_id), c.category_name || ""]));
   const isAdultForHero = (s) => {
-    const cert = tmdbFor(s.id)?.us_cert || s.us_cert;
+    const cert = effCert(tmdbFor(s.id)) || s.us_cert;
     if (cert && HERO_ADULT_CERTS.has(cert)) return true;
     if (s.name && HERO_ADULT_RE.test(s.name)) return true;
     const cn = catNameById.get(String(s.category_id)) || "";
@@ -6790,7 +6909,7 @@ app.get("/api/collection/:lang/:mode(movie|series)", (req, res) => {
       icon: s.icon || null,
       year: s.year || null,
       poster: t?.poster_path ? `https://image.tmdb.org/t/p/w154${t.poster_path}` : null,
-      us_cert: t?.us_cert || null,
+      us_cert: effCert(t) || null,
       tags: s.tags || ["other"],
       container: s.container || null,
       audio_channels: s.audio_channels ?? null,
@@ -7708,7 +7827,7 @@ app.get("/api/search/all", async (req, res, next) => {
             // "…for the kids" narrows VOD to family certs even on an
             // adult profile. Live carries no certs, so it's left as-is
             // (kid profiles are already gated upstream).
-            const kidPass = (t) => t.us_cert && FAMILY_CERTS.has(t.us_cert);
+            const kidPass = (t) => effCert(t) && FAMILY_CERTS.has(effCert(t));
             rerun.movie = rerun.movie.filter(kidPass);
             rerun.series = rerun.series.filter(kidPass);
           }
@@ -8636,7 +8755,7 @@ function tasteCandidatesFor(state, profile, mode, excludeIds, cap = 150) {
     const t = tmdbCache[`${mode}:${s.id}`];
     if (!t || t.source === "no-match" || !t.tmdb_id) continue;
     if (seenTmdb.has(t.tmdb_id)) continue;
-    if (kidBlocked({ us_cert: t.us_cert || s.us_cert })) continue;
+    if (kidBlocked({ us_cert: effCert(t) || s.us_cert })) continue;
     seenTmdb.add(t.tmdb_id);
     pool.push({ s, t });
   }
@@ -8690,7 +8809,7 @@ function refineBatchFor(state, profile, mode, cap = 30) {
     const t = tmdbCache[`${mode}:${s.id}`];
     if (!t || t.source === "no-match" || !t.tmdb_id) continue;
     if (seenTmdb.has(t.tmdb_id)) continue;
-    if (kidBlocked({ us_cert: t.us_cert || s.us_cert })) continue;
+    if (kidBlocked({ us_cert: effCert(t) || s.us_cert })) continue;
     seenTmdb.add(t.tmdb_id);
     const genre = (Array.isArray(t.genres) && t.genres[0]) || "other";
     const lang = t.original_language || "?";
@@ -10642,6 +10761,11 @@ app.post("/api/admin/retry-tmdb-no-matches", (req, res) => {
 // Rebuild the AI taste profiles ("For You" rail) on demand — for
 // testing and for warming a fresh deploy without waiting for the
 // 4:15 AM cron. Runs the exact same job.
+app.post("/api/admin/backfill-alt-certs", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  backfillAltCerts({ reason: "admin" }).catch((e) => console.warn(`[cert] ${e.message}`));
+  res.json({ ok: true, started: true, progress: certBackfill });
+});
 app.post("/api/admin/rebuild-streaming-buzz", (req, res) => {
   if (!requireOwner(req, res)) return;
   // ~1 min of serial TMDB calls: run in the background (a Cloudflare request would time out).
@@ -10677,7 +10801,7 @@ app.get("/api/refine/candidates/:mode(movie|series)", (req, res) => {
       icon: s.icon || null,
       year: s.year || null,
       poster: t?.poster_path ? `https://image.tmdb.org/t/p/w154${t.poster_path}` : null,
-      us_cert: t?.us_cert || null,
+      us_cert: effCert(t) || null,
       tags: s.tags || ["other"],
       container: s.container || null,
     };
@@ -12343,4 +12467,5 @@ app.listen(PORT, async () => {
   scheduleEditorialRailsWeekly();
   scheduleTonightNightly();
   scheduleStreamingBuzz();
+  scheduleAltCerts();
 });
