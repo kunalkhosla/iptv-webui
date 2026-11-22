@@ -1444,6 +1444,14 @@ function cleanPanelTitle(name, opts = {}) {
 // as a token match (dot OR space delimited, not just parens) and strip
 // dots more aggressively here, since this key is dedup-only and never
 // sent to TMDB (unlike cleanPanelTitle's output).
+// dedupTitleKey runs ~6 regexes; it is called for every title on every home/search
+// request, so memoize it per stream object (names are immutable per object).
+const dedupKeyCache = new WeakMap();
+function dedupKeyOf(s) {
+  let k = dedupKeyCache.get(s);
+  if (k === undefined) { k = dedupTitleKey(s.name); dedupKeyCache.set(s, k); }
+  return k;
+}
 function dedupTitleKey(name) {
   const raw = String(name || "");
   const yearMatch = raw.match(/\((19|20)\d{2}\)/) || raw.match(/[.\s](19|20)\d{2}(?=[.\s]|$)/);
@@ -2514,6 +2522,8 @@ function scheduleAltCerts() {
 // English comes from the US catalogs; Hindi and Punjabi from the India
 // catalogs (they differ from the US ones). Filtered by the TITLE's original
 // language, so a Korean show on Netflix never appears.
+const catBucketCache = new Map(); // gate signature -> { byId, at, map } (category grouping, see /api/home)
+const smartPoolCache = new Map(); // gate signature -> { byId, at, pool } (see /api/home)
 const BUZZ_LANG_NAME = { en: "English", hi: "Hindi", pa: "Punjabi" };
 const BUZZ_PLATFORMS_US = [
   ["netflix", "Netflix", 8], ["prime", "Prime Video", 9], ["max", "HBO Max", 1899], ["disney", "Disney+", 337],
@@ -5869,15 +5879,29 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   );
 
   // Group eligible items by category in one pass over the index.
-  const byCat = new Map();
-  for (const s of ix.byId.values()) {
-    const cid = String(s.category_id || "");
-    if (!allowedCatIds.has(cid)) continue;
-    if (!titleLangPasses(s.name)) continue;
-    if (variantHidden(s)) continue;
-    let bucket = byCat.get(cid);
-    if (!bucket) { bucket = []; byCat.set(cid, bucket); }
-    bucket.push(s);
+  // Cached per gate signature (language/kid/account) like the smart pool: the
+  // grouping is request-independent and costs a regex test per catalog item.
+  const gateSig = [
+    mode, onboarded ? [...onboardedKeys].sort().join(",") : "-",
+    allowedKidCerts ? [...allowedKidCerts].sort().join(",") : "-",
+    accountKeyOf(currentAccount()),
+  ].join("|");
+  let byCat;
+  const cachedCats = catBucketCache.get(gateSig);
+  if (cachedCats && cachedCats.byId === ix.byId && Date.now() - cachedCats.at < 8 * 60 * 1000) {
+    byCat = new Map(cachedCats.map); // shallow copy: callers replace entries with their sliced items
+  } else {
+    byCat = new Map();
+    for (const s of ix.byId.values()) {
+      const cid = String(s.category_id || "");
+      if (!allowedCatIds.has(cid)) continue;
+      if (!titleLangPasses(s.name)) continue;
+      if (variantHidden(s)) continue;
+      let bucket = byCat.get(cid);
+      if (!bucket) { bucket = []; byCat.set(cid, bucket); }
+      bucket.push(s);
+    }
+    catBucketCache.set(gateSig, { byId: ix.byId, at: Date.now(), map: new Map(byCat) });
   }
   // For kid profiles: sort each bucket so cert-passing items come first,
   // then slice to 12. Without this the cap picks the first 12 by index
@@ -5901,7 +5925,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     const out = [];
     let totalEligible = 0;
     for (const s of bucket) {
-      const titleKey = dedupTitleKey(s.name);
+      const titleKey = dedupKeyOf(s);
       if (titleKey && seenTitle.has(titleKey)) continue;
       if (s.tmdb_id) {
         if (seenTmdb.has(s.tmdb_id)) continue;
@@ -5930,7 +5954,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     if (mode !== "live" && allowedKidCerts === null) {
       const sT = new Set(), sK = new Set();
       bucket = rawBucket.filter((s) => {
-        const tk = dedupTitleKey(s.name);
+        const tk = dedupKeyOf(s);
         if ((tk && sK.has(tk)) || (s.tmdb_id && sT.has(s.tmdb_id))) return false;
         if (tk) sK.add(tk);
         if (s.tmdb_id) sT.add(s.tmdb_id);
@@ -6492,31 +6516,45 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // panel ordering is stable enough that the "primary" listing
     // tends to land first. Items without tmdb_id are skipped entirely
     // (the smart rails are TMDB-driven).
-    const pool = [];
-    const seenTmdb = new Set();
-    for (const s of ix.byId.values()) {
-      if (!titleLangPasses(s.name)) continue;
-      if (variantHidden(s)) continue;
-      const t = tmdbBy(s);
-      if (!t || t.source === "no-match") continue;
-      if (t.tmdb_id) {
-        if (seenTmdb.has(t.tmdb_id)) continue;
-        seenTmdb.add(t.tmdb_id);
+    // The pool depends only on the catalog, the TMDB cache and this profile's
+    // language/kid gates — not on the request — so cache it per gate signature
+    // (rebuilding it dominated /api/home: ~44k tileFor calls per request).
+    const cachedPool = smartPoolCache.get(gateSig);
+    let pool, poolV, poolR;
+    if (cachedPool && cachedPool.byId === ix.byId && Date.now() - cachedPool.at < 8 * 60 * 1000) {
+      pool = cachedPool.pool; poolV = cachedPool.byVotes; poolR = cachedPool.byRating;
+    } else {
+      pool = [];
+      const seenTmdb = new Set();
+      for (const s of ix.byId.values()) {
+        if (!titleLangPasses(s.name)) continue;
+        if (variantHidden(s)) continue;
+        const t = tmdbBy(s);
+        if (!t || t.source === "no-match") continue;
+        if (t.tmdb_id) {
+          if (seenTmdb.has(t.tmdb_id)) continue;
+          seenTmdb.add(t.tmdb_id);
+        }
+        // Reuse tileFor for the kid-cert + soft-NR logic. catName is
+        // null because these tiles came from the smart pool, not a
+        // specific panel category.
+        const tile = tileFor(s, null);
+        if (!tile) continue;
+        if (isKidBlocked(tile)) continue;
+        pool.push({ s, t, tile });
       }
-      // Reuse tileFor for the kid-cert + soft-NR logic. catName is
-      // null because these tiles came from the smart pool, not a
-      // specific panel category.
-      const tile = tileFor(s, null);
-      if (!tile) continue;
-      if (isKidBlocked(tile)) continue;
-      pool.push({ s, t, tile });
+      for (const p of pool) p.tvm = Array.isArray(p.t.genres) && p.t.genres.includes("TV Movie");
+      // Pre-sorted views, so rails filter an already-ordered list instead of sorting 10-20k items each.
+      const byVotes = [...pool].sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0));
+      const byRating = [...pool].sort((a, b) => (b.t.rating || 0) - (a.t.rating || 0));
+      smartPoolCache.set(gateSig, { byId: ix.byId, at: Date.now(), pool, byVotes, byRating });
+      poolV = byVotes; poolR = byRating;
     }
     // TV Movie is a TMDB genre that lumps in straight-to-streaming
     // / made-for-cable productions, which would crowd out theatrical
     // titles on every genre rail if left in. Drop them from the
     // discovery layer entirely; they still surface via panel rails.
-    const notTvMovie = (p) =>
-      !(Array.isArray(p.t.genres) && p.t.genres.includes("TV Movie"));
+    const notTvMovie = (p) => !p.tvm;
 
     const surfacedIds = new Set();
     // RAIL_CAP caps the items emitted in the rail payload to keep the
@@ -6552,19 +6590,17 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     const thisYear = String(new Date().getFullYear());
     addRail(
       `New on Khouch · ${thisYear}`,
-      pool
+      poolV
         .filter(p => p.t.year === thisYear)
-        .filter(notTvMovie)
-        .sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0)),
+        .filter(notTvMovie),
     );
 
     // Critically acclaimed — high rating, real audience size
     addRail(
       "Critically Acclaimed",
-      pool
+      poolR
         .filter(p => (p.t.rating || 0) >= 7.5 && (p.t.vote_count || 0) >= 500)
-        .filter(notTvMovie)
-        .sort((a, b) => (b.t.rating || 0) - (a.t.rating || 0)),
+        .filter(notTvMovie),
     );
 
     // Per-genre rails. Order is rough "broad → niche" so the most
@@ -6574,10 +6610,9 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     for (const g of ["Action", "Comedy", "Drama", "Thriller", "Horror",
                      "Romance", "Science Fiction", "Animation", "Family",
                      "Documentary"]) {
-      addRail(g, pool
+      addRail(g, poolV
         .filter(p => Array.isArray(p.t.genres) && p.t.genres.includes(g))
-        .filter(notTvMovie)
-        .sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0)));
+        .filter(notTvMovie));
     }
 
     // Decade flashbacks — only the most distinctive decades show.
@@ -6667,10 +6702,9 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       const dirName = top(dirCount, 1);
       const actName = top(actCount, 2);
       const peopleRail = (title, test) => {
-        const items = pool
+        const items = poolR
           .filter(p => !watchedSet.has(p.s.id) && !watchedTmdb.has(p.t.tmdb_id) && (p.t.vote_count || 0) >= 100 && test(p.t))
-          .filter(notTvMovie)
-          .sort((a, b) => (b.t.rating || 0) - (a.t.rating || 0));
+          .filter(notTvMovie);
         if (items.length < 4) return;
         rails.push({ title, total: items.length, items: items.slice(0, 40).map(p => p.tile) });
       };
@@ -6680,23 +6714,20 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       }
       // Runtime-shaped rails — the daypart weights below decide which
       // one leads (weeknights: quick; weekends: epics).
-      addRail("Quick watch · under 100 min", pool
+      addRail("Quick watch · under 100 min", poolV
         .filter(p => p.t.runtime >= 70 && p.t.runtime <= 100 && (p.t.rating || 0) >= 6.3 && (p.t.vote_count || 0) >= 300)
-        .filter(notTvMovie)
-        .sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0)));
-      addRail("Weekend epics · 2.5h+", pool
+        .filter(notTvMovie));
+      addRail("Weekend epics · 2.5h+", poolV
         .filter(p => p.t.runtime >= 150 && (p.t.rating || 0) >= 7 && (p.t.vote_count || 0) >= 500)
-        .filter(notTvMovie)
-        .sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0)));
+        .filter(notTvMovie));
     }
 
     // Long-tail discovery — high-quality stuff most people haven't
     // heard of (low vote_count). Built last; the smart-block shuffle
     // below may move it.
-    addRail("Hidden Gems", pool
+    addRail("Hidden Gems", poolR
       .filter(p => (p.t.rating || 0) >= 7 && (p.t.vote_count || 0) >= 50 && (p.t.vote_count || 0) < 500)
-      .filter(notTvMovie)
-      .sort((a, b) => (b.t.rating || 0) - (a.t.rating || 0)));
+      .filter(notTvMovie));
 
     // Mood / occasion rails — deterministic rules over cached TMDB data (genres,
     // keywords, rating, votes, runtime, cert). Overlap with genre rails on
@@ -6734,8 +6765,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
         .map((m, i) => ({ m, k: i + moodRng() * 6 - (m.dp === dpNow ? 3 : 0) }))
         .sort((x, y) => x.k - y.k).slice(0, 3);
       for (const { m } of ranked) {
-        const items = pool.filter(notTvMovie).filter((p) => m.test(p))
-          .sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0)).slice(0, 80);
+        const items = poolV.filter(notTvMovie).filter((p) => m.test(p)).slice(0, 80);
         const jittered = jitterOrder(items, seededRng(`mood-items:${visitSeed}:${req.profileId}:${m.title}`), 30);
         rails.push({ title: m.title, total: Math.min(items.length, 40), items: jittered.slice(0, 40).map((p) => p.tile) });
       }
@@ -6870,7 +6900,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   for (const items of byCat.values()) {
     for (const s of items.slice(0, 5)) {
       if (seen.has(s.id) || !s.icon) continue;
-      const titleKey = dedupTitleKey(s.name);
+      const titleKey = dedupKeyOf(s);
       if (titleKey && seenTitle.has(titleKey)) continue;
       if (s.tmdb_id && seenTmdb.has(s.tmdb_id)) continue;
       if (isAdultForHero(s)) { seen.add(s.id); continue; }
@@ -7697,7 +7727,7 @@ app.get("/api/search/all", async (req, res, next) => {
       // and "Kohrra (Hindi)" both survive as separate results; "Kohrra
       // (Tamil)"/"(Telugu)" were already rejected above and never reach
       // this point.
-      const titleKey = dedupTitleKey(s.name);
+      const titleKey = dedupKeyOf(s);
       const dedupKey = titleKey ? `${titleKey}::${suffix || "_"}` : null;
       if (dedupKey && seenTitle.has(dedupKey)) return false;
       if (s.tmdb_id) {
@@ -7778,7 +7808,7 @@ app.get("/api/search/all", async (req, res, next) => {
           if (castOnly >= limit * 10) continue;
           castOnly++;
         }
-        matches.push({ s, t, dtKey: dedupTitleKey(s.name), titleScore });
+        matches.push({ s, t, dtKey: dedupKeyOf(s), titleScore });
         if (matches.length >= 60000) break;
       }
       // Rank: how well the title matches first (exact > prefix > whole words
@@ -7810,7 +7840,7 @@ app.get("/api/search/all", async (req, res, next) => {
       // contains the word ("The Sholay Girl"); a prefix beats a mid-title hit.
       const tj = normalizeForSearch(cleanPanelTitle(s.name || "") || s.name || "");
       const bonus = tj === normQ ? 10 : tj.startsWith(normQ + " ") ? 5 : (" " + tj + " ").includes(" " + normQ + " ") ? 2 : 0;
-      ranked.push({ s, rank: rank + bonus, dtKey: dedupTitleKey(s.name) });
+      ranked.push({ s, rank: rank + bonus, dtKey: dedupKeyOf(s) });
     }
     // Same-titleKey candidates (dub variants of one show) tiebreak on
     // langRank instead of raw rank — see the comment on langRank above —
@@ -7841,7 +7871,7 @@ app.get("/api/search/all", async (req, res, next) => {
         // reasoning as the faceted-match pass above: it has to run AFTER
         // the sort below so a dub-cluster's language tiebreak sees every
         // sibling, not just whichever the raw scan reached first.
-        tagged.push({ s, vc: t.vote_count || 0, dtKey: dedupTitleKey(s.name) });
+        tagged.push({ s, vc: t.vote_count || 0, dtKey: dedupKeyOf(s) });
       }
       tagged.sort((a, b) => {
         if (a.dtKey && a.dtKey === b.dtKey) return langRank(a.s) - langRank(b.s);
@@ -8250,7 +8280,7 @@ app.get("/api/:mode(live|movie|series|disk)/streams", async (req, res, next) => 
         // tmdb_id to collide on (see dedupTitleKey) — checked first so
         // an un-enriched duplicate of an already-kept enriched item is
         // rejected too, not just the reverse.
-        const titleKey = dedupTitleKey(s.name);
+        const titleKey = dedupKeyOf(s);
         if (titleKey && seenTitle.has(titleKey)) return false;
         if (s.tmdb_id) {
           if (seenTmdb.has(s.tmdb_id)) return false;
