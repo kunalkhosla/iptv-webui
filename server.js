@@ -6109,6 +6109,11 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     const clock = (ms) => new Date(ms).toLocaleTimeString("en-US", { timeZone: DISK_DOWNLOAD_WINDOW_TZ, hour: "numeric", minute: "2-digit" });
     const seenEpg = new Set();
     const onNow = [], soon = [];
+    // Guide channel ids of favourite/recent streams (any HD/SD copy counts).
+    const favEpg = new Set();
+    for (const s of ix.byId.values()) if (s.epg_channel_id && fav.has(String(s.id))) favEpg.add(s.epg_channel_id);
+    // First programme whose stop is after `t` (arrays are sorted by start).
+    const firstEnding = (arr, t) => { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m].stop > t) hi = m; else lo = m + 1; } return lo; };
     for (const s of ix.byId.values()) {
       const eid = s.epg_channel_id;
       if (!eid || seenEpg.has(eid)) continue;
@@ -6116,16 +6121,16 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       const progs = epgIndex.get(eid);
       if (!progs || !progs.length) continue;
       seenEpg.add(eid);
-      const idx = progs.findIndex((p) => p.stop > nowMs);
-      if (idx < 0) continue;
+      const idx = firstEnding(progs, nowMs);
+      if (idx >= progs.length) continue;
       const cur = progs[idx].start <= nowMs ? progs[idx] : null;
       const nxt = cur ? progs[idx + 1] : progs[idx];
-      if (cur && !NOT_RE.test(cur.title)) {
+      if (cur && cur.title && !NOT_RE.test(cur.title)) {
         const dur = (cur.stop - cur.start) / 60000;
-        const score = (fav.has(String(s.id)) ? 5 : 0) + (SPORT_RE.test(cur.title) ? 3 : 0) + (dur >= 90 ? 2 : 0);
+        const score = (favEpg.has(eid) ? 5 : 0) + (SPORT_RE.test(cur.title) ? 3 : 0) + (dur >= 90 ? 2 : 0);
         onNow.push({ s, cur, score });
       }
-      if (nxt && nxt.start > nowMs && nxt.start - nowMs <= 3 * 3600e3 && !NOT_RE.test(nxt.title)
+      if (nxt && nxt.title && nxt.start > nowMs && nxt.start - nowMs <= 3 * 3600e3 && !NOT_RE.test(nxt.title)
           && (SPORT_RE.test(nxt.title) || (nxt.stop - nxt.start) / 60000 >= 90)) {
         soon.push({ s, nxt });
       }
@@ -6210,26 +6215,33 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     }
   }
 
-  // Popular in your house — titles most profiles in this household have been
-  // watching lately (3 weeks). Needs at least 2 profiles on a title; the usual
-  // language/kid/variant gates apply per viewing profile.
-  if ((mode === "movie" || mode === "series") && ix.byId) {
+  // Popular in your house — titles at least 2 profiles of THIS household (same
+  // login) have watched in the last 3 weeks. Who watched what comes from each
+  // profile's recents/progress/lastEpisode/watched; when comes from the
+  // household's per-title last-played timestamps (a finished movie drops out of
+  // `progress`, so progress alone misses it). Variants of a title count as one.
+  if ((mode === "movie" || mode === "series") && ix.byId && req.user) {
     const since = Date.now() - 21 * 86400000;
-    const tally = new Map(); // stream id -> { viewers:Set, last }
+    const lp = getLastPlayedFor(currentAccount())[mode] || {};
+    const tally = new Map(); // canonical stream id -> { viewers:Set, last }
+    const canonId = (id) => { const s0 = ix.byId.get(id); return s0 ? (s0.isAlt ? s0.canonicalId : id) : null; };
     const bump = (id, pid, t) => {
-      if (!ix.byId.has(id) || !(t > since)) return;
-      const e = tally.get(id) || { viewers: new Set(), last: 0 };
-      e.viewers.add(pid); e.last = Math.max(e.last, t); tally.set(id, e);
+      const cid = canonId(id);
+      if (cid == null || !(t > since)) return;
+      const e = tally.get(cid) || { viewers: new Set(), last: 0 };
+      e.viewers.add(pid); e.last = Math.max(e.last, t); tally.set(cid, e);
     };
     for (const pr of profiles.profiles) {
+      if (pr.ownerUserId !== req.user.id) continue;
       const st = getProfileState(pr.id);
-      if (mode === "movie") {
-        for (const [k, v] of Object.entries(st.progress || {})) {
-          if (k.startsWith("movie:")) bump(parseInt(k.slice(6), 10), pr.id, v?.t || 0);
-        }
-      } else {
-        for (const [sid, le] of Object.entries(st.lastEpisode || {})) bump(parseInt(sid, 10), pr.id, le?.when || 0);
+      const seenIds = new Set();
+      (st.recents?.[mode] || []).forEach((id) => seenIds.add(parseInt(id, 10)));
+      for (const k of Object.keys(st.progress || {})) if (k.startsWith(mode + ":")) seenIds.add(parseInt(k.slice(mode.length + 1), 10));
+      for (const w of st.watched || []) { const w2 = String(w); if (w2.startsWith(mode + ":")) seenIds.add(parseInt(w2.slice(mode.length + 1), 10)); }
+      for (const [sid, le] of Object.entries(st.lastEpisode || {})) {
+        if (mode === "series") bump(parseInt(sid, 10), pr.id, le?.when || 0);
       }
+      for (const id of seenIds) if (Number.isFinite(id)) bump(id, pr.id, lp[id] || lp[String(id)] || 0);
     }
     const tiles = [...tally.entries()]
       .filter(([, e]) => e.viewers.size >= 2)
@@ -6698,8 +6710,8 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
         { title: "Date night", dp: "late", test: (p) => has(p, "Romance") && !has(p, "Horror") && good(p, 6.5, 800) },
         { title: "On the edge of your seat", dp: "late", test: (p) => has(p, "Thriller", "Mystery") && !has(p, "Family") && good(p, 6.8, 1500) },
         { title: "Feel-good and funny", dp: "weeknight", test: (p) => has(p, "Comedy") && !has(p, "Horror", "Crime") && good(p, 6.8, 1000) },
-        { title: "Mind-bending", dp: "late", test: (p) => (kw(p, "plot twist", "time travel", "dystopia", "alternate reality", "parallel world", "mind") || (has(p, "Science Fiction") && has(p, "Mystery"))) && good(p, 7, 1500) },
-        { title: "Based on a true story", dp: "weeknight", test: (p) => kw(p, "based on true story", "true story", "biography", "based on real") && good(p, 6.8, 800) },
+        { title: "Mind-bending", dp: "late", test: (p) => (kw(p, "plot twist", "time travel", "dystopia", "alternate reality", "parallel world", "mind-bending", "mind bending") || (has(p, "Science Fiction") && has(p, "Mystery"))) && good(p, 7, 1500) },
+        { title: "Based on a true story", dp: "weeknight", test: (p) => kw(p, "true story", "biography", "based on real") && good(p, 6.8, 800) },
         { title: "Big, epic and award-worthy", dp: "weekend", test: (p) => p.t.runtime >= 140 && good(p, 7.5, 3000) },
         { title: "Bollywood blockbusters", dp: "weekend", test: (p) => p.t.original_language === "hi" && good(p, 6.5, 300) },
         { title: "Punjabi hits", dp: "weekend", test: (p) => p.t.original_language === "pa" && good(p, 5.5, 20) },
@@ -6712,18 +6724,20 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       ];
       const dpNow = currentDaypart();
       const moodRng = seededRng(`mood:${visitSeed}:${req.profileId}:${mode}`);
-      const built = [];
-      for (const m of MOODS) {
+      const isKidProfile = allowedKidCerts !== null;
+      const hasAtLeast = (test, n) => { let c = 0; for (const p of pool) { if (notTvMovie(p) && test(p) && ++c >= n) return true; } return false; };
+      const eligible = MOODS
+        .filter((m) => !(isKidProfile && ["Date night", "On the edge of your seat"].includes(m.title)))
+        .filter((m) => !rails.some((r) => r.title === m.title))
+        .filter((m) => hasAtLeast(m.test, 10));
+      const ranked = eligible
+        .map((m, i) => ({ m, k: i + moodRng() * 6 - (m.dp === dpNow ? 3 : 0) }))
+        .sort((x, y) => x.k - y.k).slice(0, 3);
+      for (const { m } of ranked) {
         const items = pool.filter(notTvMovie).filter((p) => m.test(p))
           .sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0)).slice(0, 80);
-        if (items.length >= 10) built.push({ m, items });
-      }
-      const ranked = built
-        .map((b, i) => ({ b, k: i + moodRng() * 6 - (b.m.dp === dpNow ? 3 : 0) }))
-        .sort((x, y) => x.k - y.k).slice(0, 3);
-      for (const { b } of ranked) {
-        const jittered = jitterOrder(b.items, seededRng(`mood-items:${visitSeed}:${req.profileId}:${b.m.title}`), 30);
-        rails.push({ title: b.m.title, total: b.items.length, items: jittered.slice(0, 40).map((p) => p.tile) });
+        const jittered = jitterOrder(items, seededRng(`mood-items:${visitSeed}:${req.profileId}:${m.title}`), 30);
+        rails.push({ title: m.title, total: Math.min(items.length, 40), items: jittered.slice(0, 40).map((p) => p.tile) });
       }
     }
 
@@ -11437,8 +11451,9 @@ function nextAltVariant(mode, id, tried) {
   // Same audio language first (the viewer picked it), then any; never a CAM
   // rip unless the failed one was a CAM too.
   const ok = cands.filter((c) => !isCam(c) || isCam(me));
-  const same = ok.filter((c) => c.audioLang && c.audioLang === me.audioLang);
-  return (same[0] || ok[0] || null);
+  // Never a different language than the one the viewer chose (when known).
+  if (me.audioLang) return ok.find((c) => c.audioLang === me.audioLang || c.audioLang === "multi") || null;
+  return ok[0] || null;
 }
 async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel = null, respawn = null, audioTrack = 0, swFallback = false) {
   audioTrack = normalizeAudioTrack(audioTrack);
@@ -11479,7 +11494,7 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
   // lookup misses and we fall back to mp4 — matches the equivalent
   // probe-fallback in /api/download for the same reason.
   // A failed-over movie reads from an alternate variant's stream id.
-  const srcId = (mode === "movie" && sourceOverride.get(key)) || id;
+  const srcId = (mode === "movie" && sourceOverride.get(`${mode}:${id}`)) || id;
   let ext;
   if (mode === "live") {
     ext = "m3u8";
@@ -11839,27 +11854,34 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
       // machine-gunning ffmpeg at a dead input.
       if (connectFail && !entry.everConnected && !entry.stopping) {
         // Before tripping the breaker: another copy of this movie may be alive.
-        if (recentViewer && mode === "movie") {
-          const ft = failoverTried.get(key) || { tried: new Set(), at: Date.now() };
-          ft.tried.add(String(sourceOverride.get(key) || id)); ft.at = Date.now();
-          failoverTried.set(key, ft);
+        // Only on an HTTP-error/empty-file signature (not a slot lock or bad seek).
+        const deadLink = /(Server returned (4|5)\d\d|HTTP error (4|5)\d\d|Invalid data found|End of file|404 Not Found|403 Forbidden)/i.test(tail || "");
+        if (recentViewer && mode === "movie" && deadLink) {
+          const fk = `${mode}:${id}`;
+          const ft = failoverTried.get(fk) || { tried: new Set(), at: Date.now() };
+          ft.tried.add(String(sourceOverride.get(fk) || id)); ft.at = Date.now();
+          failoverTried.set(fk, ft);
           const alt = nextAltVariant(mode, id, ft.tried);
           if (alt && ft.tried.size <= 4) {
-            console.log(`[transcode ${key}] source ${sourceOverride.get(key) || id} unavailable — failing over to variant ${alt.id} (${alt.name})`);
-            sourceOverride.set(key, alt.id);
+            console.log(`[transcode ${key}] source ${sourceOverride.get(fk) || id} unavailable — failing over to variant ${alt.id} (${alt.name})`);
+            sourceOverride.set(fk, alt.id);
             transcoders.delete(key);
             fs.rmSync(dir, { recursive: true, force: true });
-            spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel, null, audioTrack, !!entry.swTried)
+            // Single-flight: a manifest retry during the drain must not start a second ffmpeg.
+            // audioTrack resets to 0 — the alternate's track layout is unknown.
+            const p = spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel, null, 0, !!entry.swTried)
               .catch((e) => {
                 console.log(`[transcode ${key}] failover spawn failed: ${e?.message || e}`);
                 transcoders.delete(key);
                 fs.rmSync(dir, { recursive: true, force: true });
-              });
+              })
+              .finally(() => { if (transcoderInflight.get(key) === p) transcoderInflight.delete(key); });
+            transcoderInflight.set(key, p);
             return;
           }
         }
         transcoderFailures.set(key, Date.now());
-        sourceOverride.delete(key); failoverTried.delete(key);
+        sourceOverride.delete(`${mode}:${id}`); failoverTried.delete(`${mode}:${id}`);
       }
       transcoders.delete(key);
       fs.rmSync(dir, { recursive: true, force: true });
@@ -11916,8 +11938,9 @@ setInterval(() => {
     }
   }
   // Drop failover bookkeeping for keys that are gone (10 min).
-  for (const [key, ft] of failoverTried) {
-    if (!transcoders.has(key) && now - ft.at > 10 * 60 * 1000) { failoverTried.delete(key); sourceOverride.delete(key); }
+  for (const [fk, ft] of failoverTried) {
+    const live = [...transcoders.keys()].some((k) => k.startsWith(fk.replace(":", "-") + "-"));
+    if (!live && now - ft.at > 10 * 60 * 1000) { failoverTried.delete(fk); sourceOverride.delete(fk); }
   }
 }, 30_000);
 
