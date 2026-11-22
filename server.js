@@ -944,22 +944,39 @@ function probeChannelAudioCodec(mode, id, actx = currentAccount()) {
 // shape but over the panel URL instead of a local path. Empty/failed
 // probes aren't cached so they retry; a successful one is persisted.
 const panelTracksProbeInflight = new Map();
-// True when a network probe would compete for the provider's single
-// connection: a viewer is streaming, or another probe is already running.
-function panelProbeBusy(actx) {
-  return streamingNow(actx) || panelTracksProbeInflight.size > 0 || audioProbeInflight.size > 0;
+// True when a viewer is ACTIVELY streaming (touched within windowMs), unlike
+// streamingNow which also counts a stale previous stream inside the idle grace.
+function streamingRecently(actx, windowMs = 20000) {
+  return streamingRecentlyIn(streams, actx ? accountKeyOf(actx) : null, windowMs);
 }
-function probePanelTracks(mode, id, ext, actx = currentAccount()) {
+function anyProbeInflight() {
+  return panelTracksProbeInflight.size > 0 || audioProbeInflight.size > 0;
+}
+// Guarded entry: never opens a panel connection while a viewer is actively
+// streaming (returns {audioTracks: [], busy: true}, uncached), and never runs
+// two probes at once (waits, bounded, for the in-flight one first).
+async function probePanelTracks(mode, id, ext, actx = currentAccount()) {
   const key = `${mode}:${id}`;
-  const cached = panelTracksCache[key];
-  if (cached && typeof cached.ts === "number" && Date.now() - cached.ts < PROBE_ALIVE_TTL_MS) {
-    return Promise.resolve(cached);
-  }
+  const fresh = () => {
+    const c = panelTracksCache[key];
+    return c && typeof c.ts === "number" && Date.now() - c.ts < PROBE_ALIVE_TTL_MS ? c : null;
+  };
+  if (fresh()) return fresh();
   if (panelTracksProbeInflight.has(key)) return panelTracksProbeInflight.get(key);
-  // The provider allows ONE connection per account: never open a probe
-  // connection while a viewer holds the slot, nor alongside another probe.
-  // Empty (uncached) result; clients tolerate an empty audioTracks list.
-  if (panelProbeBusy(actx)) return Promise.resolve({ audioTracks: [] });
+  if (streamingRecently(actx)) return { audioTracks: [], busy: true };
+  if (anyProbeInflight()) {
+    const others = [...panelTracksProbeInflight.values(), ...audioProbeInflight.values()].map((p) => p.catch(() => {}));
+    let timer;
+    await Promise.race([Promise.all(others), new Promise((r) => { timer = setTimeout(r, 9500); })]);
+    clearTimeout(timer);
+    if (fresh()) return fresh();
+    if (panelTracksProbeInflight.has(key)) return panelTracksProbeInflight.get(key);
+    if (streamingRecently(actx) || anyProbeInflight()) return { audioTracks: [], busy: true };
+  }
+  return runPanelTracksProbe(mode, id, ext, actx);
+}
+function runPanelTracksProbe(mode, id, ext, actx) {
+  const key = `${mode}:${id}`;
   const direct = streamUrl(mode, id, ext, actx);
   const p = new Promise((resolve) => {
     const args = [
@@ -2440,6 +2457,7 @@ const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
 const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue");
 const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
 const { segmentQuery } = require("./lib/segment-query");
+const { streamingRecently: streamingRecentlyIn } = require("./lib/recent-stream");
 const certBackfill = { running: false, done: 0, total: 0 };
 async function tmdbRaw(pathAndQuery) {
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -12822,7 +12840,7 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     // Skip only while another probe is in flight. No streamingNow check:
     // on a channel change the viewer's own previous channel holds the slot,
     // and skipping would play MP2/AC3 channels direct with no audio.
-    if (!isProbeFresh(verdict) && panelTracksProbeInflight.size === 0 && audioProbeInflight.size === 0) {
+    if (!isProbeFresh(verdict) && !anyProbeInflight()) {
       try {
         const probed = await Promise.race([
           probeChannelAudioCodec(req.params.mode, req.params.id),
@@ -12880,7 +12898,9 @@ app.get("/api/tracks/:mode(movie|series)/:id.:ext", async (req, res) => {
       probePanelTracks(req.params.mode, req.params.id, req.params.ext),
       new Promise((r) => setTimeout(() => r(null), 10000)),
     ]);
-    res.json({ audioTracks: (probed && probed.audioTracks) || [] });
+    const out = { audioTracks: (probed && probed.audioTracks) || [] };
+    if (probed && probed.busy) out.busy = true; // viewer active; not probed, retry later
+    res.json(out);
   } catch {
     res.json({ audioTracks: [] });
   }
