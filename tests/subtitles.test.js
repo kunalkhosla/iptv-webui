@@ -86,7 +86,7 @@ test("login failure backs off globally for ~10 min", async () => {
   const n = calls.length;
   assert.equal(await svc.getVtt({ ...req, id: "2" }), null);
   assert.equal(calls.filter((c) => c.url.endsWith("/login")).length, 1);
-  assert.ok(calls.length > n - 1); // search may run, login must not
+  assert.equal(calls.length, n); // no search, no login during backoff
   clock.t += 11 * 60 * 1000;
   await svc.getVtt({ ...req, id: "3" });
   assert.equal(calls.filter((c) => c.url.endsWith("/login")).length, 2);
@@ -132,4 +132,13 @@ test("queue depth over 3 throws busy", async () => {
   const ps = [1, 2, 3].map((i) => svc.getVtt({ ...req, id: String(i) }));
   await assert.rejects(svc.getVtt({ ...req, id: "4" }), (e) => e.busy === true);
   release(); await Promise.all(ps);
+});
+
+test("search 401/403 triggers global backoff with no further upstream calls", async () => {
+  const { svc, calls } = mockSvc((u) => (u.includes("/subtitles?") ? J({}, 403) : happy(u)));
+  assert.equal(await svc.getVtt(req), null);
+  const n = calls.length;
+  assert.equal(await svc.getVtt({ ...req, id: "2" }), null);
+  assert.equal(await svc.getVtt({ ...req, id: "3", lang: "hi" }), null);
+  assert.equal(calls.length, n);
 });
