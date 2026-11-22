@@ -12819,9 +12819,10 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   if (req.params.mode === "live" && req.params.ext === "m3u8") {
     const key = `${req.params.mode}:${req.params.id}`;
     let verdict = audioCodecCache[key];
-    // Skip the probe (direct play; client falls back on error) while a
-    // viewer holds the provider's single slot or another probe is running.
-    if (!isProbeFresh(verdict) && !panelProbeBusy()) {
+    // Skip only while another probe is in flight. No streamingNow check:
+    // on a channel change the viewer's own previous channel holds the slot,
+    // and skipping would play MP2/AC3 channels direct with no audio.
+    if (!isProbeFresh(verdict) && panelTracksProbeInflight.size === 0 && audioProbeInflight.size === 0) {
       try {
         const probed = await Promise.race([
           probeChannelAudioCodec(req.params.mode, req.params.id),

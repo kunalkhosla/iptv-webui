@@ -27,5 +27,5 @@ const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
 test("server uses segmentQuery and guards probes", () => {
   assert.match(src, /const qq = segmentQuery\(\{/);
   assert.match(src, /if \(panelProbeBusy\(actx\)\) return Promise\.resolve\(\{ audioTracks: \[\] \}\)/);
-  assert.match(src, /!isProbeFresh\(verdict\) && !panelProbeBusy\(\)/);
+  assert.match(src, /!isProbeFresh\(verdict\) && panelTracksProbeInflight\.size === 0 && audioProbeInflight\.size === 0/);
 });
