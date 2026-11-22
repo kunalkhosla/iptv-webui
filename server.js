@@ -4599,10 +4599,19 @@ const DL_MAX_FETCH_RETRIES = 6;
 const dlJobs = new Map();   // "mode_id" -> job
 const dlQueue = [];
 let dlRunning = false;
-const dlKey = (mode, id) => `${mode}_${id}`;
+const DL_ID_RE = /^\d{1,12}$/;
+const dlKey = (mode, id) => {
+  if (!/^(movie|series)$/.test(mode) || !DL_ID_RE.test(String(id))) throw new Error("bad download id");
+  return `${mode}_${id}`;
+};
 const dlFile = (k) => path.join(DL_DIR, `${k}.mp4`);
 const dlSrcPath = (k) => path.join(DL_DIR, `${k}.src.part`);
 const dlOutPath = (k) => path.join(DL_DIR, `${k}.out.part.mp4`);
+const DL_MAX_JOB_AGE_MS = 24 * 3600 * 1000;
+const DL_MAX_ACTIVE_PER_PROFILE = 3;
+const DL_MAX_ACTIVE = 10;
+const DL_MIN_AGE_BEFORE_PRUNE_MS = 3600 * 1000;
+app.param("id", (req, res, next, id) => (DL_ID_RE.test(String(id).replace(/\.mp4$/, "")) || !req.path.startsWith("/api/download/")) ? next() : res.status(400).json({ error: "bad id" }));
 try {
   fs.mkdirSync(DL_DIR, { recursive: true });
   // Unfinished work from a previous run is not resumable across restarts: drop it.
@@ -4620,18 +4629,23 @@ function dlView(mode, id) {
   if (st && st.size > 0) return { state: "ready", pct: 100, size: st.size, url: dlSignedUrl(mode, id) };
   const j = dlJobs.get(k);
   if (!j) return { state: "none" };
+  if (j.state === "ready") { dlJobs.delete(k); return { state: "none" }; } // file vanished
   return {
     state: j.state, pct: Math.max(0, Math.min(99, Math.round(j.pct || 0))), stage: j.stage || null,
     bytes: j.bytes || 0, error: j.error || null, queue_position: j.state === "queued" ? dlQueue.indexOf(j) + 1 : 0,
   };
 }
-function ensureDownloadJob(mode, id, actx) {
+function ensureDownloadJob(mode, id, actx, profileId) {
   const k = dlKey(mode, id);
   const view = dlView(mode, id);
   if (view.state === "ready") { try { fs.utimesSync(dlFile(k), new Date(), new Date()); } catch {} return view; }
   const cur = dlJobs.get(k);
   if (cur && cur.state !== "failed") return dlView(mode, id);
-  const job = { key: k, mode, id, actx, state: "queued", stage: "queued", pct: 0, bytes: 0, error: null, createdAt: Date.now() };
+  const active = [...dlJobs.values()].filter((j) => j.state === "queued" || j.state === "waiting" || j.state === "running");
+  if (active.length >= DL_MAX_ACTIVE || active.filter((j) => j.profileId === profileId).length >= DL_MAX_ACTIVE_PER_PROFILE) {
+    return { state: "failed", pct: 0, error: "too many downloads in progress — wait for one to finish" };
+  }
+  const job = { key: k, mode, id, actx, profileId, state: "queued", stage: "queued", pct: 0, bytes: 0, error: null, createdAt: Date.now(), cancelled: false, abort: null };
   dlJobs.set(k, job);
   dlQueue.push(job);
   dlPump();
@@ -4644,7 +4658,13 @@ function dlPump() {
   dlRunning = true;
   runDownloadJob(job)
     .catch((e) => { job.state = "failed"; job.error = e.message; console.warn(`[download] ${job.key} crashed: ${e.message}`); })
-    .finally(() => { dlRunning = false; pruneDownloadCache(); dlPump(); });
+    .finally(() => {
+      const owner = `phone-download:${job.key}`;
+      streams.delete(owner);
+      if (job.state !== "ready") { try { fs.rmSync(dlOutPath(job.key), { force: true }); } catch {} }
+      if (job.state === "failed" || job.cancelled) { try { fs.rmSync(dlSrcPath(job.key), { force: true }); } catch {} }
+      if (job.cancelled) dlJobs.delete(job.key);
+      dlRunning = false; pruneDownloadCache(); dlPump(); });
 }
 function pruneDownloadCache() {
   try {
@@ -4654,7 +4674,7 @@ function pruneDownloadCache() {
     let total = files.reduce((n, x) => n + x.size, 0);
     const now = Date.now();
     for (const x of files) {
-      if (now - x.t > DL_TTL_MS || total > DL_MAX_BYTES) {
+      if (now - x.t > DL_TTL_MS || (total > DL_MAX_BYTES && now - x.t > DL_MIN_AGE_BEFORE_PRUNE_MS)) {
         fs.rmSync(path.join(DL_DIR, x.f), { force: true });
         dlJobs.delete(x.f.replace(/\.mp4$/, ""));
         total -= x.size;
@@ -4667,38 +4687,61 @@ setInterval(pruneDownloadCache, 30 * 60 * 1000).unref?.();
 async function runDownloadJob(job) {
   const { mode, id, actx, key } = job;
   const freeBytes = diskDownloadFreeBytes(DL_DIR);
-  if (freeBytes != null && freeBytes < DL_MIN_FREE_BYTES) {
+  if (freeBytes == null || freeBytes < DL_MIN_FREE_BYTES) {
     job.state = "failed"; job.error = "server disk almost full"; return;
   }
-  const { sourceUrl, error: probeErr } = await resolveDownloadSourceUrl(mode, id, actx);
-  if (!sourceUrl) { job.state = "failed"; job.error = `this title isn't available from the provider right now (${probeErr})`; return; }
   const srcPath = dlSrcPath(key);
   const owner = `phone-download:${key}`;
   const accountKey = accountKeyOf(actx);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // ── 1. fetch the original (Range resume; yields to viewers) ──
   let fetched = false;
+  let sourceUrl = null;
   for (let attempt = 0; attempt <= DL_MAX_FETCH_RETRIES && !fetched;) {
+    if (job.cancelled) return;
+    if (Date.now() - job.createdAt > DL_MAX_JOB_AGE_MS) { job.state = "failed"; job.error = "timed out waiting for the provider connection"; return; }
     job.stage = "fetching";
-    // Never admit while someone else holds the slot (newest-wins would evict the viewer).
+    // Never touch the provider while someone else holds the slot (newest-wins would evict the viewer).
     const slotHeld = [...streams.entries()].some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced);
-    if (slotHeld) { job.state = "waiting"; await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS)); continue; }
+    if (slotHeld) { job.state = "waiting"; job.stage = "waiting-for-viewer"; await sleep(DISK_DOWNLOAD_DISPLACED_RETRY_MS); continue; }
     const ac = new AbortController();
     const killer = () => ac.abort();
     const admission = admitStream(owner, mode, id, killer, accountKey);
-    if (!admission.ok) { job.state = "waiting"; await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS)); continue; }
+    if (!admission.ok) { job.state = "waiting"; job.stage = "waiting-for-viewer"; await sleep(DISK_DOWNLOAD_DISPLACED_RETRY_MS); continue; }
+    job.abort = () => ac.abort();
     job.state = "running";
     let startByte = 0;
     try { startByte = fs.statSync(srcPath).size; } catch {}
+    const before = startByte;
+    let out = null;
     try {
+      if (!sourceUrl) {
+        const probe = await resolveDownloadSourceUrl(mode, id, actx);
+        if (!probe.sourceUrl) throw Object.assign(new Error(`this title isn't available from the provider right now (${probe.error})`), { fatal: true });
+        sourceUrl = probe.sourceUrl;
+      }
       const resp = await fetch(sourceUrl, {
         headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 12; Smart TV)", ...(startByte > 0 ? { Range: `bytes=${startByte}-` } : {}) },
         redirect: "follow", signal: ac.signal,
       });
+      if (resp.status === 416 && startByte > 0) {
+        const m = /\*\/(\d+)/.exec(resp.headers.get("content-range") || "");
+        try { await resp.body?.cancel(); } catch {}
+        if (m && Number(m[1]) === startByte) { fetched = true; continue; }
+        fs.rmSync(srcPath, { force: true });
+        throw new Error("resume rejected; restarting");
+      }
       if (!resp.ok && resp.status !== 206) throw new Error(`HTTP ${resp.status}`);
+      if (/^text\//i.test(resp.headers.get("content-type") || "")) throw new Error("provider returned an error page instead of video");
       const resumed = resp.status === 206;
       const total = resumed ? Number(resp.headers.get("content-range")?.split("/")?.[1]) || null : Number(resp.headers.get("content-length")) || null;
+      if (total) {
+        const free = diskDownloadFreeBytes(DL_DIR);
+        const need = (total - (resumed ? startByte : 0)) * 1.3 + DL_MIN_FREE_BYTES;
+        if (free == null || free < need) throw Object.assign(new Error("not enough server disk for this title"), { fatal: true });
+      }
       job.bytes = resumed ? startByte : 0;
-      const out = fs.createWriteStream(srcPath, { flags: resumed ? "a" : "w" });
+      out = fs.createWriteStream(srcPath, { flags: resumed ? "a" : "w" });
       const source = Readable.fromWeb(resp.body);
       source.on("data", (chunk) => { job.bytes += chunk.length; if (total) job.pct = (job.bytes / total) * 50; touchStream(owner); });
       await pipeline(source, out);
@@ -4706,15 +4749,21 @@ async function runDownloadJob(job) {
       if (actual === 0 || (total != null && actual < total)) throw new Error(`truncated transfer: got ${actual} of ${total} bytes`);
       fetched = true;
     } catch (e) {
-      if (ac.signal.aborted) { job.state = "waiting"; streams.delete(owner); await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS)); continue; } // a viewer arrived: resume later
-      attempt++;
-      job.error = e.message;
+      if (out) { try { if (!out.closed) await new Promise((r) => { out.once("close", r); out.destroy(); }); } catch {} }
       streams.delete(owner);
+      if (job.cancelled) return;
+      if (e.fatal) { job.state = "failed"; job.error = e.message; return; }
+      if (ac.signal.aborted) { job.state = "waiting"; job.stage = "waiting-for-viewer"; await sleep(DISK_DOWNLOAD_DISPLACED_RETRY_MS); continue; } // a viewer arrived: resume later
+      let grew = false;
+      try { grew = fs.statSync(srcPath).size > before; } catch {}
+      if (grew) attempt = 0; else attempt++;
+      job.error = e.message;
       if (attempt > DL_MAX_FETCH_RETRIES) { job.state = "failed"; job.error = `download from provider failed: ${e.message}`; try { fs.rmSync(srcPath, { force: true }); } catch {} return; }
-      await new Promise((r) => setTimeout(r, Math.min(5000 * attempt, 30000)));
+      await sleep(Math.min(5000 * Math.max(attempt, 1), 30000));
     }
   }
-  dropStreamKiller(owner, null);
+  job.abort = null;
+  if (job.cancelled) return;
   streams.delete(owner); // encode reads the local file: free the provider connection
   // ── 2. encode to a small faststart MP4 ──
   job.state = "running"; job.stage = "encoding"; job.error = null; job.pct = 50;
@@ -4738,13 +4787,29 @@ async function runDownloadJob(job) {
       const m = /out_time_us=(\d+)/.exec(String(c));
       if (m && durationSecs) job.pct = 50 + Math.min(1, Number(m[1]) / 1e6 / durationSecs) * 49;
     });
-    ff.on("close", (code) => resolve({ code, err }));
+    let lastAdvance = Date.now();
+    const wd = setInterval(() => {
+      const hard = durationSecs ? durationSecs * 3000 + 600000 : 6 * 3600 * 1000;
+      if (job.cancelled || Date.now() - lastAdvance > 10 * 60 * 1000 || Date.now() - startedAt > hard) { err += " [killed: stalled/cancelled]"; try { ff.kill("SIGKILL"); } catch {} }
+    }, 15000);
+    const startedAt = Date.now();
+    ff.stdout.on("data", () => { lastAdvance = Date.now(); });
+    ff.on("error", (e) => { clearInterval(wd); resolve({ code: -1, err: e.message }); });
+    ff.on("close", (code) => { clearInterval(wd); resolve({ code, err }); });
   });
-  let res = await encode(HW_ENCODE && !hwDecodeFailed.has(`${mode}:${id}`));
-  let okOut = res.code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0;
-  if (!okOut && HW_ENCODE) { res = await encode(false); okOut = res.code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0; }
-  try { fs.rmSync(srcPath, { force: true }); } catch {}
-  if (!okOut) { job.state = "failed"; job.error = `could not prepare the file (${(res.err || "ffmpeg failed").slice(-200)})`; try { fs.rmSync(outPath, { force: true }); } catch {} return; }
+  const useHw0 = HW_ENCODE && !hwDecodeFailed.has(`${mode}:${id}`);
+  const outOk = async () => {
+    if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) return false;
+    if (!durationSecs) return true;
+    const d = await new Promise((resolve) => execFile("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", outPath], { timeout: 20000 }, (err, o) => resolve(err ? null : parseFloat(o))));
+    return d != null && d >= durationSecs * 0.97;
+  };
+  let res = await encode(useHw0);
+  let okOut = res.code === 0 && await outOk();
+  if (!okOut && useHw0 && !job.cancelled) { res = await encode(false); okOut = res.code === 0 && await outOk(); }
+  if (okOut || res.code === 0) { try { fs.rmSync(srcPath, { force: true }); } catch {} }
+  if (job.cancelled) return;
+  if (!okOut) { job.state = "failed"; job.error = `could not prepare the file (${(res.err || "ffmpeg failed or output was incomplete").slice(-200)})`; try { fs.rmSync(outPath, { force: true }); } catch {} return; }
   fs.renameSync(outPath, dlFile(key));
   job.state = "ready"; job.pct = 100;
   console.log(`[download] ${key} ready (${(fs.statSync(dlFile(key)).size / 1024 / 1024).toFixed(0)} MB)`);
@@ -4762,7 +4827,7 @@ app.get("/api/download/:mode(movie|series)/:id.mp4", async (req, res) => {
     if (!fs.existsSync(file)) return res.status(409).json(dlView(mode, id));
     res.set("Cache-Control", "no-store");
     return res.sendFile(file, {
-      acceptRanges: true,
+      acceptRanges: true, dotfiles: "allow",
       headers: { "Content-Type": "video/mp4", "Content-Disposition": `attachment; filename="khouch_${mode}_${id}_720p.mp4"` },
     });
   }
@@ -7462,7 +7527,7 @@ app.post("/api/play-event/:mode(live|movie|series|disk)/:id", express.json(), (r
 app.post("/api/download/prepare/:mode(movie|series)/:id", (req, res) => {
   const id = String(req.params.id);
   if (!/^\d{1,12}$/.test(id)) return res.status(400).json({ error: "bad id" });
-  res.json(ensureDownloadJob(req.params.mode, id, currentAccount()));
+  res.json(ensureDownloadJob(req.params.mode, id, currentAccount(), req.profileId));
 });
 app.get("/api/download/status/:mode(movie|series)/:id", (req, res) => {
   res.set("Cache-Control", "no-store");
@@ -7472,7 +7537,13 @@ app.get("/api/download/status/:mode(movie|series)/:id", (req, res) => {
 app.delete("/api/download/cache/:mode(movie|series)/:id", (req, res) => {
   const k = dlKey(req.params.mode, String(req.params.id));
   const j = dlJobs.get(k);
-  if (j && (j.state === "running" || j.state === "waiting" || j.state === "queued")) return res.json({ ok: true, kept: "job in progress" });
+  if (j && (j.state === "running" || j.state === "waiting" || j.state === "queued")) {
+    // cancel: the runner notices the flag, stops, and cleans its partial files
+    j.cancelled = true;
+    const qi = dlQueue.indexOf(j); if (qi >= 0) { dlQueue.splice(qi, 1); dlJobs.delete(k); }
+    try { j.abort?.(); } catch {}
+    return res.json({ ok: true, cancelled: true });
+  }
   try { fs.rmSync(dlFile(k), { force: true }); } catch {}
   dlJobs.delete(k);
   res.json({ ok: true });
