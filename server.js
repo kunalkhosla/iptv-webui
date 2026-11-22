@@ -2631,6 +2631,93 @@ async function buildStreamingBuzz({ reason = "cron" } = {}) {
     streamingBuzzRunning = false;
   }
 }
+// ── Streaming arrivals: new titles on the platforms ──────────────────
+// TMDB has no "added on" date for platform availability, so arrivals are
+// detected by DIFFERENCE: per platform/language/kind we keep the set of recent
+// releases (last 120 days, flatrate, region catalog) seen at the previous
+// check; anything newly present is an arrival (with first-seen time). The
+// first run only seeds the snapshot (no flood). Log kept 60 days.
+const streamingArrivalsFile = path.join(DATA_DIR, "streaming-arrivals.json");
+let streamingArrivals = (() => {
+  try { return JSON.parse(fs.readFileSync(streamingArrivalsFile, "utf8")) || {}; } catch { return {}; }
+})();
+let arrivalsRunning = false;
+async function checkStreamingArrivals({ reason = "cron" } = {}) {
+  if (!TMDB_API_KEY) return { ok: false, error: "no TMDB_API_KEY" };
+  if (arrivalsRunning) return { ok: false, error: "already running" };
+  arrivalsRunning = true;
+  try {
+    const now = new Date();
+    const dayStr = (d) => d.toISOString().slice(0, 10);
+    const since = dayStr(new Date(now.getTime() - 120 * 86400000));
+    const today = dayStr(now);
+    const seeded = !!streamingArrivals.seeded;
+    const snap = streamingArrivals.snap || {};
+    const log = Array.isArray(streamingArrivals.log) ? streamingArrivals.log : [];
+    const nextSnap = {};
+    const added = [];
+    let failures = 0;
+    for (const src of BUZZ_SOURCES) {
+      if (src.platform === "trending") continue;
+      for (const kind of ["movie", "tv"]) {
+        const key = `${src.key}|${kind}`;
+        const rows = [];
+        let ok = true;
+        for (let page = 1; page <= 3; page++) {
+          // tmdb() caches 24h; arrivals need fresh pages, so bypass the cache
+          const params = new URLSearchParams({
+            watch_region: src.region, with_watch_providers: String(src.id), with_watch_monetization_types: "flatrate",
+            with_original_language: src.lang, sort_by: kind === "movie" ? "primary_release_date.desc" : "first_air_date.desc", page: String(page),
+            [kind === "movie" ? "primary_release_date.gte" : "first_air_date.gte"]: since,
+            [kind === "movie" ? "primary_release_date.lte" : "first_air_date.lte"]: today,
+          }).toString();
+          const res = await tmdbRaw(`/discover/${kind}?${params}`);
+          if (!res) { ok = false; break; }
+          for (const r of res.results || []) {
+            if (!BUZZ_LANGS.has(r.original_language)) continue;
+            rows.push({
+              id: r.id, title: kind === "movie" ? r.title : r.name,
+              year: String((kind === "movie" ? r.release_date : r.first_air_date) || "").slice(0, 4) || null,
+              overview: String(r.overview || "").slice(0, 200),
+            });
+          }
+          if (page >= (res.total_pages || 1)) break;
+        }
+        if (!ok) { failures++; nextSnap[key] = snap[key] || []; continue; } // keep the old snapshot on failure
+        const prev = new Set(snap[key] || []);
+        nextSnap[key] = rows.map((r) => r.id);
+        if (!seeded || !snap[key]) continue; // first sight of this list only seeds it
+        for (const r of rows) {
+          if (prev.has(r.id)) continue;
+          added.push({
+            tmdb_id: r.id, title: r.title, year: r.year, overview: r.overview,
+            kind: kind === "movie" ? "movie" : "series",
+            platform: src.platform, platform_label: src.label, lang: src.lang, first_seen: Date.now(),
+          });
+        }
+      }
+    }
+    const cutoff = Date.now() - 60 * 86400000;
+    streamingArrivals = {
+      seeded: true, updatedAt: Date.now(), snap: nextSnap,
+      log: [...added, ...log].filter((a) => a.first_seen > cutoff).slice(0, 2000),
+    };
+    try {
+      fs.writeFileSync(streamingArrivalsFile + ".tmp", JSON.stringify(streamingArrivals));
+      fs.renameSync(streamingArrivalsFile + ".tmp", streamingArrivalsFile);
+    } catch (e) { console.warn(`[arrivals] save failed: ${e.message}`); }
+    console.log(`[arrivals] (${reason}) ${seeded ? added.length + " new" : "seeded"}${failures ? `, ${failures} lists failed` : ""}`);
+    return { ok: true, seeded: !seeded, new: added.length, failures };
+  } finally {
+    arrivalsRunning = false;
+  }
+}
+function scheduleStreamingArrivals() {
+  if (!TMDB_API_KEY) return;
+  setTimeout(() => checkStreamingArrivals({ reason: "boot" }).catch((e) => console.warn(`[arrivals] ${e.message}`)), 6 * 60 * 1000);
+  setInterval(() => checkStreamingArrivals().catch((e) => console.warn(`[arrivals] ${e.message}`)), 6 * 3600 * 1000);
+}
+
 function scheduleStreamingBuzz() {
   if (!TMDB_API_KEY) return;
   const age = Date.now() - (streamingBuzz.updatedAt || 0);
@@ -10260,6 +10347,64 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: "streaming_arrivals",
+    description: "NEW arrivals on the streaming platforms (Netflix, Prime Video, HBO Max, Disney+, Apple TV+, "
+      + "Hulu, Paramount+, Peacock; JioHotstar/ZEE5/SonyLIV/MX Player for Hindi and Punjabi) — movies and "
+      + "series that newly became available since the last check, English/Hindi/Punjabi only. Checked every "
+      + "6 hours. `since_hours` (default 24), `platform`, `language` english|hindi|punjabi, `kind` "
+      + "movie|series. Each item has the platform, title, year, a short overview, `in_khouch` (and a `ref` "
+      + "when Khouch has it). Use it for 'what's new on Netflix', and for the daily new-arrivals alert.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        since_hours: { type: "integer", minimum: 1, maximum: 1440 },
+        platform: { type: "string" },
+        language: { type: "string", enum: ["english", "hindi", "punjabi"] },
+        kind: { type: "string", enum: ["movie", "series"] },
+        limit: { type: "integer", minimum: 1, maximum: 50 },
+      },
+    },
+    async handler(args, req) {
+      if (!streamingArrivals.seeded) return { arrivals: [], note: "arrival tracking is still seeding (first check pending); try again after the next 6-hourly check" };
+      const hours = Math.min(Math.max(parseInt(args.since_hours, 10) || 24, 1), 1440);
+      const limit = Math.min(Math.max(parseInt(args.limit, 10) || 25, 1), 50);
+      const norm = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const ALIASES = { amazon: "prime", amazonprime: "prime", primevideo: "prime", disneyplus: "disney", hbo: "max", hbomax: "max", appletv: "apple", jio: "hotstar", jiohotstar: "hotstar" };
+      const LANGS = { english: "en", hindi: "hi", punjabi: "pa" };
+      const wantP = ALIASES[norm(args.platform)] || norm(args.platform);
+      const wantL = LANGS[norm(args.language)] || null;
+      const wantK = args.kind === "movie" ? "movie" : args.kind === "series" ? "series" : null;
+      const cutoff = Date.now() - hours * 3600 * 1000;
+      const prof = findProfile(req.profileId);
+      const isKid = !!prof?.kidsBirthYear;
+      const kidBlocked = makeKidsBlocker(prof);
+      const seen = new Set();
+      const out = [];
+      for (const a of streamingArrivals.log || []) {
+        if (a.first_seen < cutoff) continue;
+        if (wantP && a.platform !== wantP && norm(a.platform_label) !== wantP) continue;
+        if (wantL && a.lang !== wantL) continue;
+        if (wantK && a.kind !== wantK) continue;
+        const dedupe = `${a.kind}:${a.tmdb_id}:${a.platform}`;
+        if (seen.has(dedupe)) continue;
+        seen.add(dedupe);
+        const mode = a.kind;
+        const members = getIndexesFor(currentAccount())[mode]?.byTmdb?.get(a.tmdb_id) || [];
+        const ok = members.filter((m) => !(isKid && kidBlocked({ us_cert: m.us_cert })));
+        const s = ok.find((m) => m.variants) || ok.find((m) => !m.isAlt) || ok[0] || null;
+        if (isKid && !s) continue; // kids only see titles Khouch can gate
+        out.push({
+          platform: a.platform_label, kind: a.kind, title: a.title, year: a.year,
+          language: a.lang === "en" ? "English" : a.lang === "hi" ? "Hindi" : "Punjabi",
+          overview: a.overview, first_seen: new Date(a.first_seen).toISOString(),
+          in_khouch: !!s, ...(s ? { ref: mcpHit(mode, s).ref } : {}),
+        });
+        if (out.length >= limit) break;
+      }
+      return { updated: new Date(streamingArrivals.updatedAt || 0).toISOString(), count: out.length, arrivals: out };
+    },
+  },
+  {
     name: "update_list",
     description: "Add or remove items on this profile's Watch Later (`watch_later`) or Favorites "
       + "(`favorites`) list. `refs` are refs from search / for_you / whats_on (movie, series, live, "
@@ -10959,6 +11104,11 @@ app.post("/api/admin/retry-tmdb-no-matches", (req, res) => {
 // Rebuild the AI taste profiles ("For You" rail) on demand — for
 // testing and for warming a fresh deploy without waiting for the
 // 4:15 AM cron. Runs the exact same job.
+app.post("/api/admin/check-streaming-arrivals", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  checkStreamingArrivals({ reason: "admin" }).catch((e) => console.warn(`[arrivals] ${e.message}`));
+  res.json({ ok: true, started: true });
+});
 app.post("/api/admin/backfill-alt-certs", (req, res) => {
   if (!requireOwner(req, res)) return;
   if (certBackfill.running) return res.json({ ok: false, error: "already running", progress: certBackfill });
@@ -12723,5 +12873,6 @@ app.listen(PORT, async () => {
   scheduleEditorialRailsWeekly();
   scheduleTonightNightly();
   scheduleStreamingBuzz();
+  scheduleStreamingArrivals();
   scheduleAltCerts();
 });
