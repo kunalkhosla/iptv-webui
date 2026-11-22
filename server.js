@@ -944,6 +944,11 @@ function probeChannelAudioCodec(mode, id, actx = currentAccount()) {
 // shape but over the panel URL instead of a local path. Empty/failed
 // probes aren't cached so they retry; a successful one is persisted.
 const panelTracksProbeInflight = new Map();
+// True when a network probe would compete for the provider's single
+// connection: a viewer is streaming, or another probe is already running.
+function panelProbeBusy(actx) {
+  return streamingNow(actx) || panelTracksProbeInflight.size > 0 || audioProbeInflight.size > 0;
+}
 function probePanelTracks(mode, id, ext, actx = currentAccount()) {
   const key = `${mode}:${id}`;
   const cached = panelTracksCache[key];
@@ -951,6 +956,10 @@ function probePanelTracks(mode, id, ext, actx = currentAccount()) {
     return Promise.resolve(cached);
   }
   if (panelTracksProbeInflight.has(key)) return panelTracksProbeInflight.get(key);
+  // The provider allows ONE connection per account: never open a probe
+  // connection while a viewer holds the slot, nor alongside another probe.
+  // Empty (uncached) result; clients tolerate an empty audioTracks list.
+  if (panelProbeBusy(actx)) return Promise.resolve({ audioTracks: [] });
   const direct = streamUrl(mode, id, ext, actx);
   const p = new Promise((resolve) => {
     const args = [
@@ -2430,6 +2439,7 @@ const effCert = (t) => (t ? (t.us_cert || t.cert_alt || "") : "");
 const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
 const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue");
 const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
+const { segmentQuery } = require("./lib/segment-query");
 const certBackfill = { running: false, done: 0, total: 0 };
 async function tmdbRaw(pathAndQuery) {
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -4468,11 +4478,7 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/index.m3u8", async (re
         // Segment URLs carry the same quality tag AND offset so the
         // segment route can route to the right ffmpeg dir even when
         // the user has flipped quality or re-anchored mid-stream.
-        const qq = `q=${quality}` +
-          (offsetSecs > 0 ? `&t=${offsetSecs}` : "") +
-          (audio === "surround" ? `&a=surround` : "") +
-          (diskSel?.a != null ? `&da=${diskSel.a}` : "") +
-          (diskSel?.s != null ? `&ds=${diskSel.s}` : "");
+        const qq = segmentQuery({ quality, offsetSecs, audio, diskSel, audioTrack });
         // Pass 1: before a respawn-boundary segment, inject #EXT-X-DISCONTINUITY
         // *ahead of* its #EXTINF (HLS requires it precede the segment's EXTINF,
         // not sit between EXTINF and the URI) so the player resets its decoder
@@ -12813,7 +12819,9 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   if (req.params.mode === "live" && req.params.ext === "m3u8") {
     const key = `${req.params.mode}:${req.params.id}`;
     let verdict = audioCodecCache[key];
-    if (!isProbeFresh(verdict)) {
+    // Skip the probe (direct play; client falls back on error) while a
+    // viewer holds the provider's single slot or another probe is running.
+    if (!isProbeFresh(verdict) && !panelProbeBusy()) {
       try {
         const probed = await Promise.race([
           probeChannelAudioCodec(req.params.mode, req.params.id),
