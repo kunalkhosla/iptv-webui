@@ -6512,18 +6512,18 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // state has none); intersect with the profile's recents/progress so
     // another member's titles never name a rail on this profile (kids).
     const myPlays = (() => {
+      if (mode === "series") {
+        // Series timestamps are keyed by EPISODE id and progress keys are episode ids,
+        // so use the profile's recents (show ids, newest first) as the history.
+        return (userState.recents?.series || []).map((id) => [String(id), 0]);
+      }
       const mine = new Set((userState.recents?.[mode] || []).map(String));
       for (const k of Object.keys(userState.progress || {})) {
         if (k.startsWith(mode + ":")) mine.add(k.split(":", 2)[1]);
       }
-      const timed = Object.entries(getLastPlayedFor(currentAccount())[mode] || {})
+      return Object.entries(getLastPlayedFor(currentAccount())[mode] || {})
         .filter(([id]) => mine.has(String(id)))
         .sort((x, y) => y[1] - x[1]);
-      // Series timestamps are keyed by episode, so they rarely match the show ids in
-      // recents: append this profile's recents (newest-first) that have no timestamp.
-      const have = new Set(timed.map(([id]) => String(id)));
-      for (const id of userState.recents?.[mode] || []) if (!have.has(String(id))) { timed.push([String(id), 0]); have.add(String(id)); }
-      return timed;
     })();
     const tmdbBy = (s) => tmdbFor(s.id);
     // Build the pool, deduplicating by tmdb_id so a movie that the
@@ -7217,18 +7217,19 @@ function advanceToNextEpisode(userState, finishedEpisodeId) {
   if (!seasons) return;
   const all = Object.entries(seasons)
     .flatMap(([sn, eps]) => (Array.isArray(eps) ? eps : []).map((e) => ({ ...e, season: Number(e.season ?? sn) })))
-    .sort((a, b) => a.season - b.season || Number(a.episode_num) - Number(b.episode_num));
+    .sort((a, b) => a.season - b.season || (Number(a.episode_num) || 0) - (Number(b.episode_num) || 0));
   const at = all.findIndex((e) => String(e.id) === epId);
   const next = at >= 0 ? all[at + 1] : null;
   if (!next || !/^\d{1,12}$/.test(String(next.id))) return; // last episode (or unknown): leave as is
   userState.lastEpisode[seriesId] = {
     ...le,
-    episode_id: next.id, season: next.season, episode_num: Number(next.episode_num) || null,
+    episode_id: String(next.id), season: next.season, episode_num: Number(next.episode_num) || null,
     title: next.title || null, container: String(next.container_extension || le.container || "mp4").toLowerCase(),
     when: Date.now(), auto: true,
   };
   const sid = parseInt(seriesId, 10);
   if (Number.isFinite(sid)) {
+    userState.recents ||= {};
     const list = Array.isArray(userState.recents?.series) ? userState.recents.series : (userState.recents.series = []);
     userState.recents.series = [sid, ...list.filter((x) => x !== sid)].slice(0, 100);
   }
@@ -7313,7 +7314,15 @@ app.put("/api/user-state", express.json({ limit: "256kb" }), (req, res) => {
     userState.watched = b.watched.slice(0, 50000);
   }
   if (b.lastEpisode && typeof b.lastEpisode === "object") {
-    userState.lastEpisode = b.lastEpisode;
+    // Per show, keep the newer pointer: a stale client snapshot must not revert the
+    // server's "next episode" advance (entries without `when` count as oldest).
+    const merged = { ...b.lastEpisode };
+    for (const [sid, cur] of Object.entries(userState.lastEpisode || {})) {
+      const inc = merged[sid];
+      // (A show the client omitted stays omitted: that is how a client clears history.)
+      if (inc && (cur?.when || 0) > (inc?.when || 0)) merged[sid] = cur;
+    }
+    userState.lastEpisode = merged;
   }
   if (b.filter && typeof b.filter === "object") {
     const next = {
