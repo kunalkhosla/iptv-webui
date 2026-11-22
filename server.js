@@ -7193,9 +7193,46 @@ app.post("/api/progress/:mode(movie|series|disk)/:id", express.json(), (req, res
   } else {
     userState.progress[key] = { p: position, d: validDur, t: Date.now() };
   }
+  // Finished a series episode: move this profile's "continue" pointer to the NEXT
+  // episode, so Continue Watching offers what to watch next instead of replaying
+  // the one just finished. Uses the cached series info only (never calls the
+  // panel mid-playback: the account allows one connection).
+  if (mode === "series" && finished) {
+    try { advanceToNextEpisode(userState, id); } catch (e) { console.warn(`[progress] next-episode: ${e.message}`); }
+  }
   scheduleUserStateSave();
   res.json({ ok: true });
 });
+
+function advanceToNextEpisode(userState, finishedEpisodeId) {
+  const epId = String(finishedEpisodeId);
+  const entry = Object.entries(userState.lastEpisode || {}).find(([, le]) => String(le?.episode_id) === epId);
+  if (!entry) return;
+  const [seriesId, le] = entry;
+  const actx = currentAccount();
+  const infoKey = (sid) => `${accountKeyOf(actx)} ${MODES.series.info}${JSON.stringify({ series_id: sid })}`;
+  const hit = cache.get(infoKey(String(seriesId))) || cache.get(infoKey(parseInt(seriesId, 10)));
+  const info = hit && Date.now() - hit.t < TTL_MS ? hit.v : null;
+  const seasons = info?.episodes && typeof info.episodes === "object" ? info.episodes : null;
+  if (!seasons) return;
+  const all = Object.entries(seasons)
+    .flatMap(([sn, eps]) => (Array.isArray(eps) ? eps : []).map((e) => ({ ...e, season: Number(e.season ?? sn) })))
+    .sort((a, b) => a.season - b.season || Number(a.episode_num) - Number(b.episode_num));
+  const at = all.findIndex((e) => String(e.id) === epId);
+  const next = at >= 0 ? all[at + 1] : null;
+  if (!next || !/^\d{1,12}$/.test(String(next.id))) return; // last episode (or unknown): leave as is
+  userState.lastEpisode[seriesId] = {
+    ...le,
+    episode_id: next.id, season: next.season, episode_num: Number(next.episode_num) || null,
+    title: next.title || null, container: String(next.container_extension || le.container || "mp4").toLowerCase(),
+    when: Date.now(), auto: true,
+  };
+  const sid = parseInt(seriesId, 10);
+  if (Number.isFinite(sid)) {
+    const list = Array.isArray(userState.recents?.series) ? userState.recents.series : (userState.recents.series = []);
+    userState.recents.series = [sid, ...list.filter((x) => x !== sid)].slice(0, 100);
+  }
+}
 
 // Remove a single item from the merged Continue Watching rail (#48).
 // Wipes both `recents[mode]` (the "I pressed play" entry) AND
