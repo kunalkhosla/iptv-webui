@@ -6096,6 +6096,49 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     }
   }
 
+  // On now / Starting soon (live) — from the guide (EPG) for channels matched
+  // to guide data: what's airing now on your favourite/recent channels, live
+  // sport and long programmes (movies), plus sport/movies starting in the next
+  // 3 hours. One tile per guide channel (HD/FHD copies collapse). Owner +
+  // adult profiles only, like Tonight.
+  if (mode === "live" && isOwnerAccount(currentAccount()) && allowedKidCerts === null && epgIndex.size) {
+    const nowMs = Date.now();
+    const SPORT_RE = /\b(live|v|vs|cricket|football|soccer|match|ipl|nba|nfl|mlb|nhl|f1|grand prix|ufc|wwe|tennis|golf|premier league|world cup|test|odi|t20)\b/i;
+    const NOT_RE = /\b(news|bulletin|headlines|weather|shopping|teleshop|promo|filler|religious|prayer)\b/i;
+    const fav = new Set([...(userState.favorites?.live || []), ...(userState.recents?.live || [])].map(String));
+    const clock = (ms) => new Date(ms).toLocaleTimeString("en-US", { timeZone: DISK_DOWNLOAD_WINDOW_TZ, hour: "numeric", minute: "2-digit" });
+    const seenEpg = new Set();
+    const onNow = [], soon = [];
+    for (const s of ix.byId.values()) {
+      const eid = s.epg_channel_id;
+      if (!eid || seenEpg.has(eid)) continue;
+      if (!allowedCatIds.has(String(s.category_id)) || !titleLangPasses(s.name)) continue;
+      const progs = epgIndex.get(eid);
+      if (!progs || !progs.length) continue;
+      seenEpg.add(eid);
+      const idx = progs.findIndex((p) => p.stop > nowMs);
+      if (idx < 0) continue;
+      const cur = progs[idx].start <= nowMs ? progs[idx] : null;
+      const nxt = cur ? progs[idx + 1] : progs[idx];
+      if (cur && !NOT_RE.test(cur.title)) {
+        const dur = (cur.stop - cur.start) / 60000;
+        const score = (fav.has(String(s.id)) ? 5 : 0) + (SPORT_RE.test(cur.title) ? 3 : 0) + (dur >= 90 ? 2 : 0);
+        onNow.push({ s, cur, score });
+      }
+      if (nxt && nxt.start > nowMs && nxt.start - nowMs <= 3 * 3600e3 && !NOT_RE.test(nxt.title)
+          && (SPORT_RE.test(nxt.title) || (nxt.stop - nxt.start) / 60000 >= 90)) {
+        soon.push({ s, nxt });
+      }
+    }
+    const mk = (s, text) => { const tl = tileFor(s, null); if (tl) tl.pickReason = text.slice(0, 80); return tl; };
+    const nowTiles = onNow.sort((a, b) => b.score - a.score || a.cur.stop - b.cur.stop).slice(0, 20)
+      .map((x) => mk(x.s, `${x.cur.title} · until ${clock(x.cur.stop)}`)).filter(Boolean);
+    const soonTiles = soon.sort((a, b) => a.nxt.start - b.nxt.start).slice(0, 16)
+      .map((x) => mk(x.s, `${x.nxt.title} · ${clock(x.nxt.start)}`)).filter(Boolean);
+    if (nowTiles.length >= 4) rails.push({ title: "On now", total: nowTiles.length, items: nowTiles });
+    if (soonTiles.length >= 4) rails.push({ title: "Starting soon", total: soonTiles.length, items: soonTiles });
+  }
+
   // For You — AI taste picks from the nightly rebuildTasteProfiles()
   // job (absent until the job has run, i.e. whenever ANTHROPIC_API_KEY
   // isn't configured). Picks were kid-gated at build time, but the
@@ -6165,6 +6208,39 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
         });
       }
     }
+  }
+
+  // Popular in your house — titles most profiles in this household have been
+  // watching lately (3 weeks). Needs at least 2 profiles on a title; the usual
+  // language/kid/variant gates apply per viewing profile.
+  if ((mode === "movie" || mode === "series") && ix.byId) {
+    const since = Date.now() - 21 * 86400000;
+    const tally = new Map(); // stream id -> { viewers:Set, last }
+    const bump = (id, pid, t) => {
+      if (!ix.byId.has(id) || !(t > since)) return;
+      const e = tally.get(id) || { viewers: new Set(), last: 0 };
+      e.viewers.add(pid); e.last = Math.max(e.last, t); tally.set(id, e);
+    };
+    for (const pr of profiles.profiles) {
+      const st = getProfileState(pr.id);
+      if (mode === "movie") {
+        for (const [k, v] of Object.entries(st.progress || {})) {
+          if (k.startsWith("movie:")) bump(parseInt(k.slice(6), 10), pr.id, v?.t || 0);
+        }
+      } else {
+        for (const [sid, le] of Object.entries(st.lastEpisode || {})) bump(parseInt(sid, 10), pr.id, le?.when || 0);
+      }
+    }
+    const tiles = [...tally.entries()]
+      .filter(([, e]) => e.viewers.size >= 2)
+      .sort((a, b) => b[1].viewers.size - a[1].viewers.size || b[1].last - a[1].last)
+      .map(([id]) => variantHidden.resolve(ix.byId.get(id)))
+      .filter((s) => s && titleLangPasses(s.name))
+      .map((s) => tileFor(s, null))
+      .filter((t) => t && !isKidBlocked(t));
+    const seenH = new Set();
+    const uniq = tiles.filter((t) => (seenH.has(t.id) ? false : (seenH.add(t.id), true)));
+    if (uniq.length >= 4) rails.push({ title: "Popular in your house", total: uniq.length, items: uniq.slice(0, 20) });
   }
 
   // Streaming buzz — "Popular on Netflix / Prime / Max / …" from TMDB's
@@ -6609,6 +6685,47 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       .filter(p => (p.t.rating || 0) >= 7 && (p.t.vote_count || 0) >= 50 && (p.t.vote_count || 0) < 500)
       .filter(notTvMovie)
       .sort((a, b) => (b.t.rating || 0) - (a.t.rating || 0)));
+
+    // Mood / occasion rails — deterministic rules over cached TMDB data (genres,
+    // keywords, rating, votes, runtime, cert). Overlap with genre rails on
+    // purpose, so they bypass surfacedIds. Three per visit, biased by daypart.
+    {
+      const has = (p, ...g) => g.some((x) => (p.t.genres || []).includes(x));
+      const kw = (p, ...k) => (p.t.keywords || []).some((w) => k.some((x) => String(w).toLowerCase().includes(x)));
+      const good = (p, r, v) => (p.t.rating || 0) >= r && (p.t.vote_count || 0) >= v;
+      const MOODS = mode === "movie" ? [
+        { title: "Family movie night", dp: "weekend", test: (p) => has(p, "Family", "Animation") && ["G", "PG"].includes(effCert(p.t)) && good(p, 6.5, 800) },
+        { title: "Date night", dp: "late", test: (p) => has(p, "Romance") && !has(p, "Horror") && good(p, 6.5, 800) },
+        { title: "On the edge of your seat", dp: "late", test: (p) => has(p, "Thriller", "Mystery") && !has(p, "Family") && good(p, 6.8, 1500) },
+        { title: "Feel-good and funny", dp: "weeknight", test: (p) => has(p, "Comedy") && !has(p, "Horror", "Crime") && good(p, 6.8, 1000) },
+        { title: "Mind-bending", dp: "late", test: (p) => (kw(p, "plot twist", "time travel", "dystopia", "alternate reality", "parallel world", "mind") || (has(p, "Science Fiction") && has(p, "Mystery"))) && good(p, 7, 1500) },
+        { title: "Based on a true story", dp: "weeknight", test: (p) => kw(p, "based on true story", "true story", "biography", "based on real") && good(p, 6.8, 800) },
+        { title: "Big, epic and award-worthy", dp: "weekend", test: (p) => p.t.runtime >= 140 && good(p, 7.5, 3000) },
+        { title: "Bollywood blockbusters", dp: "weekend", test: (p) => p.t.original_language === "hi" && good(p, 6.5, 300) },
+        { title: "Punjabi hits", dp: "weekend", test: (p) => p.t.original_language === "pa" && good(p, 5.5, 20) },
+      ] : [
+        { title: "Binge-worthy", dp: "weekend", test: (p) => good(p, 8.0, 1500) },
+        { title: "Crime and mystery", dp: "late", test: (p) => has(p, "Crime", "Mystery") && good(p, 7.3, 800) },
+        { title: "Comedy series", dp: "weeknight", test: (p) => has(p, "Comedy") && !has(p, "Animation") && good(p, 7.3, 600) },
+        { title: "For the whole family", dp: "weekend", test: (p) => has(p, "Family", "Kids") && ["TV-G", "TV-PG", "TV-Y", "TV-Y7"].includes(effCert(p.t)) && good(p, 7, 300) },
+        { title: "Indian shows people love", dp: "weeknight", test: (p) => ["hi", "pa"].includes(p.t.original_language) && good(p, 6.8, 40) },
+      ];
+      const dpNow = currentDaypart();
+      const moodRng = seededRng(`mood:${visitSeed}:${req.profileId}:${mode}`);
+      const built = [];
+      for (const m of MOODS) {
+        const items = pool.filter(notTvMovie).filter((p) => m.test(p))
+          .sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0)).slice(0, 80);
+        if (items.length >= 10) built.push({ m, items });
+      }
+      const ranked = built
+        .map((b, i) => ({ b, k: i + moodRng() * 6 - (b.m.dp === dpNow ? 3 : 0) }))
+        .sort((x, y) => x.k - y.k).slice(0, 3);
+      for (const { b } of ranked) {
+        const jittered = jitterOrder(b.items, seededRng(`mood-items:${visitSeed}:${req.profileId}:${b.m.title}`), 30);
+        rails.push({ title: b.m.title, total: b.items.length, items: jittered.slice(0, 40).map((p) => p.tile) });
+      }
+    }
 
     // Reorder the smart block: personal rails (new releases, because-you-
     // watched, people rails) stay up front; the rest are shuffled with a
@@ -11302,6 +11419,27 @@ async function startOrTouchTranscoder(mode, id, quality, offsetSecs = 0, audio =
 
 // The actual spawn. Only ever runs once per key at a time, gated by the
 // transcoderInflight single-flight map in startOrTouchTranscoder.
+// Source failover: when a movie's stream never opens (dead link / 4xx / empty
+// file), play another copy of the same title (see assignVariants) under the
+// same transcode key, so the viewer's manifest requests just start working.
+const sourceOverride = new Map(); // transcode key -> alternate stream id
+const failoverTried = new Map();  // transcode key -> { tried:Set<id>, at }
+function nextAltVariant(mode, id, tried) {
+  if (mode !== "movie") return null;
+  const ix = indexes.movie;
+  const me = ix?.byId?.get(parseInt(id, 10));
+  if (!me) return null;
+  const canon = me.isAlt ? ix.byId.get(me.canonicalId) : me;
+  const cands = (canon?.variants || []).map((v) => ix.byId.get(v.id)).filter(Boolean)
+    .filter((c) => String(c.id) !== String(id) && !tried.has(String(c.id)));
+  if (!cands.length) return null;
+  const isCam = (c) => (c.tags || []).includes("cam");
+  // Same audio language first (the viewer picked it), then any; never a CAM
+  // rip unless the failed one was a CAM too.
+  const ok = cands.filter((c) => !isCam(c) || isCam(me));
+  const same = ok.filter((c) => c.audioLang && c.audioLang === me.audioLang);
+  return (same[0] || ok[0] || null);
+}
 async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel = null, respawn = null, audioTrack = 0, swFallback = false) {
   audioTrack = normalizeAudioTrack(audioTrack);
   // Hardware encode for this run: the global VAAPI capability, unless this is
@@ -11340,17 +11478,19 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
   // for series the index keys by series_id (not episode_id), so the
   // lookup misses and we fall back to mp4 — matches the equivalent
   // probe-fallback in /api/download for the same reason.
+  // A failed-over movie reads from an alternate variant's stream id.
+  const srcId = (mode === "movie" && sourceOverride.get(key)) || id;
   let ext;
   if (mode === "live") {
     ext = "m3u8";
   } else if (mode === "movie") {
-    ext = indexes.movie.byId.get(parseInt(id, 10))?.container || "mp4";
+    ext = indexes.movie.byId.get(parseInt(srcId, 10))?.container || "mp4";
   } else if (MODES[mode].local) {
     ext = getIndexesFor(currentAccount()).disk?.byId?.get(parseInt(id, 10))?.container || "mp4";
   } else {
     ext = "mp4"; // series — see comment above
   }
-  const sourceUrl = streamUrl(mode, id, ext); // panel URL, or absolute path for disk
+  const sourceUrl = streamUrl(mode, srcId, ext); // panel URL, or absolute path for disk
   // Audio codec selection:
   //  - "stereo" (default): AAC 192/preset stereo. Max compatibility.
   //  - "surround": E-AC3 384k passthrough for AVR-connected Android TVs.
@@ -11698,7 +11838,28 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
       // The next manifest retry for this key is then refused fast instead of
       // machine-gunning ffmpeg at a dead input.
       if (connectFail && !entry.everConnected && !entry.stopping) {
+        // Before tripping the breaker: another copy of this movie may be alive.
+        if (recentViewer && mode === "movie") {
+          const ft = failoverTried.get(key) || { tried: new Set(), at: Date.now() };
+          ft.tried.add(String(sourceOverride.get(key) || id)); ft.at = Date.now();
+          failoverTried.set(key, ft);
+          const alt = nextAltVariant(mode, id, ft.tried);
+          if (alt && ft.tried.size <= 4) {
+            console.log(`[transcode ${key}] source ${sourceOverride.get(key) || id} unavailable — failing over to variant ${alt.id} (${alt.name})`);
+            sourceOverride.set(key, alt.id);
+            transcoders.delete(key);
+            fs.rmSync(dir, { recursive: true, force: true });
+            spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel, null, audioTrack, !!entry.swTried)
+              .catch((e) => {
+                console.log(`[transcode ${key}] failover spawn failed: ${e?.message || e}`);
+                transcoders.delete(key);
+                fs.rmSync(dir, { recursive: true, force: true });
+              });
+            return;
+          }
+        }
         transcoderFailures.set(key, Date.now());
+        sourceOverride.delete(key); failoverTried.delete(key);
       }
       transcoders.delete(key);
       fs.rmSync(dir, { recursive: true, force: true });
@@ -11753,6 +11914,10 @@ setInterval(() => {
     if (now - t.lastAccess > idleWindowMs()) {
       stopTranscoder(t, "idle");
     }
+  }
+  // Drop failover bookkeeping for keys that are gone (10 min).
+  for (const [key, ft] of failoverTried) {
+    if (!transcoders.has(key) && now - ft.at > 10 * 60 * 1000) { failoverTried.delete(key); sourceOverride.delete(key); }
   }
 }, 30_000);
 
