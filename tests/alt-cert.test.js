@@ -70,3 +70,11 @@ test("family heuristic: conservative", () => {
   assert.equal(familyHeuristicCert("series", ["Kids"], "x"), "TV-PG");
   assert.equal(familyHeuristicCert("series", ["Family", "Animation", "War & Politics"], "x"), "");
 });
+
+test("an unparsable rating vetoes a lenient verdict", () => {
+  assert.equal(altCertFromTmdb("movie", [rd("GB", "U"), rd("DE", "FSK 18")]).cert, "");
+  assert.equal(altCertFromTmdb("movie", [rd("GB", "U"), rd("NZ", "M")]).cert, "");
+  // ...but an already-restrictive verdict stands.
+  assert.equal(altCertFromTmdb("movie", [rd("GB", "15"), rd("NZ", "M")]).cert, "R");
+  assert.equal(familyHeuristicCert("movie", ["Family"], "Hot 18+"), "");
+});
