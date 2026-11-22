@@ -6516,9 +6516,14 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       for (const k of Object.keys(userState.progress || {})) {
         if (k.startsWith(mode + ":")) mine.add(k.split(":", 2)[1]);
       }
-      return Object.entries(getLastPlayedFor(currentAccount())[mode] || {})
+      const timed = Object.entries(getLastPlayedFor(currentAccount())[mode] || {})
         .filter(([id]) => mine.has(String(id)))
         .sort((x, y) => y[1] - x[1]);
+      // Series timestamps are keyed by episode, so they rarely match the show ids in
+      // recents: append this profile's recents (newest-first) that have no timestamp.
+      const have = new Set(timed.map(([id]) => String(id)));
+      for (const id of userState.recents?.[mode] || []) if (!have.has(String(id))) { timed.push([String(id), 0]); have.add(String(id)); }
+      return timed;
     })();
     const tmdbBy = (s) => tmdbFor(s.id);
     // Build the pool, deduplicating by tmdb_id so a movie that the
@@ -6695,10 +6700,10 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       addRail(c.name, c.items, { jitter: false });
     }
 
-    // Taste-driven people rails (movies only — TMDB cache carries cast /
-    // directors / runtime for movies): the director and the actor the
-    // household's recent plays share most. No AI, rebuilt every request.
-    if (mode === "movie") {
+    // Taste-driven people rails (movies and series — creators count as
+    // "directors" for TV): the director/creator and the actor the profile's
+    // recent plays share most. No AI, rebuilt every request.
+    {
       const recentIds = myPlays.slice(0, 25).map(([k]) => parseInt(k, 10)).filter(Number.isFinite);
       const watchedSet = new Set(recentIds);
       const watchedTmdb = new Set(recentIds.map(id => tmdbFor(id)?.tmdb_id).filter(Boolean));
@@ -6723,8 +6728,10 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       if (actName && actName !== dirName) {
         peopleRail(`Starring ${actName}`, t => (t.cast || []).slice(0, 6).some(a => a?.name === actName));
       }
-      // Runtime-shaped rails — the daypart weights below decide which
-      // one leads (weeknights: quick; weekends: epics).
+    }
+    if (mode === "movie") {
+      // Runtime-shaped rails (movies only) — the daypart weights below decide
+      // which one leads (weeknights: quick; weekends: epics).
       addRail("Quick watch · under 100 min", poolV
         .filter(p => p.t.runtime >= 70 && p.t.runtime <= 100 && (p.t.rating || 0) >= 6.3 && (p.t.vote_count || 0) >= 300)
         .filter(notTvMovie));
