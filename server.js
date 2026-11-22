@@ -2428,7 +2428,8 @@ async function saveIndexToDisk(mode, actx = currentAccount()) {
 // `us_cert` now goes through effCert().
 const effCert = (t) => (t ? (t.us_cert || t.cert_alt || "") : "");
 const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
-const { createPrewarmQueue } = require("./lib/prewarm-queue");
+const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue");
+const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
 const certBackfill = { running: false, done: 0, total: 0 };
 async function tmdbRaw(pathAndQuery) {
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -2922,7 +2923,7 @@ async function clearDiskIndexes(actx = currentAccount()) {
 }
 
 function xtreamKey(actx, action, params) {
-  return `${accountKeyOf(actx)}\0${action}${JSON.stringify(params)}`;
+  return xtreamKeyFor(accountKeyOf(actx), action, params);
 }
 function xtreamIsFresh(actx, action, params) {
   const key = xtreamKey(actx, action, params);
@@ -2935,23 +2936,12 @@ function xtreamIsFresh(actx, action, params) {
 // instead of a (up to ~19 s) live panel round-trip. Only warms the xtream
 // cache; the /info handler still runs its side effects on first open.
 const detailPrewarm = createPrewarmQueue({
-  fetcher: (e) => xtream(MODES[e.mode].info, { [e.idKey]: e.id }, { actx: e.actx, timeout: 20_000 }),
+  fetcher: (e) => xtream(MODES[e.mode].info, { [e.idKey]: e.id }, { actx: e.actx }),
   isCached: (e) => xtreamIsFresh(e.actx, MODES[e.mode].info, { [e.idKey]: e.id }),
   shouldYield: () => streamingNow(null),
 });
 function prewarmDetails(mode, ids, actx, max = 8) {
-  if (mode !== "movie" && mode !== "series") return 0;
-  const idKey = mode === "series" ? "series_id" : "vod_id";
-  const out = [];
-  const seen = new Set();
-  for (const raw of ids) {
-    const id = String(raw ?? "");
-    if (!/^\d+$/.test(id) || seen.has(id)) continue;
-    seen.add(id);
-    out.push({ key: `${accountKeyOf(actx)}|${mode}|${id}`, mode, idKey, id, actx });
-    if (out.length >= max) break;
-  }
-  return detailPrewarm.enqueue(out);
+  return detailPrewarm.enqueue(buildDetailEntries(mode, ids, actx, accountKeyOf(actx), max));
 }
 
 async function xtream(action, params = {}, opts = {}) {
@@ -7630,7 +7620,7 @@ function advanceToNextEpisode(userState, finishedEpisodeId) {
   if (!entry) return;
   const [seriesId, le] = entry;
   const actx = currentAccount();
-  const infoKey = (sid) => `${accountKeyOf(actx)} ${MODES.series.info}${JSON.stringify({ series_id: sid })}`;
+  const infoKey = (sid) => xtreamKey(actx, MODES.series.info, { series_id: sid });
   const hit = cache.get(infoKey(String(seriesId))) || cache.get(infoKey(parseInt(seriesId, 10)));
   const info = hit && Date.now() - hit.t < TTL_MS ? hit.v : null;
   const seasons = info?.episodes && typeof info.episodes === "object" ? info.episodes : null;
