@@ -2428,6 +2428,7 @@ async function saveIndexToDisk(mode, actx = currentAccount()) {
 // `us_cert` now goes through effCert().
 const effCert = (t) => (t ? (t.us_cert || t.cert_alt || "") : "");
 const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
+const { createPrewarmQueue } = require("./lib/prewarm-queue");
 const certBackfill = { running: false, done: 0, total: 0 };
 async function tmdbRaw(pathAndQuery) {
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -2920,13 +2921,46 @@ async function clearDiskIndexes(actx = currentAccount()) {
   }
 }
 
+function xtreamKey(actx, action, params) {
+  return `${accountKeyOf(actx)}\0${action}${JSON.stringify(params)}`;
+}
+function xtreamIsFresh(actx, action, params) {
+  const key = xtreamKey(actx, action, params);
+  const hit = cache.get(key);
+  return !!((hit && Date.now() - hit.t < TTL_MS) || inflight.has(key));
+}
+
+// Background warm-up of get_vod_info / get_series_info for titles the home
+// screen just surfaced, so the first detail-screen open is a cache hit
+// instead of a (up to ~19 s) live panel round-trip. Only warms the xtream
+// cache; the /info handler still runs its side effects on first open.
+const detailPrewarm = createPrewarmQueue({
+  fetcher: (e) => xtream(MODES[e.mode].info, { [e.idKey]: e.id }, { actx: e.actx, timeout: 20_000 }),
+  isCached: (e) => xtreamIsFresh(e.actx, MODES[e.mode].info, { [e.idKey]: e.id }),
+  shouldYield: () => streamingNow(null),
+});
+function prewarmDetails(mode, ids, actx, max = 8) {
+  if (mode !== "movie" && mode !== "series") return 0;
+  const idKey = mode === "series" ? "series_id" : "vod_id";
+  const out = [];
+  const seen = new Set();
+  for (const raw of ids) {
+    const id = String(raw ?? "");
+    if (!/^\d+$/.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ key: `${accountKeyOf(actx)}|${mode}|${id}`, mode, idKey, id, actx });
+    if (out.length >= max) break;
+  }
+  return detailPrewarm.enqueue(out);
+}
+
 async function xtream(action, params = {}, opts = {}) {
   const { timeout = 90_000, actx = currentAccount() } = opts;
   // Scope the cache + inflight map by accountKey so two accounts (owner
   // and a friend on a different reseller host, or just different panel
   // logins) don't poison each other. Same action+params under different
   // creds will yield different upstream responses.
-  const key = `${accountKeyOf(actx)} ${action}${JSON.stringify(params)}`;
+  const key = xtreamKey(actx, action, params);
   const hit = cache.get(key);
   if (hit && Date.now() - hit.t < TTL_MS) return hit.v;
   if (inflight.has(key)) return inflight.get(key);
@@ -7355,6 +7389,19 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       .replace(/^-+|-+$/g, "");
     if (slug) r.category_id = `__rail-${slug}`;
   }
+
+  // Warm the detail-info cache for what the user is most likely to open:
+  // hero first, then the leading rails' first items. Fire-and-forget.
+  try {
+    if (mode === "movie" || mode === "series") {
+      const lead = [];
+      for (const h of hero) if (!h.isSeriesGroup) lead.push(h.id);
+      for (const r of rails.slice(0, 6)) {
+        for (const it of (r.items || []).slice(0, 4)) if (!it.isSeriesGroup) lead.push(it.id);
+      }
+      prewarmDetails(mode, lead, req.account || currentAccount(), 8);
+    }
+  } catch {}
 
   res.json({
     mode,
