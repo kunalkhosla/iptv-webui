@@ -8859,6 +8859,47 @@ app.get("/api/:mode(movie|series)/info/:id", async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---- Subtitles (OpenSubtitles, lazy + disk-cached; see lib/subtitles.js) ----
+const subtitleSvc = require("./lib/subtitles").createSubtitleService({ dataDir: DATA_DIR });
+function subtitleCtx(req, mode, id) {
+  // Series ids are series ids; the episode comes from ?season=&episode=.
+  if (mode !== "series") return { mode, id };
+  const season = String(req.query.season ?? ""), episode = String(req.query.episode ?? "");
+  if (!/^\d{1,4}$/.test(season) || !/^\d{1,5}$/.test(episode)) return null;
+  return { mode, id, season, episode };
+}
+const subtitleQs = (c) => (c.mode === "series" ? `?season=${c.season}&episode=${c.episode}` : "");
+const subtitleEntries = (c) => subtitleSvc.listLangs(c).map((lang) => ({ lang, label: subtitleSvc.LANGS[lang], url: `/api/subtitles/${c.mode}/${c.id}/${lang}.vtt${subtitleQs(c)}` }));
+async function subtitleTmdb(mode, id) {
+  const numId = parseInt(id, 10);
+  const item = indexes[mode]?.byId.get(numId) || indexes[mode]?.byId.get(id);
+  if (!item) return null;
+  const entry = await ensureTmdbForItem(mode, id, { name: item.name, year: item.year, lang: isoLangForItem(item), forcedKind: item.isSeriesGroup ? "series" : undefined });
+  return entry && entry.source === "tmdb" && entry.tmdb_id ? entry : null;
+}
+app.get("/api/subtitles/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next) => {
+  try {
+    res.set("Cache-Control", "private, max-age=300");
+    const c = subtitleCtx(req, req.params.mode, req.params.id);
+    if (!c || !TMDB_API_KEY || !subtitleSvc.enabled()) return res.json([]);
+    const entry = await subtitleTmdb(c.mode, c.id);
+    res.json(entry ? subtitleEntries(c) : []);
+  } catch (e) { next(e); }
+});
+app.get("/api/subtitles/:mode(movie|series)/:id(\\d{1,12})/:lang(en|hi).vtt", async (req, res, next) => {
+  try {
+    const c = subtitleCtx(req, req.params.mode, req.params.id);
+    if (!c) return res.status(404).json({ error: "no subtitles" });
+    const entry = await subtitleTmdb(c.mode, c.id);
+    if (!entry) return res.status(404).json({ error: "no subtitles" });
+    const file = await subtitleSvc.getVtt({ ...c, lang: req.params.lang, tmdbId: entry.tmdb_id, year: entry.year });
+    if (!file) return res.status(404).json({ error: "no subtitles" });
+    res.set("Cache-Control", "private, max-age=86400");
+    res.type("text/vtt; charset=utf-8");
+    res.sendFile(file);
+  } catch (e) { next(e); }
+});
+
 // TMDB poster + metadata for a movie or series. Returns null TMDB
 // fields when no key is configured or when nothing matches — the
 // client falls back to the panel artwork in either case. We pull the
@@ -12738,8 +12779,24 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     transcodeAnchorSecs: offsetSecs,
     forceTranscode,
     forceReason,
+    subtitles: streamSubtitles(req),
   });
 });
+
+// Cache-only (never calls TMDB or OpenSubtitles): lazy en/hi URLs when the
+// title already has a TMDB match. Series need ?series=<id>&season=&episode=.
+function streamSubtitles(req) {
+  try {
+    const mode = req.params.mode;
+    if (mode !== "movie" && mode !== "series") return [];
+    const id = mode === "series" ? String(req.query.series ?? "") : req.params.id;
+    if (!/^\d{1,12}$/.test(id)) return [];
+    const e = tmdbCache[`${mode}:${id}`];
+    if (!e || e.source !== "tmdb" || !e.tmdb_id || !subtitleSvc.enabled()) return [];
+    const c = subtitleCtx(req, mode, id);
+    return c ? subtitleEntries(c) : [];
+  } catch { return []; }
+}
 
 // Audio-track list for a panel VOD (movie/series). The client calls this
 // after playback starts; if >1 audio track it shows a picker, and
