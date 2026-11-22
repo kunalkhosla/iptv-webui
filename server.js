@@ -2445,6 +2445,7 @@ async function tmdbRaw(pathAndQuery) {
   return null;
 }
 function refreshIndexCerts() {
+  catalogGen++;
   for (const m of ["movie", "series"]) {
     const ix = indexes[m];
     if (!ix?.byId) continue;
@@ -2522,6 +2523,15 @@ function scheduleAltCerts() {
 // English comes from the US catalogs; Hindi and Punjabi from the India
 // catalogs (they differ from the US ones). Filtered by the TITLE's original
 // language, so a Korean show on Netflix never appears.
+// Bumped whenever catalog metadata changes IN PLACE (variants, ratings, TMDB
+// matches) so the /api/home caches below don't serve stale groupings.
+let catalogGen = 0;
+function putHomeCache(map, key, val) {
+  const now = Date.now();
+  for (const [k, v] of map) if (now - v.at > 8 * 60 * 1000) map.delete(k);
+  while (map.size >= 12) map.delete(map.keys().next().value); // oldest first
+  map.set(key, { ...val, gen: catalogGen, at: now });
+}
 const catBucketCache = new Map(); // gate signature -> { byId, at, map } (category grouping, see /api/home)
 const smartPoolCache = new Map(); // gate signature -> { byId, at, pool } (see /api/home)
 const BUZZ_LANG_NAME = { en: "English", hi: "Hindi", pa: "Punjabi" };
@@ -2712,6 +2722,7 @@ function assignVariants(mode, actx = currentAccount()) {
     grouped++;
   }
   ix.byTmdb = byTmdb;
+  catalogGen++;
   console.log(`[${mode}] variants: ${grouped} multi-version titles, ${hidden} alternates folded`);
 }
 // Per-request: should stream `s` be hidden because another variant of the same
@@ -5888,7 +5899,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   ].join("|");
   let byCat;
   const cachedCats = catBucketCache.get(gateSig);
-  if (cachedCats && cachedCats.byId === ix.byId && Date.now() - cachedCats.at < 8 * 60 * 1000) {
+  if (ix.ready && cachedCats && cachedCats.byId === ix.byId && cachedCats.gen === catalogGen && Date.now() - cachedCats.at < 8 * 60 * 1000) {
     byCat = new Map(cachedCats.map); // shallow copy: callers replace entries with their sliced items
   } else {
     byCat = new Map();
@@ -5901,7 +5912,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       if (!bucket) { bucket = []; byCat.set(cid, bucket); }
       bucket.push(s);
     }
-    catBucketCache.set(gateSig, { byId: ix.byId, at: Date.now(), map: new Map(byCat) });
+    if (ix.ready) putHomeCache(catBucketCache, gateSig, { byId: ix.byId, map: new Map(byCat) }); // never cache a half-built catalog
   }
   // For kid profiles: sort each bucket so cert-passing items come first,
   // then slice to 12. Without this the cap picks the first 12 by index
@@ -6521,7 +6532,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // (rebuilding it dominated /api/home: ~44k tileFor calls per request).
     const cachedPool = smartPoolCache.get(gateSig);
     let pool, poolV, poolR;
-    if (cachedPool && cachedPool.byId === ix.byId && Date.now() - cachedPool.at < 8 * 60 * 1000) {
+    if (ix.ready && cachedPool && cachedPool.byId === ix.byId && cachedPool.gen === catalogGen && Date.now() - cachedPool.at < 8 * 60 * 1000) {
       pool = cachedPool.pool; poolV = cachedPool.byVotes; poolR = cachedPool.byRating;
     } else {
       pool = [];
@@ -6547,7 +6558,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       // Pre-sorted views, so rails filter an already-ordered list instead of sorting 10-20k items each.
       const byVotes = [...pool].sort((a, b) => (b.t.vote_count || 0) - (a.t.vote_count || 0));
       const byRating = [...pool].sort((a, b) => (b.t.rating || 0) - (a.t.rating || 0));
-      smartPoolCache.set(gateSig, { byId: ix.byId, at: Date.now(), pool, byVotes, byRating });
+      if (ix.ready) putHomeCache(smartPoolCache, gateSig, { byId: ix.byId, pool, byVotes, byRating });
       poolV = byVotes; poolR = byRating;
     }
     // TV Movie is a TMDB genre that lumps in straight-to-streaming
