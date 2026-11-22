@@ -2651,12 +2651,15 @@ async function checkStreamingArrivals({ reason = "cron" } = {}) {
     const dayStr = (d) => d.toISOString().slice(0, 10);
     const since = dayStr(new Date(now.getTime() - 120 * 86400000));
     const today = dayStr(now);
+    const recentCut = dayStr(new Date(now.getTime() - 60 * 86400000)); // an "arrival" must be a recent release
     const seeded = !!streamingArrivals.seeded;
     const snap = streamingArrivals.snap || {};
+    const everSeen = streamingArrivals.everSeen || {};   // "kind:tmdb_id:platform" -> ts (never re-announce)
     const log = Array.isArray(streamingArrivals.log) ? streamingArrivals.log : [];
     const nextSnap = {};
+    const nextSeen = { ...everSeen };
     const added = [];
-    let failures = 0;
+    let failures = 0, anomalies = 0;
     for (const src of BUZZ_SOURCES) {
       if (src.platform === "trending") continue;
       for (const kind of ["movie", "tv"]) {
@@ -2672,25 +2675,32 @@ async function checkStreamingArrivals({ reason = "cron" } = {}) {
             [kind === "movie" ? "primary_release_date.lte" : "first_air_date.lte"]: today,
           }).toString();
           const res = await tmdbRaw(`/discover/${kind}?${params}`);
-          if (!res) { ok = false; break; }
+          if (!res || (res.results || []).length === 0 && page === 1 && (snap[key] || []).length > 0) { ok = false; break; } // error / suspicious empty
           for (const r of res.results || []) {
             if (!BUZZ_LANGS.has(r.original_language)) continue;
+            const date = String((kind === "movie" ? r.release_date : r.first_air_date) || "");
             rows.push({
-              id: r.id, title: kind === "movie" ? r.title : r.name,
-              year: String((kind === "movie" ? r.release_date : r.first_air_date) || "").slice(0, 4) || null,
-              overview: String(r.overview || "").slice(0, 200),
+              id: r.id, title: kind === "movie" ? r.title : r.name, date,
+              year: date.slice(0, 4) || null, overview: String(r.overview || "").slice(0, 200),
             });
           }
           if (page >= (res.total_pages || 1)) break;
         }
-        if (!ok) { failures++; nextSnap[key] = snap[key] || []; continue; } // keep the old snapshot on failure
+        if (!ok) { failures++; if (Array.isArray(snap[key])) nextSnap[key] = snap[key]; continue; } // keep old; never invent []
         const prev = new Set(snap[key] || []);
         nextSnap[key] = rows.map((r) => r.id);
-        if (!seeded || !snap[key]) continue; // first sight of this list only seeds it
+        const fresh = [];
         for (const r of rows) {
-          if (prev.has(r.id)) continue;
+          const sk = `${kind}:${r.id}:${src.platform}`;
+          if (!nextSeen[sk]) { nextSeen[sk] = Date.now(); if (seeded && Array.isArray(snap[key]) && !prev.has(r.id)) fresh.push(r); }
+        }
+        if (!seeded || !Array.isArray(snap[key])) continue; // first sight of this list only seeds it
+        // Flood breaker: a big jump in one list is a data anomaly, not 15 premieres.
+        if (fresh.length > 15) { anomalies++; continue; }
+        for (const r of fresh) {
+          if (r.date && r.date < recentCut) continue; // slid in from deep in the window: not a new release
           added.push({
-            tmdb_id: r.id, title: r.title, year: r.year, overview: r.overview,
+            tmdb_id: r.id, title: r.title, year: r.year, date: r.date, overview: r.overview,
             kind: kind === "movie" ? "movie" : "series",
             platform: src.platform, platform_label: src.label, lang: src.lang, first_seen: Date.now(),
           });
@@ -2698,16 +2708,19 @@ async function checkStreamingArrivals({ reason = "cron" } = {}) {
       }
     }
     const cutoff = Date.now() - 60 * 86400000;
+    const seenCut = Date.now() - 150 * 86400000;
+    for (const [k, t] of Object.entries(nextSeen)) if (t < seenCut) delete nextSeen[k];
     streamingArrivals = {
-      seeded: true, updatedAt: Date.now(), snap: nextSnap,
+      seeded: true, updatedAt: Date.now(), snap: nextSnap, everSeen: nextSeen,
+      cursors: streamingArrivals.cursors || {},
       log: [...added, ...log].filter((a) => a.first_seen > cutoff).slice(0, 2000),
     };
     try {
       fs.writeFileSync(streamingArrivalsFile + ".tmp", JSON.stringify(streamingArrivals));
       fs.renameSync(streamingArrivalsFile + ".tmp", streamingArrivalsFile);
     } catch (e) { console.warn(`[arrivals] save failed: ${e.message}`); }
-    console.log(`[arrivals] (${reason}) ${seeded ? added.length + " new" : "seeded"}${failures ? `, ${failures} lists failed` : ""}`);
-    return { ok: true, seeded: !seeded, new: added.length, failures };
+    console.log(`[arrivals] (${reason}) ${seeded ? added.length + " new" : "seeded"}${failures ? `, ${failures} lists failed` : ""}${anomalies ? `, ${anomalies} anomalous lists reseeded` : ""}`);
+    return { ok: true, seeded: !seeded, new: added.length, failures, anomalies };
   } finally {
     arrivalsRunning = false;
   }
@@ -10351,13 +10364,16 @@ const MCP_TOOLS = [
     description: "NEW arrivals on the streaming platforms (Netflix, Prime Video, HBO Max, Disney+, Apple TV+, "
       + "Hulu, Paramount+, Peacock; JioHotstar/ZEE5/SonyLIV/MX Player for Hindi and Punjabi) — movies and "
       + "series that newly became available since the last check, English/Hindi/Punjabi only. Checked every "
-      + "6 hours. `since_hours` (default 24), `platform`, `language` english|hindi|punjabi, `kind` "
-      + "movie|series. Each item has the platform, title, year, a short overview, `in_khouch` (and a `ref` "
-      + "when Khouch has it). Use it for 'what's new on Netflix', and for the daily new-arrivals alert.",
+      + "6 hours. Covers NEW RELEASES that became available (released in the last ~60 days); an older "
+      + "title added to a catalog is not detected. `unseen: true` returns only arrivals not already "
+      + "returned to this caller (for a recurring alert); otherwise `since_hours` (default 24). Also "
+      + "`platform`, `language` english|hindi|punjabi, `kind` movie|series. Each item has the platform, "
+      + "title, year, a short overview, `in_khouch` (and a `ref` when Khouch has it).",
     inputSchema: {
       type: "object",
       properties: {
         since_hours: { type: "integer", minimum: 1, maximum: 1440 },
+        unseen: { type: "boolean" },
         platform: { type: "string" },
         language: { type: "string", enum: ["english", "hindi", "punjabi"] },
         kind: { type: "string", enum: ["movie", "series"] },
@@ -10374,7 +10390,10 @@ const MCP_TOOLS = [
       const wantP = ALIASES[norm(args.platform)] || norm(args.platform);
       const wantL = LANGS[norm(args.language)] || null;
       const wantK = args.kind === "movie" ? "movie" : args.kind === "series" ? "series" : null;
-      const cutoff = Date.now() - hours * 3600 * 1000;
+      const callerKey = `${req.user?.id || "u"}:${req.profileId || "p"}`;
+      const cursors = (streamingArrivals.cursors ||= {});
+      // `unseen`: everything newer than this caller's cursor (first call: the last 24h).
+      const cutoff = args.unseen ? (cursors[callerKey] ?? Date.now() - 24 * 3600 * 1000) : Date.now() - hours * 3600 * 1000;
       const prof = findProfile(req.profileId);
       const isKid = !!prof?.kidsBirthYear;
       const kidBlocked = makeKidsBlocker(prof);
@@ -10400,6 +10419,15 @@ const MCP_TOOLS = [
           in_khouch: !!s, ...(s ? { ref: mcpHit(mode, s).ref } : {}),
         });
         if (out.length >= limit) break;
+      }
+      if (args.unseen) {
+        // Covered everything up to the last check (a truncated list drops the overflow;
+        // repeating the same top items forever would be worse for an alert).
+        cursors[callerKey] = streamingArrivals.updatedAt || Date.now();
+        try {
+          fs.writeFileSync(streamingArrivalsFile + ".tmp", JSON.stringify(streamingArrivals));
+          fs.renameSync(streamingArrivalsFile + ".tmp", streamingArrivalsFile);
+        } catch (e) { console.warn(`[arrivals] cursor save failed: ${e.message}`); }
       }
       return { updated: new Date(streamingArrivals.updatedAt || 0).toISOString(), count: out.length, arrivals: out };
     },
