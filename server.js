@@ -8875,29 +8875,37 @@ async function subtitleTmdb(mode, id) {
   const item = indexes[mode]?.byId.get(numId) || indexes[mode]?.byId.get(id);
   if (!item) return null;
   const entry = await ensureTmdbForItem(mode, id, { name: item.name, year: item.year, lang: isoLangForItem(item), forcedKind: item.isSeriesGroup ? "series" : undefined });
-  return entry && entry.source === "tmdb" && entry.tmdb_id ? entry : null;
+  if (!entry || entry.source !== "tmdb" || !entry.tmdb_id) return null;
+  // tmdb_id of a movie vs a TV show differ; never feed one into the other's search.
+  // (tmdb_kind "series" marks a movie-mode item that resolved to a TV show.)
+  if (mode === "movie" && entry.tmdb_kind === "series") return null;
+  return entry;
 }
 app.get("/api/subtitles/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next) => {
   try {
-    res.set("Cache-Control", "private, max-age=300");
     const c = subtitleCtx(req, req.params.mode, req.params.id);
-    if (!c || !TMDB_API_KEY || !subtitleSvc.enabled()) return res.json([]);
-    const entry = await subtitleTmdb(c.mode, c.id);
-    res.json(entry ? subtitleEntries(c) : []);
+    const entry = c && TMDB_API_KEY && subtitleSvc.enabled() ? await subtitleTmdb(c.mode, c.id) : null;
+    const list = entry ? subtitleEntries(c) : [];
+    res.set("Cache-Control", list.length ? "private, max-age=300" : "no-store");
+    res.json(list);
   } catch (e) { next(e); }
 });
 app.get("/api/subtitles/:mode(movie|series)/:id(\\d{1,12})/:lang(en|hi).vtt", async (req, res, next) => {
   try {
+    const none = () => { res.set("Cache-Control", "no-store"); return res.status(404).json({ error: "no subtitles" }); };
     const c = subtitleCtx(req, req.params.mode, req.params.id);
-    if (!c) return res.status(404).json({ error: "no subtitles" });
+    if (!c) return none();
     const entry = await subtitleTmdb(c.mode, c.id);
-    if (!entry) return res.status(404).json({ error: "no subtitles" });
+    if (!entry) return none();
     const file = await subtitleSvc.getVtt({ ...c, lang: req.params.lang, tmdbId: entry.tmdb_id, year: entry.year });
-    if (!file) return res.status(404).json({ error: "no subtitles" });
+    if (!file) return none();
     res.set("Cache-Control", "private, max-age=86400");
     res.type("text/vtt; charset=utf-8");
-    res.sendFile(file);
-  } catch (e) { next(e); }
+    res.sendFile(path.resolve(file));
+  } catch (e) {
+    if (e && e.busy) { res.set({ "Retry-After": String(e.retryAfter || 10), "Cache-Control": "no-store" }); return res.status(503).json({ error: "busy" }); }
+    next(e);
+  }
 });
 
 // TMDB poster + metadata for a movie or series. Returns null TMDB
@@ -12793,6 +12801,7 @@ function streamSubtitles(req) {
     if (!/^\d{1,12}$/.test(id)) return [];
     const e = tmdbCache[`${mode}:${id}`];
     if (!e || e.source !== "tmdb" || !e.tmdb_id || !subtitleSvc.enabled()) return [];
+    if (mode === "movie" && e.tmdb_kind === "series") return [];
     const c = subtitleCtx(req, mode, id);
     return c ? subtitleEntries(c) : [];
   } catch { return []; }
