@@ -3,7 +3,7 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
-const { spawn, spawnSync } = require("child_process");
+const { spawn, spawnSync, execFile } = require("child_process");
 const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 const { AsyncLocalStorage } = require("async_hooks");
@@ -4580,11 +4580,192 @@ async function resolveDownloadSourceUrl(mode, id, actx = currentAccount()) {
   return { sourceUrl: null, ext: null, error: lastProbeErr };
 }
 
+// ── Phone downloads v2 ───────────────────────────────────────────────
+// The old /api/download piped a LIVE re-encode to DownloadManager: no size,
+// no resume, silent truncation. v2 prepares a finished 720p MP4 first:
+//   1. fetch the ORIGINAL file from the panel into the cache dir (Range resume,
+//      takes the single provider connection and yields to anyone watching),
+//   2. encode it locally (GPU, faststart MP4, ~1-2 GB per film) — no provider
+//      connection needed for this step,
+//   3. serve the finished file with Content-Length + Range, so the phone's
+//      DownloadManager gets a real percentage and can resume.
+// One job at a time. Clients: POST /api/download/prepare/:mode/:id, poll
+// GET /api/download/status/:mode/:id, then download the signed `url`.
+const DL_DIR = path.join(DATA_DIR, "download-cache");
+const DL_MAX_BYTES = 40 * 1024 ** 3;
+const DL_TTL_MS = 48 * 3600 * 1000;
+const DL_MIN_FREE_BYTES = 8 * 1024 ** 3;
+const DL_MAX_FETCH_RETRIES = 6;
+const dlJobs = new Map();   // "mode_id" -> job
+const dlQueue = [];
+let dlRunning = false;
+const dlKey = (mode, id) => `${mode}_${id}`;
+const dlFile = (k) => path.join(DL_DIR, `${k}.mp4`);
+const dlSrcPath = (k) => path.join(DL_DIR, `${k}.src.part`);
+const dlOutPath = (k) => path.join(DL_DIR, `${k}.out.part.mp4`);
+try {
+  fs.mkdirSync(DL_DIR, { recursive: true });
+  // Unfinished work from a previous run is not resumable across restarts: drop it.
+  for (const f of fs.readdirSync(DL_DIR)) if (f.endsWith(".part") || f.endsWith(".part.mp4")) fs.rmSync(path.join(DL_DIR, f), { force: true });
+} catch (e) { console.warn(`[download] cache dir: ${e.message}`); }
+
+function dlSignedUrl(mode, id) {
+  const sig = crypto.createHmac("sha256", PROXY_SECRET).update(`download:${mode}:${id}`).digest("hex").slice(0, 16);
+  return `/api/download/${mode}/${id}.mp4?s=${sig}&v=2`;
+}
+function dlView(mode, id) {
+  const k = dlKey(mode, id);
+  let st = null;
+  try { st = fs.statSync(dlFile(k)); } catch {}
+  if (st && st.size > 0) return { state: "ready", pct: 100, size: st.size, url: dlSignedUrl(mode, id) };
+  const j = dlJobs.get(k);
+  if (!j) return { state: "none" };
+  return {
+    state: j.state, pct: Math.max(0, Math.min(99, Math.round(j.pct || 0))), stage: j.stage || null,
+    bytes: j.bytes || 0, error: j.error || null, queue_position: j.state === "queued" ? dlQueue.indexOf(j) + 1 : 0,
+  };
+}
+function ensureDownloadJob(mode, id, actx) {
+  const k = dlKey(mode, id);
+  const view = dlView(mode, id);
+  if (view.state === "ready") { try { fs.utimesSync(dlFile(k), new Date(), new Date()); } catch {} return view; }
+  const cur = dlJobs.get(k);
+  if (cur && cur.state !== "failed") return dlView(mode, id);
+  const job = { key: k, mode, id, actx, state: "queued", stage: "queued", pct: 0, bytes: 0, error: null, createdAt: Date.now() };
+  dlJobs.set(k, job);
+  dlQueue.push(job);
+  dlPump();
+  return dlView(mode, id);
+}
+function dlPump() {
+  if (dlRunning) return;
+  const job = dlQueue.shift();
+  if (!job) return;
+  dlRunning = true;
+  runDownloadJob(job)
+    .catch((e) => { job.state = "failed"; job.error = e.message; console.warn(`[download] ${job.key} crashed: ${e.message}`); })
+    .finally(() => { dlRunning = false; pruneDownloadCache(); dlPump(); });
+}
+function pruneDownloadCache() {
+  try {
+    const files = fs.readdirSync(DL_DIR).filter((f) => f.endsWith(".mp4") && !f.endsWith(".part.mp4"))
+      .map((f) => { const st = fs.statSync(path.join(DL_DIR, f)); return { f, size: st.size, t: st.mtimeMs }; })
+      .sort((a, b) => a.t - b.t);
+    let total = files.reduce((n, x) => n + x.size, 0);
+    const now = Date.now();
+    for (const x of files) {
+      if (now - x.t > DL_TTL_MS || total > DL_MAX_BYTES) {
+        fs.rmSync(path.join(DL_DIR, x.f), { force: true });
+        dlJobs.delete(x.f.replace(/\.mp4$/, ""));
+        total -= x.size;
+      }
+    }
+  } catch (e) { console.warn(`[download] prune: ${e.message}`); }
+}
+setInterval(pruneDownloadCache, 30 * 60 * 1000).unref?.();
+
+async function runDownloadJob(job) {
+  const { mode, id, actx, key } = job;
+  const freeBytes = diskDownloadFreeBytes(DL_DIR);
+  if (freeBytes != null && freeBytes < DL_MIN_FREE_BYTES) {
+    job.state = "failed"; job.error = "server disk almost full"; return;
+  }
+  const { sourceUrl, error: probeErr } = await resolveDownloadSourceUrl(mode, id, actx);
+  if (!sourceUrl) { job.state = "failed"; job.error = `this title isn't available from the provider right now (${probeErr})`; return; }
+  const srcPath = dlSrcPath(key);
+  const owner = `phone-download:${key}`;
+  const accountKey = accountKeyOf(actx);
+  // ── 1. fetch the original (Range resume; yields to viewers) ──
+  let fetched = false;
+  for (let attempt = 0; attempt <= DL_MAX_FETCH_RETRIES && !fetched;) {
+    job.stage = "fetching";
+    // Never admit while someone else holds the slot (newest-wins would evict the viewer).
+    const slotHeld = [...streams.entries()].some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced);
+    if (slotHeld) { job.state = "waiting"; await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS)); continue; }
+    const ac = new AbortController();
+    const killer = () => ac.abort();
+    const admission = admitStream(owner, mode, id, killer, accountKey);
+    if (!admission.ok) { job.state = "waiting"; await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS)); continue; }
+    job.state = "running";
+    let startByte = 0;
+    try { startByte = fs.statSync(srcPath).size; } catch {}
+    try {
+      const resp = await fetch(sourceUrl, {
+        headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 12; Smart TV)", ...(startByte > 0 ? { Range: `bytes=${startByte}-` } : {}) },
+        redirect: "follow", signal: ac.signal,
+      });
+      if (!resp.ok && resp.status !== 206) throw new Error(`HTTP ${resp.status}`);
+      const resumed = resp.status === 206;
+      const total = resumed ? Number(resp.headers.get("content-range")?.split("/")?.[1]) || null : Number(resp.headers.get("content-length")) || null;
+      job.bytes = resumed ? startByte : 0;
+      const out = fs.createWriteStream(srcPath, { flags: resumed ? "a" : "w" });
+      const source = Readable.fromWeb(resp.body);
+      source.on("data", (chunk) => { job.bytes += chunk.length; if (total) job.pct = (job.bytes / total) * 50; touchStream(owner); });
+      await pipeline(source, out);
+      const actual = fs.statSync(srcPath).size;
+      if (actual === 0 || (total != null && actual < total)) throw new Error(`truncated transfer: got ${actual} of ${total} bytes`);
+      fetched = true;
+    } catch (e) {
+      if (ac.signal.aborted) { job.state = "waiting"; streams.delete(owner); await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS)); continue; } // a viewer arrived: resume later
+      attempt++;
+      job.error = e.message;
+      streams.delete(owner);
+      if (attempt > DL_MAX_FETCH_RETRIES) { job.state = "failed"; job.error = `download from provider failed: ${e.message}`; try { fs.rmSync(srcPath, { force: true }); } catch {} return; }
+      await new Promise((r) => setTimeout(r, Math.min(5000 * attempt, 30000)));
+    }
+  }
+  dropStreamKiller(owner, null);
+  streams.delete(owner); // encode reads the local file: free the provider connection
+  // ── 2. encode to a small faststart MP4 ──
+  job.state = "running"; job.stage = "encoding"; job.error = null; job.pct = 50;
+  const durationSecs = await new Promise((resolve) => {
+    execFile("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", srcPath], { timeout: 20000 }, (err, out) => resolve(err ? null : parseFloat(out)));
+  });
+  const outPath = dlOutPath(key);
+  const encode = (useHw) => new Promise((resolve) => {
+    try { fs.rmSync(outPath, { force: true }); } catch {}
+    const args = ["-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-y"];
+    if (useHw) args.push("-hwaccel", "vaapi", "-hwaccel_device", VAAPI_DEVICE, "-hwaccel_output_format", "vaapi");
+    args.push("-i", srcPath, "-map", "0:v:0", "-map", "0:a:0?");
+    if (useHw) args.push("-vf", "scale_vaapi=w='min(1280,iw)':h=-2:format=nv12", "-c:v", "h264_vaapi", "-qp", "26", "-profile:v", "high");
+    else args.push("-vf", "scale='min(1280,iw)':-2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-profile:v", "high", "-pix_fmt", "yuv420p");
+    args.push("-c:a", "aac", "-b:a", "128k", "-ac", "2", "-movflags", "+faststart", "-f", "mp4", outPath);
+    const ff = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    try { os.setPriority(ff.pid, 10); } catch {}
+    let err = "";
+    ff.stderr.on("data", (c) => { err = (err + c).slice(-2000); });
+    ff.stdout.on("data", (c) => {
+      const m = /out_time_us=(\d+)/.exec(String(c));
+      if (m && durationSecs) job.pct = 50 + Math.min(1, Number(m[1]) / 1e6 / durationSecs) * 49;
+    });
+    ff.on("close", (code) => resolve({ code, err }));
+  });
+  let res = await encode(HW_ENCODE && !hwDecodeFailed.has(`${mode}:${id}`));
+  let okOut = res.code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0;
+  if (!okOut && HW_ENCODE) { res = await encode(false); okOut = res.code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0; }
+  try { fs.rmSync(srcPath, { force: true }); } catch {}
+  if (!okOut) { job.state = "failed"; job.error = `could not prepare the file (${(res.err || "ffmpeg failed").slice(-200)})`; try { fs.rmSync(outPath, { force: true }); } catch {} return; }
+  fs.renameSync(outPath, dlFile(key));
+  job.state = "ready"; job.pct = 100;
+  console.log(`[download] ${key} ready (${(fs.statSync(dlFile(key)).size / 1024 / 1024).toFixed(0)} MB)`);
+}
+
 app.get("/api/download/:mode(movie|series)/:id.mp4", async (req, res) => {
   const { mode, id } = req.params;
   const expected = crypto.createHmac("sha256", PROXY_SECRET)
     .update(`download:${mode}:${id}`).digest("hex").slice(0, 16);
   if (req.query.s !== expected) return res.status(403).end("bad signature");
+
+  // v2: serve the prepared file (Content-Length + Range). 409 until it is ready.
+  if (req.query.v === "2") {
+    const file = dlFile(dlKey(mode, id));
+    if (!fs.existsSync(file)) return res.status(409).json(dlView(mode, id));
+    res.set("Cache-Control", "no-store");
+    return res.sendFile(file, {
+      acceptRanges: true,
+      headers: { "Content-Type": "video/mp4", "Content-Disposition": `attachment; filename="khouch_${mode}_${id}_720p.mp4"` },
+    });
+  }
 
   const { sourceUrl, error: lastProbeErr } = await resolveDownloadSourceUrl(mode, id);
   if (!sourceUrl) {
@@ -7277,6 +7458,26 @@ app.post("/api/play-event/:mode(live|movie|series|disk)/:id", express.json(), (r
 // position has no meaning in a sliding-window stream. Position near the
 // start (< 30s) or near the end (within 30s or past 95%) deletes the
 // entry: nothing useful to resume to.
+// Phone downloads v2 (see the block above the signed file route).
+app.post("/api/download/prepare/:mode(movie|series)/:id", (req, res) => {
+  const id = String(req.params.id);
+  if (!/^\d{1,12}$/.test(id)) return res.status(400).json({ error: "bad id" });
+  res.json(ensureDownloadJob(req.params.mode, id, currentAccount()));
+});
+app.get("/api/download/status/:mode(movie|series)/:id", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json(dlView(req.params.mode, String(req.params.id)));
+});
+// The phone calls this after it has saved the file, to free server disk.
+app.delete("/api/download/cache/:mode(movie|series)/:id", (req, res) => {
+  const k = dlKey(req.params.mode, String(req.params.id));
+  const j = dlJobs.get(k);
+  if (j && (j.state === "running" || j.state === "waiting" || j.state === "queued")) return res.json({ ok: true, kept: "job in progress" });
+  try { fs.rmSync(dlFile(k), { force: true }); } catch {}
+  dlJobs.delete(k);
+  res.json({ ok: true });
+});
+
 app.post("/api/progress/:mode(movie|series|disk)/:id", express.json(), (req, res) => {
   const userState = getProfileState(req.profileId);
   const { mode, id } = req.params;
@@ -12460,6 +12661,7 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     proxy: signProxyUrl(direct),
     transcode: transcodeUrl,
     download: `/api/download/${req.params.mode}/${req.params.id}.mp4?s=${downloadSig}`,
+    download2: `/api/download/${req.params.mode}/${req.params.id}.mp4?s=${downloadSig}&v=2`,
     url: primaryUrl,
     transcodeAnchorSecs: offsetSecs,
     forceTranscode,
