@@ -2419,46 +2419,7 @@ async function saveIndexToDisk(mode, actx = currentAccount()) {
 // that, a conservative "PG" for Family-genre titles. Everything that used
 // `us_cert` now goes through effCert().
 const effCert = (t) => (t ? (t.us_cert || t.cert_alt || "") : "");
-const CERT_ORDER_MOVIE = ["G", "PG", "PG-13", "R", "NC-17"];
-const CERT_ORDER_TV = ["TV-G", "TV-PG", "TV-14", "TV-MA"];
-const ALT_CERT_COUNTRIES = ["GB", "DE", "IN", "AU", "CA", "IE", "FR", "NL", "BR"];
-// Map a foreign rating to an age bucket (0, 6, 12, 15/16, 18) then to the US scale.
-function certAgeBucket(country, raw) {
-  const c = String(raw || "").trim().toUpperCase();
-  if (!c) return null;
-  const num = /(\d{1,2})/.exec(c);
-  const tab = {
-    GB: { U: 0, PG: 6, "12": 12, "12A": 12, "15": 15, "18": 18, R18: 18 },
-    DE: { "0": 0, "6": 6, "12": 12, "16": 16, "18": 18 },
-    IN: { U: 0, UA: 12, A: 18, S: 18 },
-    AU: { G: 0, PG: 6, M: 12, "MA15+": 15, "R18+": 18, "X18+": 18 },
-    CA: { G: 0, PG: 6, "14A": 12, "18A": 16, R: 18, A: 18 },
-    IE: { G: 0, PG: 6, "12A": 12, "12": 12, "15A": 15, "16": 16, "18": 18 },
-    FR: { U: 0, "10": 6, "12": 12, "16": 16, "18": 18 },
-    NL: { AL: 0, "6": 6, "9": 6, "12": 12, "14": 12, "16": 16, "18": 18 },
-    BR: { L: 0, "10": 6, "12": 12, "14": 12, "16": 16, "18": 18 },
-  }[country];
-  if (tab && c in tab) return tab[c];
-  if (country === "IN" && /^UA/.test(c)) return num ? (parseInt(num[1], 10) >= 16 ? 16 : parseInt(num[1], 10) >= 13 ? 12 : 6) : 12;
-  if (num) { const n = parseInt(num[1], 10); return n <= 5 ? 0 : n <= 11 ? 6 : n <= 14 ? 12 : n <= 17 ? 16 : 18; }
-  return null;
-}
-function usEquivalent(mode, age) {
-  if (mode === "series") return age === 0 ? "TV-G" : age <= 6 ? "TV-PG" : age <= 12 ? "TV-14" : "TV-MA";
-  return age === 0 ? "G" : age <= 6 ? "PG" : age <= 12 ? "PG-13" : age <= 16 ? "R" : "NC-17";
-}
-function altCertFromTmdb(mode, results) {
-  let worst = null;
-  for (const r of results || []) {
-    if (!ALT_CERT_COUNTRIES.includes(r.iso_3166_1)) continue;
-    const raws = mode === "series" ? [r.rating] : (r.release_dates || []).map((d) => d.certification);
-    for (const raw of raws) {
-      const a = certAgeBucket(r.iso_3166_1, raw);
-      if (a !== null && (worst === null || a > worst)) worst = a;
-    }
-  }
-  return worst === null ? "" : usEquivalent(mode, worst);
-}
+const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
 const certBackfill = { running: false, done: 0, total: 0 };
 async function tmdbRaw(pathAndQuery) {
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -2491,28 +2452,40 @@ async function backfillAltCerts({ reason = "cron" } = {}) {
   certBackfill.running = true;
   try {
     const todo = [];
+    const RECHECK_MS = 30 * 24 * 3600 * 1000; // TMDB adds ratings weeks after release
     for (const [key, e] of Object.entries(tmdbCache)) {
-      if (!e || e.source === "no-match" || !e.tmdb_id || e.us_cert || ("cert_alt" in e)) continue;
+      if (!e || e.source === "no-match" || !e.tmdb_id || e.us_cert) continue;
+      const stale = ("cert_alt" in e) && (!e.cert_alt || e.cert_src === "genre") && Date.now() - (e.cert_checked_at || 0) > RECHECK_MS;
+      if (("cert_alt" in e) && !stale) continue;
       const [mode] = key.split(":");
       if (mode === "movie" || mode === "series") todo.push({ key, mode, e });
     }
     certBackfill.done = 0; certBackfill.total = todo.length;
     console.log(`[cert] backfilling alternate ratings for ${todo.length} titles (${reason})`);
-    let i = 0, found = 0, genreRated = 0;
+    let i = 0, found = 0, genreRated = 0, nulls = 0, abort = false;
     await Promise.all(Array.from({ length: 4 }, async () => {
-      while (i < todo.length) {
+      while (i < todo.length && !abort) {
         const { key, mode, e } = todo[i++];
         const res = await tmdbRaw(mode === "series" ? `/tv/${e.tmdb_id}/content_ratings` : `/movie/${e.tmdb_id}/release_dates`);
-        if (res === null) { certBackfill.done++; continue; } // transient failure: retry next run
-        let alt = altCertFromTmdb(mode, res.results);
-        let src = "intl";
-        if (alt) found++;
-        else if ((e.genres || []).includes("Family") && !(e.genres || []).some((g) => ["Horror", "Crime", "Thriller", "War", "Mystery"].includes(g))) {
-          alt = mode === "series" ? "TV-PG" : "PG"; genreRated++; src = "genre";
+        certBackfill.done++;
+        if (res === null) {
+          // transient failure: retry next run; stop if TMDB looks down
+          if (++nulls >= 40) { abort = true; console.warn("[cert] TMDB failing repeatedly — stopping this run"); }
+          continue;
         }
-        e.cert_alt = alt; // "" = checked, nothing found
-        if (alt) e.cert_src = src;
-        if (++certBackfill.done % 1500 === 0) {
+        nulls = 0;
+        const r = altCertFromTmdb(mode, res.results);
+        let alt = r.cert, src = "intl";
+        if (alt) found++;
+        else if (!r.anyData) {
+          // No rating anywhere: conservative Family-genre fallback.
+          alt = familyHeuristicCert(mode, e.genres, e.tmdb_title || "");
+          if (alt) { genreRated++; src = "genre"; }
+        } // else: ratings exist but are unmappable → grant nothing
+        e.cert_alt = alt;           // "" = checked, nothing granted
+        e.cert_checked_at = Date.now();
+        if (alt) e.cert_src = src; else delete e.cert_src;
+        if (certBackfill.done % 10000 === 0) {
           scheduleTmdbCacheSave(); refreshIndexCerts();
           console.log(`[cert] ${certBackfill.done}/${certBackfill.total} (intl ${found}, family-genre ${genreRated})`);
         }
@@ -10763,6 +10736,7 @@ app.post("/api/admin/retry-tmdb-no-matches", (req, res) => {
 // 4:15 AM cron. Runs the exact same job.
 app.post("/api/admin/backfill-alt-certs", (req, res) => {
   if (!requireOwner(req, res)) return;
+  if (certBackfill.running) return res.json({ ok: false, error: "already running", progress: certBackfill });
   backfillAltCerts({ reason: "admin" }).catch((e) => console.warn(`[cert] ${e.message}`));
   res.json({ ok: true, started: true, progress: certBackfill });
 });
