@@ -946,7 +946,7 @@ function probeChannelAudioCodec(mode, id, actx = currentAccount()) {
 const panelTracksProbeInflight = new Map();
 // True when a viewer is ACTIVELY streaming (touched within windowMs), unlike
 // streamingNow which also counts a stale previous stream inside the idle grace.
-function streamingRecently(actx, windowMs = 20000) {
+function streamingRecently(actx, windowMs = 60000) {
   return streamingRecentlyIn(streams, actx ? accountKeyOf(actx) : null, windowMs);
 }
 function anyProbeInflight() {
@@ -12899,7 +12899,7 @@ app.get("/api/tracks/:mode(movie|series)/:id.:ext", async (req, res) => {
       new Promise((r) => setTimeout(() => r(null), 10000)),
     ]);
     const out = { audioTracks: (probed && probed.audioTracks) || [] };
-    if (probed && probed.busy) out.busy = true; // viewer active; not probed, retry later
+    if (!probed || probed.busy) out.busy = true; // viewer active or probe still running; retry later
     res.json(out);
   } catch {
     res.json({ audioTracks: [] });
