@@ -4793,7 +4793,8 @@ async function runDownloadJob(job) {
       if (job.cancelled || Date.now() - lastAdvance > 10 * 60 * 1000 || Date.now() - startedAt > hard) { err += " [killed: stalled/cancelled]"; try { ff.kill("SIGKILL"); } catch {} }
     }, 15000);
     const startedAt = Date.now();
-    ff.stdout.on("data", () => { lastAdvance = Date.now(); });
+    let lastUs = -1;
+    ff.stdout.on("data", (c) => { const m = /out_time_us=(\d+)/.exec(String(c)); if (m && Number(m[1]) > lastUs) { lastUs = Number(m[1]); lastAdvance = Date.now(); } });
     ff.on("error", (e) => { clearInterval(wd); resolve({ code: -1, err: e.message }); });
     ff.on("close", (code) => { clearInterval(wd); resolve({ code, err }); });
   });
@@ -7539,7 +7540,7 @@ app.delete("/api/download/cache/:mode(movie|series)/:id", (req, res) => {
   const j = dlJobs.get(k);
   if (j && (j.state === "running" || j.state === "waiting" || j.state === "queued")) {
     // cancel: the runner notices the flag, stops, and cleans its partial files
-    j.cancelled = true;
+    j.cancelled = true; dlJobs.delete(k);
     const qi = dlQueue.indexOf(j); if (qi >= 0) { dlQueue.splice(qi, 1); dlJobs.delete(k); }
     try { j.abort?.(); } catch {}
     return res.json({ ok: true, cancelled: true });
