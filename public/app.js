@@ -3473,9 +3473,9 @@ function formatPos(secs) {
 const _manifestRetries = new Map();
 
 // Tells the server to kill ffmpeg transcoders. Without arguments, kills
-// this session's own current stream (used on closePlayer / beforeunload —
-// nothing should be playing). With { mode, id }, kills only that title's
-// transcoders on this account
+// the caller's own transcoders — its current stream and anything it was
+// fetching (used on closePlayer / beforeunload — nothing should be
+// playing). With { mode, id }, kills only that title's transcoders
 // (used in play() to tear down the *previous* stream by id without
 // risking a race where the new stream's ffmpeg has already spawned and
 // gets killed by an in-flight kill-all POST).

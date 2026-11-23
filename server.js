@@ -4738,6 +4738,7 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/index.m3u8", async (re
   if (!ad.ok) return sendDisplaced(res);
   try {
     const t = await startOrTouchTranscoder(req.params.mode, req.params.id, quality, offsetSecs, audio, diskSel, audioTrack);
+    noteOwner(t, owner);
     const playlistPath = path.join(t.dir, "index.m3u8");
     // 30 s startup window. Heavy MKVs (4K HEVC with TrueHD audio) can
     // need 15-20 s for ffmpeg to read the source headers + emit the
@@ -4791,6 +4792,7 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/seg_:n.ts", (req, res)
   const t = transcoders.get(transcoderKey(req.params.mode, req.params.id, quality, offsetSecs, audio, diskSel, audioTrack));
   if (!t) return res.status(404).end();
   t.lastAccess = Date.now();
+  noteOwner(t, owner);
   const segPath = path.join(t.dir, `seg_${req.params.n}.ts`);
   if (!fs.existsSync(segPath)) return res.status(404).end();
   res.setHeader("Content-Type", "video/mp2t");
@@ -12420,7 +12422,7 @@ const transcoders = new Map();
 const hwDecodeFailed = new Set();
 // When a VOD run using VAAPI dies with no output, retry it once in software.
 const { vodSoftwareFallbackEligible, transcodeSourceUnavailable } = require("./lib/transcode-fallback");
-const { parseStopRequest, ownStreamTarget, selectTranscodersToStop } = require("./lib/transcode-stop");
+const { noteOwner, handleStopRequest } = require("./lib/transcode-stop");
 
 // Circuit breaker: transcoderKey -> timestamp of the last give-up where the
 // source never connected (invalid/broken upstream). A fresh request for that
@@ -13133,10 +13135,9 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     proc: ffmpeg, lastAccess: Date.now(), dir, sourceUrl, mode, id, quality,
     audio, preset, offsetSecs, diskSel, restarts: [], stopping: false, respawning: false,
     discontinuities: new Set(),
-    // Panel account this ffmpeg pulls from (the request's account, same one
-    // streamUrl() used above). /api/transcode/stop only lets a caller stop
-    // transcoders of their own account.
-    accountKey: accountKeyOf(currentAccount()),
+    // Owner keys that fetched this transcoder's manifest/segments (bounded,
+    // see noteOwner). /api/transcode/stop with no args stops only these.
+    owners: new Set(),
   };
   entry.proc = ffmpeg;
   entry.sourceUrl = sourceUrl;
@@ -13404,22 +13405,18 @@ setInterval(() => {
   }
 }, 10_000);
 
-// Stops transcoders on the client's request, scoped to the caller:
-//  - { mode, id }: every quality/offset variant of that title, but only
-//    transcoders pulling from the caller's own panel account. Called by the
+// Stops transcoders on the client's request (logic in lib/transcode-stop.js):
+//  - { mode, id }: every quality/offset variant of that title. Called by the
 //    client right before switching streams so the previous ffmpeg (which would
 //    otherwise hold the upstream slot until the idle grace elapses) doesn't
 //    collide with the new stream against the panel's max_connections=1.
-//  - no args: only the caller's own current stream (the admission map's entry
-//    for this owner) — used on closePlayer / beforeunload / deep-link resume.
-// Never stops other viewers' or other accounts' transcoders.
+//  - no args: only the caller's own — its admission stream plus transcoders it
+//    fetched from (closePlayer / beforeunload / deep-link resume). Never all.
 app.post("/api/transcode/stop", express.json(), (req, res) => {
-  const parsed = parseStopRequest(req.body);
-  if (!parsed.ok) return res.status(400).json({ ok: false, error: parsed.error });
-  const target = parsed.target || ownStreamTarget(streams.get(ownerKeyOf(req)));
-  const victims = selectTranscodersToStop(transcoders, target, accountKeyOf(currentAccount()));
-  for (const t of victims) stopTranscoder(t, parsed.target ? "client-stop" : "client-stop-own");
-  res.json({ ok: true, killed: victims.length });
+  const owner = ownerKeyOf(req);
+  const r = handleStopRequest(req.body, { transcoders, streams, owner, stop: stopTranscoder });
+  if (r.error) console.log(`[transcode-stop] rejected ${owner}: ${r.error}`);
+  res.status(r.status).json(r.body);
 });
 
 app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) => {
