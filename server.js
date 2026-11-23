@@ -2458,7 +2458,7 @@ const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue"
 const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
 const { isLowQuality, lowQualityLast } = require("./lib/low-quality");
 const { decideLiveAudio, withDeadline } = require("./lib/live-audio-verdict");
-const LIVE_AUDIO_PROBE_WAIT_MS = Math.max(0, parseInt(process.env.LIVE_AUDIO_PROBE_WAIT_MS || "1200", 10) || 1200);
+const LIVE_AUDIO_PROBE_WAIT_MS = Math.max(0, parseInt(process.env.LIVE_AUDIO_PROBE_WAIT_MS || "3500", 10) || 3500);
 const { segmentQuery } = require("./lib/segment-query");
 const { liveHlsListSize, panelReconnectArgs } = require("./lib/live-hls");
 const { createDownloadQueue } = require("./lib/download-queue");
@@ -12900,9 +12900,9 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     let verdict = audioCodecCache[key];
     // Stale-while-revalidate: a known codec verdict (even past its TTL) routes
     // immediately; only an unknown channel waits, and only up to
-    // LIVE_AUDIO_PROBE_WAIT_MS (the probe keeps running and caches for next
-    // zap). A verdict that arrives late means that one first zap plays direct;
-    // clients recover via BUFFER_CODECS / codec-error -> transcode.
+    // LIVE_AUDIO_PROBE_WAIT_MS (default 3500; the probe keeps running and
+    // caches for next zap). Keep it generous: an unknown MP2/AC3 channel played
+    // direct gives silent audio on ExoPlayer (no error to recover from).
     const plan = decideLiveAudio({
       entry: verdict,
       fresh: isProbeFresh(verdict),
