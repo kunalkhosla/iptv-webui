@@ -918,6 +918,27 @@ async function _probeManifestOnce(direct, timeoutMs = 3500) {
     // A header-only playlist (no segments, no variants) is what the provider
     // serves for a broken channel; players spin on it forever.
     if (!manifestHasContent(text)) return { alive: false, reason: "empty-playlist" };
+    // A master playlist can look healthy while its variant is an empty
+    // media playlist (players then throw/spin). Check the first variant.
+    const variant = firstVariantUri(text);
+    if (variant) {
+      try {
+        const vr = await fetch(new URL(variant, r.url || direct).href, {
+          method: "GET", redirect: "follow",
+          headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 12; Smart TV) AppleWebKit/537.36" },
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (!vr.ok) return { alive: false, reason: `variant-http-${vr.status}` };
+        const vt = await vr.text();
+        // Dead only if it is clearly an HLS media playlist with no segments;
+        // anything else (HTML, nested master) stays inconclusive -> plays.
+        if (vt.includes("#EXTM3U") && !/#EXTINF:|#EXT-X-STREAM-INF:/.test(vt)) {
+          return { alive: false, reason: "empty-playlist" };
+        }
+      } catch (e) {
+        if (e?.name === "AbortError" || e?.name === "TimeoutError") return { alive: false, reason: "timeout" };
+      }
+    }
     return { alive: true };
   } catch (e) {
     return { alive: false, reason: e?.name === "AbortError" ? "timeout" : "fetch-error" };
@@ -2637,7 +2658,7 @@ const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
 const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue");
 const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
 const { isLowQuality, lowQualityLast } = require("./lib/low-quality");
-const { decideLiveAudio, withDeadline, decideLiveHealth, applyLiveCheck, isPersistentDeadReason, deadTtlMs, manifestHasContent, LIVE_UNAVAILABLE } = require("./lib/live-audio-verdict");
+const { decideLiveAudio, withDeadline, decideLiveHealth, applyLiveCheck, isPersistentDeadReason, deadTtlMs, manifestHasContent, firstVariantUri, LIVE_UNAVAILABLE } = require("./lib/live-audio-verdict");
 const LIVE_AUDIO_PROBE_WAIT_MS = (() => { const n = parseInt(process.env.LIVE_AUDIO_PROBE_WAIT_MS ?? "", 10); return Number.isFinite(n) && n >= 0 ? n : 3500; })();
 const { segmentQuery } = require("./lib/segment-query");
 const { liveHlsListSize, panelReconnectArgs, liveTolerantArgs } = require("./lib/live-hls");

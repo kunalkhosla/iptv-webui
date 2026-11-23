@@ -102,3 +102,10 @@ test("recent-stream: excludeOwner ignores own stream, respects other owners, ign
   const stale = mk({ "ip:a": { mode: "live", accountKey: "k", lastSeen: now - 1000 }, "ip:b": { mode: "live", accountKey: "k", lastSeen: now - 400e3 } });
   assert.equal(streamingRecently(stale, null, 180e3, now, "ip:a"), false);
 });
+
+test("firstVariantUri: master -> first variant, media/other -> null", () => {
+  const { firstVariantUri } = require("../lib/live-audio-verdict");
+  assert.equal(firstVariantUri("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv/a.m3u8\n"), "v/a.m3u8");
+  assert.equal(firstVariantUri("#EXTM3U\n#EXTINF:4,\nseg.ts\n"), null);
+  assert.equal(firstVariantUri("#EXTM3U\n"), null);
+});
