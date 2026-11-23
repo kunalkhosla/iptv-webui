@@ -725,12 +725,11 @@ const tmdbStore = (() => {
 // data/tmdb-overrides.json {"movie:825105": null | 1234} pins a stream to
 // "no match" (null) or to a specific TMDB id (number) and bypasses the guard.
 const { matchPlausible } = require("./lib/tmdb-match");
+const { createGuardedTmdbCache, normalizeOverrides, markGuardRejected } = require("./lib/tmdb-guard-view");
 const tmdbOverridesFile = path.join(DATA_DIR, "tmdb-overrides.json");
 const tmdbOverrides = (() => {
-  try {
-    const d = JSON.parse(fs.readFileSync(tmdbOverridesFile, "utf8"));
-    return d && typeof d === "object" && !Array.isArray(d) ? d : {};
-  } catch { return {}; }
+  try { return normalizeOverrides(JSON.parse(fs.readFileSync(tmdbOverridesFile, "utf8"))); }
+  catch { return {}; }
 })();
 function saveTmdbOverrides() {
   try {
@@ -739,8 +738,10 @@ function saveTmdbOverrides() {
   } catch (e) { console.warn(`save tmdb-overrides failed: ${e.message}`); }
 }
 const hasTmdbOverride = (key) => Object.prototype.hasOwnProperty.call(tmdbOverrides, key);
-// cacheKey -> {name, tags} captured while indexes are built (and looked up from
-// the owner index afterwards), so the view can judge an entry by stream name.
+// cacheKey -> {name, year, tags} captured while indexes are built (and looked up
+// from the owner index afterwards), so the view can judge an entry by stream name.
+// The SAME {name, year, tags} feeds ensureTmdbForItem's judging (tmdbHintsPlausible),
+// so the view and the resolver can never disagree and loop re-fetching.
 const tmdbNameHints = new Map();
 function tmdbStreamInfo(key) {
   const h = tmdbNameHints.get(key);
@@ -748,63 +749,27 @@ function tmdbStreamInfo(key) {
   try {
     const [m, id] = key.split(":");
     const it = _ownerIndexes[m]?.byId?.get(parseInt(id, 10));
-    return it ? { name: it.name, tags: it.tags } : null;
+    return it ? { name: it.name, year: it.year, tags: it.tags } : null;
   } catch { return null; }
 }
-const tmdbPlausMemo = new Map(); // key -> {e, name, view}
-// Judge a (projected) TMDB entry against a stream name. Only movie/series.
-function tmdbPlausibility(mode, hints, e, viaPanelId) {
+// Judge a (projected) TMDB entry against a stream. Only movie/series.
+function tmdbPlausibility(mode, info, e, viaPanelId) {
   if (mode !== "movie" && mode !== "series") return { ok: true, reason: "n/a" };
   let lang = null;
-  try { lang = hints.lang || (hints.tags ? isoLangForItem({ tags: hints.tags }) : null); } catch { /* ignore */ }
+  try { lang = info.tags ? isoLangForItem({ tags: info.tags }) : (info.lang || null); } catch { /* ignore */ }
   return matchPlausible({
-    streamName: hints.name, streamLangTag: lang, streamYear: hints.year,
-    tmdb: { title: e.tmdb_title, original_language: e.original_language, year: e.year, genres: e.genres, runtime: e.runtime },
+    streamName: info.name, streamLangTag: lang, streamYear: info.year,
+    tmdb: { title: e.tmdb_title, original_title: e.original_title, original_language: e.original_language,
+            year: e.year, genres: e.genres, runtime: e.runtime, alternative_titles: e.alternative_titles },
     viaPanelId: !!viaPanelId,
   });
 }
-// Verdict for a raw cache entry ({ok, reason}); memoised by entry identity + name.
-function tmdbEntryVerdict(key, e) {
-  if (!e || typeof e !== "object" || e.source !== "tmdb" || !e.tmdb_id) return { ok: true };
-  if (hasTmdbOverride(key)) return { ok: true, reason: "override" };
-  const info = tmdbStreamInfo(key);
-  if (!info || !info.name) return { ok: true };
-  const m = tmdbPlausMemo.get(key);
-  if (m && m.e === e && m.name === info.name) return m.verdict;
-  const verdict = tmdbPlausibility(key.split(":")[0], info, e, false);
-  tmdbPlausMemo.set(key, { e, name: info.name, verdict });
-  return verdict;
-}
-const tmdbView = new Map(); // key -> synthesized no-match (stable identity)
-const tmdbCache = new Proxy(tmdbStore, {
-  get(t, k) {
-    if (typeof k !== "string") return t[k];
-    if (hasTmdbOverride(k)) {
-      const ov = tmdbOverrides[k];
-      if (ov === null) {
-        return { tmdb_id: null, source: "no-match", checked_at: Date.now(), override: true };
-      }
-      const e = t[k];
-      if (!(e && e.tmdb_id === ov)) return { tmdb_id: null, source: "no-match", checked_at: 0, override_pending: true };
-      return e;
-    }
-    const e = t[k];
-    if (!e || typeof e !== "object") return e;
-    if (e.source === "tmdb" && e.tmdb_id) {
-      const v = tmdbEntryVerdict(k, e);
-      if (!v.ok) {
-        let syn = tmdbView.get(k);
-        if (!syn || syn.raw !== e) {
-          syn = { tmdb_id: null, source: "no-match", checked_at: 0, implausible: true, reason: v.reason };
-          Object.defineProperty(syn, "raw", { enumerable: false, value: e });
-          tmdbView.set(k, syn);
-        }
-        return syn;
-      }
-    }
-    return e;
-  },
+const tmdbGuard = createGuardedTmdbCache({
+  store: tmdbStore, overrides: tmdbOverrides, getInfo: tmdbStreamInfo,
+  judge: (mode, info, e) => tmdbPlausibility(mode, info, e, false),
 });
+const tmdbCache = tmdbGuard.cache;
+const tmdbEntryVerdict = tmdbGuard.verdict;
 let tmdbCacheSaveTimer = null;
 function scheduleTmdbCacheSave() {
   if (tmdbCacheSaveTimer) return;
@@ -1484,6 +1449,13 @@ function projectTmdbDetail(mode, detail, baseTitle) {
                            : (Array.isArray(detail.episode_run_time) && detail.episode_run_time[0]) || null,
     genres:        Array.isArray(detail.genres) ? detail.genres.map(g => g.name).filter(Boolean) : [],
     tagline:       detail.tagline || null,
+    // Kept for the match-plausibility guard (lib/tmdb-match.js); not exposed by tmdbToResponse.
+    original_title: (isMovie ? detail.original_title : detail.original_name) || null,
+    alternative_titles: (() => {
+      const alt = detail.alternative_titles || {};
+      const arr = Array.isArray(alt.titles) ? alt.titles : Array.isArray(alt.results) ? alt.results : [];
+      return [...new Set(arr.map((t) => t && t.title).filter((t) => typeof t === "string" && t && t.length <= 120))].slice(0, 30);
+    })(),
     original_language: detail.original_language || null,
     imdb_id:       (detail.external_ids && detail.external_ids.imdb_id) || detail.imdb_id || null,
     // US-region content certification ("PG", "TV-MA", etc.). Used by
@@ -1804,6 +1776,7 @@ const TMDB_DETAIL_APPENDS = (mode) => {
     "recommendations",
     "similar",
     "external_ids",
+    "alternative_titles",
   ].join(",");
 };
 
@@ -1825,13 +1798,31 @@ async function refetchTmdbDetail(mode, tmdbId, kindOverride) {
   return projected;
 }
 
-// Guard for a freshly fetched/searched match (see tmdbPlausibility). Skipped
-// for disk / forced-kind lookups and when there is no stream name to judge by.
-function tmdbHintsPlausible(mode, hints, projected, viaPanelId) {
-  if (!hints || !hints.name || hints.forcedKind || !projected) return true;
-  const v = tmdbPlausibility(mode, hints, projected, viaPanelId);
-  if (!v.ok) console.log(`[tmdb] rejected implausible match ${mode} "${hints.name}" -> "${projected.tmdb_title}" (${v.reason})`);
-  return v.ok;
+// Guard for a freshly fetched/searched match (see tmdbPlausibility). Judges with
+// the SAME {name, year, tags} the cache view uses (owner index / boot hints) when
+// known, falling back to the caller's hints (e.g. the info route may have no item).
+// Skipped for disk / forced-kind lookups and when there is no stream name.
+function tmdbHintsPlausible(mode, hints, projected, viaPanelId, key) {
+  if (!projected || (hints && hints.forcedKind)) return { ok: true };
+  const info = (key && tmdbStreamInfo(key)) || hints;
+  if (!info || !info.name) return { ok: true };
+  const v = tmdbPlausibility(mode, info, projected, viaPanelId);
+  if (!v.ok) console.log(`[tmdb] rejected implausible match ${mode} "${info.name}" -> "${projected.tmdb_title}" (${v.reason})`);
+  return v;
+}
+// Record a guard rejection without destroying data: an existing raw tmdb entry
+// is kept (marked guard_rejected) so the view returns no-match but a false
+// positive can be undone via /api/admin/tmdb-accept; otherwise store a no-match.
+function tmdbStoreRejection(cacheKey, rejectedTmdbId, reason) {
+  const raw = tmdbStore[cacheKey];
+  if (raw && raw.source === "tmdb" && raw.tmdb_id) {
+    tmdbStore[cacheKey] = markGuardRejected(raw, reason, rejectedTmdbId);
+  } else {
+    tmdbStore[cacheKey] = { tmdb_id: null, source: "no-match", checked_at: Date.now(), rejected_tmdb_id: rejectedTmdbId || null, guard_rejected: reason };
+  }
+  tmdbGuard.invalidate(cacheKey);
+  scheduleTmdbCacheSave();
+  return tmdbCache[cacheKey];
 }
 
 // Entry point used by the /api/poster routes. Reads cache (with negative
@@ -1842,9 +1833,9 @@ async function ensureTmdbForItem(mode, id, panelHints) {
   if (hasTmdbOverride(cacheKey)) {
     const ov = tmdbOverrides[cacheKey];
     if (ov === null) {
-      const entry = { tmdb_id: null, source: "no-match", checked_at: Date.now(), override: true };
-      tmdbStore[cacheKey] = entry;
-      return entry;
+      // Pinned no-match: served by the view; the raw entry is kept untouched so
+      // clearing the override restores the original match.
+      return tmdbCache[cacheKey];
     }
     const cur = tmdbStore[cacheKey];
     if (cur && cur.source === "tmdb" && cur.tmdb_id === ov) return cur;
@@ -1856,6 +1847,12 @@ async function ensureTmdbForItem(mode, id, panelHints) {
       return entry;
     }
     return { tmdb_id: null, source: "no-match", checked_at: Date.now(), override_failed: true };
+  }
+  panelHints = panelHints || {};
+  if (!panelHints.name) {
+    // e.g. the info route had no index item: look the stream up from the owner index.
+    const si = tmdbStreamInfo(cacheKey);
+    if (si) panelHints = { ...panelHints, name: si.name, year: panelHints.year ?? si.year, lang: panelHints.lang ?? isoLangForItem({ tags: si.tags }) };
   }
   const existing = tmdbCache[cacheKey];
   // Cache entries written before the kids-profile feature lack the
@@ -1893,24 +1890,42 @@ async function ensureTmdbForItem(mode, id, panelHints) {
   // to the detail fetch — saves one HTTP round-trip per item AND
   // avoids the search-result ambiguity that bit ambiguous titles.
   const hintedId = panelHints && panelHints.tmdbId;
+  let panelRejected = null;
   if (hintedId) {
     const refreshed = await refetchTmdbDetail(mode, hintedId);
     // The panel's id is wrong for some streams (e.g. a Punjabi film pointing at
     // "Dune: Part Three"): only trust it if the fetched title is plausible.
-    if (refreshed && tmdbHintsPlausible(mode, panelHints, refreshed, true)) {
-      const entry = { ...refreshed, source: "tmdb", checked_at: Date.now() };
-      tmdbCache[cacheKey] = entry;
-      scheduleTmdbCacheSave();
-      return entry;
+    if (refreshed) {
+      const v = tmdbHintsPlausible(mode, panelHints, refreshed, true, cacheKey);
+      if (v.ok) {
+        const entry = { ...refreshed, source: "tmdb", checked_at: Date.now() };
+        tmdbCache[cacheKey] = entry;
+        scheduleTmdbCacheSave();
+        return entry;
+      }
+      panelRejected = { id: refreshed.tmdb_id, reason: v.reason };
     }
     // Detail fetch with the panel-supplied id failed (or was implausible) —
     // fall through to the search-based path rather than caching a bad miss.
   }
   const match = await findTmdbMatch(mode, panelHints.name, panelHints.year, panelHints.lang, panelHints.forcedKind);
-  const matchOk = match && tmdbHintsPlausible(mode, panelHints, match, false);
-  const entry = matchOk
-    ? { ...match, source: "tmdb", checked_at: Date.now() }
-    : { tmdb_id: null, source: "no-match", checked_at: Date.now(), ...(match ? { rejected_tmdb_id: match.tmdb_id } : {}) };
+  if (match) {
+    const v = tmdbHintsPlausible(mode, panelHints, match, false, cacheKey);
+    if (v.ok) {
+      const entry = { ...match, source: "tmdb", checked_at: Date.now() };
+      tmdbCache[cacheKey] = entry;
+      scheduleTmdbCacheSave();
+      return entry;
+    }
+    return tmdbStoreRejection(cacheKey, match.tmdb_id, v.reason);
+  }
+  if (panelRejected) return tmdbStoreRejection(cacheKey, panelRejected.id, panelRejected.reason);
+  const raw = tmdbStore[cacheKey];
+  if (raw && raw.source === "tmdb" && raw.tmdb_id) {
+    // Nothing plausible came back for an entry the guard hid: keep its data.
+    return tmdbStoreRejection(cacheKey, null, tmdbEntryVerdict(cacheKey, raw).reason || "no plausible match on re-resolve");
+  }
+  const entry = { tmdb_id: null, source: "no-match", checked_at: Date.now() };
   tmdbCache[cacheKey] = entry;
   scheduleTmdbCacheSave();
   return entry;
@@ -3081,7 +3096,7 @@ async function loadIndexFromDisk(mode, actx = currentAccount()) {
       const cat = tagMap?.get(String(s.category_id)) || ["other"];
       s.tags = applyQualityDemotion(mode, s.id, streamTagsFor(s.name, cat));
       if (mode !== "live") {
-        tmdbNameHints.set(`${mode}:${s.id}`, { name: s.name, tags: s.tags });
+        tmdbNameHints.set(`${mode}:${s.id}`, { name: s.name, year: s.year, tags: s.tags });
         const tmdbEntry = tmdbCache[`${mode}:${s.id}`];
         s.us_cert = effCert(tmdbEntry) || null;
         s.tmdb_id = tmdbEntry?.tmdb_id || null;
@@ -9327,14 +9342,23 @@ async function retryTmdbNoMatches({ onProgress } = {}) {
         const year = item?.year;
         if (!name) { tally.errors++; continue; }
         const match = await findTmdbMatch(c.mode, name, year, isoLangForItem(item), item?.isSeriesGroup ? "series" : undefined);
-        if (match && match.tmdb_id && tmdbHintsPlausible(c.mode, { name, year, lang: isoLangForItem(item), forcedKind: item?.isSeriesGroup ? "series" : undefined }, match, false)) {
+        const verdict = match && match.tmdb_id
+          ? tmdbHintsPlausible(c.mode, { name, year, lang: isoLangForItem(item), forcedKind: item?.isSeriesGroup ? "series" : undefined }, match, false, c.key)
+          : null;
+        if (verdict && verdict.ok) {
           tmdbCache[c.key] = { ...match, source: "tmdb", checked_at: Date.now() };
           tally.promoted++;
           onProgress?.({ phase: "hit", id: c.id, mode: c.mode, name, tmdb_id: match.tmdb_id, us_cert: match.us_cert || "" });
         } else {
           // Refresh checked_at so the next cron pass doesn't re-retry
-          // immediately — keep the no-match status.
-          tmdbCache[c.key] = { tmdb_id: null, source: "no-match", checked_at: Date.now() };
+          // immediately — keep the no-match status. A guard-hidden raw match
+          // keeps its data (marked rejected) instead of being overwritten.
+          const raw = tmdbStore[c.key];
+          if (raw && raw.source === "tmdb" && raw.tmdb_id) {
+            tmdbStoreRejection(c.key, verdict ? match.tmdb_id : null, verdict ? verdict.reason : (tmdbEntryVerdict(c.key, raw).reason || "no plausible match on retry"));
+          } else {
+            tmdbCache[c.key] = { tmdb_id: null, source: "no-match", checked_at: Date.now(), ...(verdict ? { rejected_tmdb_id: match.tmdb_id, guard_rejected: verdict.reason } : {}) };
+          }
           tally.stillMissing++;
         }
       } catch (e) {
@@ -9402,7 +9426,7 @@ async function revalidateTmdbYears({ onProgress } = {}) {
       if (hasTmdbOverride(c.key)) continue;
       try {
         let match = await findTmdbMatch(c.mode, c.name, c.nameYear, c.lang, c.forcedKind);
-        if (match && !tmdbHintsPlausible(c.mode, { name: c.name, year: c.nameYear, lang: c.lang, forcedKind: c.forcedKind }, match, false)) match = null;
+        if (match && !tmdbHintsPlausible(c.mode, { name: c.name, year: c.nameYear, lang: c.lang, forcedKind: c.forcedKind }, match, false, c.key).ok) match = null;
         const cur = tmdbCache[c.key];
         // For a lang candidate, only accept a re-match that actually
         // resolved to the wanted language — otherwise the regional-default
@@ -11730,15 +11754,28 @@ app.post("/api/admin/reindex-account", express.json(), async (req, res) => {
   }
 });
 
+// Only one TMDB bulk admin job (v2 backfill / no-match retry / year revalidation)
+// at a time, so concurrent runs can't double-hit TMDB.
+let tmdbAdminJob = null;
+function tmdbAdminJobStart(res, name) {
+  if (tmdbAdminJob) { res.status(409).json({ ok: false, error: `already running: ${tmdbAdminJob}` }); return false; }
+  tmdbAdminJob = name;
+  return true;
+}
+function tmdbAdminJobEnd() { tmdbAdminJob = null; }
+
 app.post("/api/admin/backfill-tmdb-v2", (req, res) => {
+  if (!requireOwner(req, res)) return;
   if (!TMDB_API_KEY) {
     return res.status(400).json({ ok: false, error: "no TMDB_API_KEY configured" });
   }
+  if (!tmdbAdminJobStart(res, "backfill-tmdb-v2")) return;
   res.set("Content-Type", "application/x-ndjson");
   res.set("Cache-Control", "no-store");
   backfillTmdbCacheV2({
     onProgress: (e) => res.write(JSON.stringify(e) + "\n"),
-  }).then(() => res.end()).catch(e => {
+  }).then(() => { tmdbAdminJobEnd(); res.end(); }).catch(e => {
+    tmdbAdminJobEnd();
     res.write(JSON.stringify({ phase: "fatal", error: redactAllUrls(e.message) }) + "\n");
     res.end();
   });
@@ -11749,21 +11786,30 @@ app.post("/api/admin/backfill-tmdb-v2", (req, res) => {
 // --- TMDB match guard: manual overrides + mismatch report (OWNER ONLY) ---
 // Override file: data/tmdb-overrides.json {"movie:825105": null | 1234}.
 // null pins "no match" (UI falls back to panel metadata); a number pins that
-// TMDB id. Either bypasses the plausibility guard. Setting/clearing drops the
-// cached entry so the resolver re-runs on the next detail/poster request.
+// TMDB id. Either bypasses the plausibility guard. The raw cached match is never
+// destroyed by setting an override (the view just masks it), so clearing one
+// restores the original; only an entry that WAS written by a number override is
+// dropped on clear so the normal resolver runs again.
 function tmdbOverrideKey(src) {
   const mode = String(src?.mode || "");
   const id = String(src?.id || "");
   if (!["movie", "series"].includes(mode) || !/^\d+$/.test(id)) return null;
   return { key: `${mode}:${id}`, mode, id };
 }
-function afterTmdbOverrideChange(k) {
-  delete tmdbStore[k.key];
-  tmdbPlausMemo.delete(k.key);
-  tmdbView.delete(k.key);
+function refreshIndexItemFromTmdb(k) {
   const item = _ownerIndexes[k.mode]?.byId?.get(parseInt(k.id, 10));
-  if (item) { item.tmdb_id = null; item.us_cert = null; }
+  if (item) {
+    const e = tmdbCache[k.key];
+    item.tmdb_id = e?.tmdb_id || null;
+    item.us_cert = effCert(e) || null;
+  }
   catalogGen++;
+}
+function afterTmdbOverrideChange(k, { clearing = false } = {}) {
+  const raw = tmdbStore[k.key];
+  if (clearing && raw && raw.override) delete tmdbStore[k.key];
+  tmdbGuard.invalidate(k.key);
+  refreshIndexItemFromTmdb(k);
   scheduleTmdbCacheSave();
 }
 app.post("/api/admin/tmdb-override", express.json(), (req, res) => {
@@ -11778,11 +11824,7 @@ app.post("/api/admin/tmdb-override", express.json(), (req, res) => {
   saveTmdbOverrides();
   afterTmdbOverrideChange(k);
   if (t !== null && TMDB_API_KEY) {
-    ensureTmdbForItem(k.mode, k.id, {}).then(() => {
-      const e = tmdbStore[k.key];
-      const item = _ownerIndexes[k.mode]?.byId?.get(parseInt(k.id, 10));
-      if (item && e && e.tmdb_id) { item.tmdb_id = e.tmdb_id; item.us_cert = effCert(e) || null; catalogGen++; }
-    }).catch(() => {});
+    ensureTmdbForItem(k.mode, k.id, {}).then(() => refreshIndexItemFromTmdb(k)).catch(() => {});
   }
   res.json({ ok: true, key: k.key, tmdbId: t });
 });
@@ -11793,8 +11835,31 @@ app.delete("/api/admin/tmdb-override", express.json(), (req, res) => {
   const had = hasTmdbOverride(k.key);
   delete tmdbOverrides[k.key];
   saveTmdbOverrides();
-  afterTmdbOverrideChange(k);
+  afterTmdbOverrideChange(k, { clearing: true });
   res.json({ ok: true, key: k.key, cleared: had });
+});
+// Undo a guard false positive: pin the existing (or rejected) tmdb id as an
+// override, which bypasses the guard and clears the rejection marker.
+app.post("/api/admin/tmdb-accept", express.json(), (req, res) => {
+  if (!requireOwner(req, res)) return;
+  const k = tmdbOverrideKey(req.body);
+  if (!k) return res.status(400).json({ error: "need mode (movie|series) and numeric id" });
+  const raw = tmdbStore[k.key];
+  const id = raw && ((raw.source === "tmdb" && raw.tmdb_id) || raw.rejected_tmdb_id);
+  if (!id) return res.status(404).json({ error: "no cached or rejected tmdb match for this stream" });
+  tmdbOverrides[k.key] = id;
+  saveTmdbOverrides();
+  if (raw.source === "tmdb" && raw.tmdb_id === id) {
+    const { guard_rejected, rejected_at, rejected_tmdb_id, ...clean } = raw;
+    tmdbStore[k.key] = clean;
+  } else {
+    delete tmdbStore[k.key]; // no-match placeholder: let the override resolver fetch the id
+  }
+  afterTmdbOverrideChange(k);
+  if (TMDB_API_KEY && !(tmdbStore[k.key] && tmdbStore[k.key].tmdb_id)) {
+    ensureTmdbForItem(k.mode, k.id, {}).then(() => refreshIndexItemFromTmdb(k)).catch(() => {});
+  }
+  res.json({ ok: true, key: k.key, tmdbId: id });
 });
 app.get("/api/admin/tmdb-mismatches", (req, res) => {
   if (!requireOwner(req, res)) return;
@@ -11802,15 +11867,23 @@ app.get("/api/admin/tmdb-mismatches", (req, res) => {
   const rows = [];
   let checked = 0;
   for (const [key, e] of Object.entries(tmdbStore)) {
-    if (!e || e.source !== "tmdb" || !e.tmdb_id) continue;
+    if (!e) continue;
     const [mode, id] = key.split(":");
     if (mode !== "movie" && mode !== "series") continue;
     if (only && only !== mode) continue;
-    checked++;
-    const v = tmdbEntryVerdict(key, e);
-    if (v.ok) continue;
+    if (hasTmdbOverride(key)) continue;
+    let reason = null, kind = null;
+    if (e.source === "tmdb" && e.tmdb_id) {
+      checked++;
+      const v = tmdbEntryVerdict(key, e);
+      if (!v.ok) { reason = v.reason; kind = e.guard_rejected ? "guard_rejected" : "implausible"; }
+    } else if (e.rejected_tmdb_id) {
+      reason = e.guard_rejected || "rejected on re-resolve"; kind = "rejected_candidate";
+    }
+    if (!reason) continue;
     const info = tmdbStreamInfo(key);
-    rows.push({ mode, id, name: info?.name || null, tmdb_id: e.tmdb_id, tmdb_title: e.tmdb_title, original_language: e.original_language || null, reason: v.reason });
+    rows.push({ mode, id, name: info?.name || null, tmdb_id: e.tmdb_id || null, rejected_tmdb_id: e.rejected_tmdb_id || null,
+      tmdb_title: e.tmdb_title || null, original_language: e.original_language || null, kind, reason });
   }
   res.json({ checked, flagged: rows.length, overrides: tmdbOverrides, mismatches: rows });
 });
@@ -11825,14 +11898,17 @@ setTimeout(() => {
 }, 60 * 1000).unref?.();
 
 app.post("/api/admin/retry-tmdb-no-matches", (req, res) => {
+  if (!requireOwner(req, res)) return;
   if (!TMDB_API_KEY) {
     return res.status(400).json({ ok: false, error: "no TMDB_API_KEY configured" });
   }
+  if (!tmdbAdminJobStart(res, "retry-tmdb-no-matches")) return;
   res.set("Content-Type", "application/x-ndjson");
   res.set("Cache-Control", "no-store");
   retryTmdbNoMatches({
     onProgress: (e) => res.write(JSON.stringify(e) + "\n"),
-  }).then(() => res.end()).catch(e => {
+  }).then(() => { tmdbAdminJobEnd(); res.end(); }).catch(e => {
+    tmdbAdminJobEnd();
     res.write(JSON.stringify({ phase: "fatal", error: redactAllUrls(e.message) }) + "\n");
     res.end();
   });
@@ -11947,14 +12023,17 @@ app.post("/api/admin/rebuild-tonight", async (req, res) => {
 // title's year (the "Blind (2023)" → "The Blind Side (2009)" class of
 // wrong poster). Streams NDJSON progress.
 app.post("/api/admin/revalidate-tmdb-years", (req, res) => {
+  if (!requireOwner(req, res)) return;
   if (!TMDB_API_KEY) {
     return res.status(400).json({ ok: false, error: "no TMDB_API_KEY configured" });
   }
+  if (!tmdbAdminJobStart(res, "revalidate-tmdb-years")) return;
   res.set("Content-Type", "application/x-ndjson");
   res.set("Cache-Control", "no-store");
   revalidateTmdbYears({
     onProgress: (e) => res.write(JSON.stringify(e) + "\n"),
-  }).then(() => res.end()).catch(e => {
+  }).then(() => { tmdbAdminJobEnd(); res.end(); }).catch(e => {
+    tmdbAdminJobEnd();
     res.write(JSON.stringify({ phase: "fatal", error: redactAllUrls(e.message) }) + "\n");
     res.end();
   });

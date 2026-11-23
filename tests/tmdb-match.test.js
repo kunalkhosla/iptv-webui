@@ -2,6 +2,56 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { matchPlausible, parseStreamName, hasOverlap, looksLikeLiveEvent } = require("../lib/tmdb-match");
 
+// Exact reason strings are asserted so a heuristic change shows up as a diff here.
+const EXPECTED_REASONS = {
+  "Hissa (2026) (Punjabi)|Dune: Part Three": "zero-overlap, punjabi stream vs original_language en",
+  "Agra (2023) (Hindi)|Divididos en Vélez - Agradecer y Seguir": "zero-overlap, festival/concert-style tmdb title",
+  "Freedom (2024)|Hardwell @ Ultra Miami 2024": "zero-overlap, festival/concert-style tmdb title",
+  "Maria (2024)|Tomorrowland Festival - Live Set": "zero-overlap, festival/concert-style tmdb title",
+  "Vaasta (2021)|Connection": "zero-overlap, hindi stream vs original_language en",
+  "The Bad Boy and Me  (2025) (Tamil)|Sidelined 2: Intercepted": "zero-overlap, tamil stream vs original_language en",
+  "Kho Kho (2012)|Les Misérables": "zero-overlap, telugu stream vs original_language en",
+  "Talismi Jazeera (1992) (Urdu)|Zorro the Gay Blade": "zero-overlap, year 1992 vs 1981",
+  "Berlin (2023)|Brandt Brauer Frick @ Berlinale 2023": "zero-overlap, festival/concert-style tmdb title",
+  "Neha (2021) Telugu|Never Rarely Sometimes Always": "zero-overlap, telugu stream vs original_language en",
+  "Some Film (2010)|Totally Different": "zero-overlap, year 2010 vs 2015",
+  "Mystery (2020) (Punjabi)|Unrelated Hollywood": "zero-overlap, punjabi stream vs original_language en",
+  "Culpa Mia (2023)(4K)|My Fault": "zero-overlap, no language tag",
+  "Madres (2021)|Parallel Mothers": "zero-overlap, no language tag",
+  "Dhurandhar (2025) (Hindi)|Dhurandhar": "overlap",
+  "Aithrí (2018)|Penance": "zero-overlap, lenient language",
+  "Tre uomini e un fantasma (2022) (Hindi)|Three Man And A Ghost": "zero-overlap, foreign original language",
+  "Man Hua Xiong Xin (2021) (Hindi)|Comic Ambition": "zero-overlap, foreign original language",
+  "Nieobliczalna (2024) (Hindi) (CAM)|Unpredictable": "zero-overlap, foreign original language",
+  "Putulnacher Itikatha (2025) (Bangla)|The Puppet’s Tale": "zero-overlap, language consistent",
+  "Navarathri (1964)|Navarathiri": "similar",
+  "Baahubali (2017)|Bāhubali 2: The Conclusion": "zero-overlap, indic cross-language",
+  "Tegimpu (2023)|Thunivu": "zero-overlap, indic cross-language",
+  "Um Ano Inesquecivel Primavera (2023)(4K)|An Unforgettable Year - Spring": "zero-overlap, lenient language",
+  "La Ermita (2023) (Telugu)|The Chapel": "zero-overlap, foreign original language",
+  "Acide (2023)|Acid": "zero-overlap, no language tag",
+  "Cici Anne (2024) (Turkish)|Step Mom": "zero-overlap, language consistent",
+  "Aranyer Din Ratri (1970)|Days and Nights in the Forest": "zero-overlap, language consistent",
+  "Dune Part Two (2024)|Dune: Part Two": "overlap",
+  "Wonder Woman 1984 (2020)(4K)|Wonder Woman 1984": "overlap",
+  "Spiderman (2002)|Spider-Man": "overlap",
+  "MY3 (2023) (Tamil)|My 3": "overlap",
+  "The.Gift.2015.1080p|The Gift": "overlap",
+  "Amélie (2001)|Amelie": "overlap",
+  "Fast & Furious (2009)|Fast and Furious": "overlap",
+  "Toy Stories (1995)|Toy Story": "overlap",
+  "1917 (2019)|1917": "overlap",
+  "Avatar (2009) (Hindi)|Avatar": "overlap",
+  "The Expendables 4 (2023) (Tamil)|Expend4bles": "similar",
+  "Se7en (1995)|Seven": "similar",
+  "Bahubali (2015)|Baahubali": "similar",
+  "Fast Four (2009) (Hindi)|Fast 4": "overlap",
+  "Star Wars Episode IV (1977) (Hindi)|A New Hope": "zero-overlap, hindi stream vs original_language en",
+  "Raju (1978)|We Will All Meet in Paradise": "zero-overlap, foreign original language",
+  "Kasa Kasa (2021)|Paydirt": "zero-overlap, no language tag",
+  "Gem (2024) (Telugu)|GEMNIBUS Volume 1": "zero-overlap, foreign original language",
+  "Rocky (1976)|": "no-tmdb-title"
+};
 const mp = (streamName, tmdb, extra = {}) => matchPlausible({ streamName, tmdb, ...extra });
 
 // [stream name, lang tag, tmdb {title, original_language, year}, expected ok]
@@ -47,6 +97,15 @@ const CASES = [
   ["Toy Stories (1995)", null, { title: "Toy Story", original_language: "en", year: "1995" }, true],
   ["1917 (2019)", null, { title: "1917", original_language: "en", year: "2019" }, true],
   ["Avatar (2009) (Hindi)", "hindi", { title: "Avatar", original_language: "en", year: "2009" }, true],
+  // --- fuzzy accept path (compacted / leetspeak / numerals / trigram Dice) ---
+  ["The Expendables 4 (2023) (Tamil)", "tamil", { title: "Expend4bles", original_language: "en", year: "2023" }, true],
+  ["Se7en (1995)", "english", { title: "Seven", original_language: "en", year: "1995" }, true],
+  ["Bahubali (2015)", "telugu", { title: "Baahubali", original_language: "te", year: "2015" }, true],
+  ["Fast Four (2009) (Hindi)", "hindi", { title: "Fast 4", original_language: "en", year: "2009" }, true],
+  // documented limitation: a subtitle-only title ("A New Hope") shares nothing with
+  // "Star Wars Episode IV"; with a regional tag + original_language en it is rejected.
+  ["Star Wars Episode IV (1977) (Hindi)", "hindi", { title: "A New Hope", original_language: "en", year: "1977" }, false],
+  ["Hissa (2026) (Punjabi)", "punjabi", { title: "Dune: Part Three", original_language: "en", year: "2026", genres: ["Science Fiction"] }, false],
   // --- conservative: no signal => ok ---
   ["Raju (1978)", "punjabi", { title: "We Will All Meet in Paradise", original_language: "fr", year: "1978" }, true],
   ["Kasa Kasa (2021)", null, { title: "Paydirt", original_language: "en", year: "2021" }, true], // no lang tag
@@ -58,7 +117,7 @@ for (const [name, tag, tmdb, expected] of CASES) {
   test(`${name} -> ${tmdb.title || "(empty)"} => ${expected ? "ok" : "NOT ok"}`, () => {
     const r = mp(name, tmdb, { streamLangTag: tag });
     assert.equal(r.ok, expected, r.reason);
-    assert.ok(typeof r.reason === "string");
+    assert.equal(r.reason, EXPECTED_REASONS[`${name}|${tmdb.title}`], "reason");
   });
 }
 
