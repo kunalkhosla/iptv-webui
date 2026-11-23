@@ -1,6 +1,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { srtToVtt, cacheName, pickBest } = require("../lib/subtitles");
+const { srtToVtt, cacheName, pickBest, createSubtitleService } = require("../lib/subtitles");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 test("srtToVtt converts header, commas and strips BOM/CRLF", () => {
   const out = srtToVtt("﻿1\r\n00:00:01,000 --> 00:00:02,500\r\nHello, world\r\n\r\n2\r\n0:00:03,5 --> 0:00:04,25\r\nBye\r\n");
@@ -141,4 +144,17 @@ test("search 401/403 triggers global backoff with no further upstream calls", as
   assert.equal(await svc.getVtt({ ...req, id: "2" }), null);
   assert.equal(await svc.getVtt({ ...req, id: "3", lang: "hi" }), null);
   assert.equal(calls.length, n);
+});
+
+test("isCached is true only when the VTT file exists", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "subs-"));
+  const svc = createSubtitleService({ dataDir, env: {} });
+  const ctx = { mode: "movie", id: "42" };
+  assert.equal(svc.isCached({ ...ctx, lang: "en" }), false);
+  const dir = path.join(dataDir, "subtitles");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, cacheName("movie", "42", "en")), "WEBVTT\n");
+  assert.equal(svc.isCached({ ...ctx, lang: "en" }), true);
+  assert.equal(svc.isCached({ ...ctx, lang: "hi" }), false);
+  assert.equal(svc.isCached({ mode: "movie", id: "../x", lang: "en" }), false);
 });

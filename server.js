@@ -8997,7 +8997,7 @@ function subtitleCtx(req, mode, id) {
   return { mode, id, season, episode };
 }
 const subtitleQs = (c) => (c.mode === "series" ? `?season=${c.season}&episode=${c.episode}` : "");
-const subtitleEntries = (c) => subtitleSvc.listLangs(c).map((lang) => ({ lang, label: subtitleSvc.LANGS[lang], url: `/api/subtitles/${c.mode}/${c.id}/${lang}.vtt${subtitleQs(c)}` }));
+const subtitleEntries = (c) => subtitleSvc.listLangs(c).map((lang) => ({ lang, label: subtitleSvc.LANGS[lang], url: `/api/subtitles/${c.mode}/${c.id}/${lang}.vtt${subtitleQs(c)}`, cached: subtitleSvc.isCached({ ...c, lang }) }));
 async function subtitleTmdb(mode, id) {
   const numId = parseInt(id, 10);
   const item = indexes[mode]?.byId.get(numId) || indexes[mode]?.byId.get(id);
