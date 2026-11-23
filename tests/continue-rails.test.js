@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { selectContinueAndHistory } = require("../lib/continue-rails");
+const { selectContinueAndHistory, clearAutoPointer } = require("../lib/continue-rails");
 
 const pm = (o) => new Map(Object.entries(o).map(([k, v]) => [Number(k), v]));
 
@@ -12,7 +12,7 @@ test("finished movie (no progress, in recents) goes to history only", () => {
 });
 
 test("just-pressed movie (p<=5) is history, not continue", () => {
-  const r = selectContinueAndHistory({ mode: "movie", progressById: pm({ 3: { p: 4, t: 9 } }), recentIds: [3] });
+  const r = selectContinueAndHistory({ mode: "movie", progressById: pm({ 3: { p: 20, t: 9 } }), recentIds: [3] });
   assert.deepEqual(r.continueIds, []);
   assert.deepEqual(r.historyIds, [3]);
 });
@@ -30,4 +30,26 @@ test("series with in-progress episode continues; ordering newest first; watched 
     recentIds: [22], lpForMode: { 22: 20 }, watchedIds: [23] });
   assert.deepEqual(r.continueIds, [21, 20]);
   assert.deepEqual(r.historyIds, [22, 23]);
+});
+
+test("clearAutoPointer drops up-next flag so a finished series leaves Continue", () => {
+  const le = { auto: true, when: Date.now() };
+  clearAutoPointer(le);
+  const r = selectContinueAndHistory({ mode: "series", progressById: pm({}), recentIds: [30], lastEpisode: { 30: le } });
+  assert.deepEqual(r.continueIds, []);
+  assert.deepEqual(r.historyIds, [30]);
+});
+
+test("stale auto pointer (>45d) expires", () => {
+  const r = selectContinueAndHistory({ mode: "series", progressById: pm({}), recentIds: [31],
+    lastEpisode: { 31: { auto: true, when: Date.now() - 46 * 864e5 } } });
+  assert.deepEqual(r.continueIds, []);
+});
+
+test("direct-play finished (d>0, p>=95%) and p<30 are not Continue", () => {
+  const r = selectContinueAndHistory({ mode: "movie",
+    progressById: pm({ 40: { p: 6800, d: 7000, t: 5 }, 41: { p: 10, d: 7000, t: 4 }, 42: { p: 100, d: 0, t: 3 } }),
+    recentIds: [] });
+  assert.deepEqual(r.continueIds, [42]);
+  assert.deepEqual(r.historyIds.sort(), [40, 41]);
 });

@@ -5988,7 +5988,7 @@ const CHIP_KINDS = {
 // filtering is uniform across rails, search, index, and per-mode
 // streams.
 const { KIDS_CERT_TIERS, makeKidsBlocker } = require("./lib/kids-filter");
-const { selectContinueAndHistory, hasPosition } = require("./lib/continue-rails");
+const { selectContinueAndHistory, hasPosition, clearAutoPointer, autoPointerLive } = require("./lib/continue-rails");
 
 // "<genre> | <lang>: <name>" is a common alternate convention where
 // the word BEFORE the pipe is the genre hint ("News | Ar: Al Jazeera",
@@ -7676,13 +7676,13 @@ function advanceToNextEpisode(userState, finishedEpisodeId) {
   const hit = cache.get(infoKey(String(seriesId))) || cache.get(infoKey(parseInt(seriesId, 10)));
   const info = hit && Date.now() - hit.t < TTL_MS ? hit.v : null;
   const seasons = info?.episodes && typeof info.episodes === "object" ? info.episodes : null;
-  if (!seasons) return;
+  if (!seasons) { clearAutoPointer(le); return; }
   const all = Object.entries(seasons)
     .flatMap(([sn, eps]) => (Array.isArray(eps) ? eps : []).map((e) => ({ ...e, season: Number(e.season ?? sn) })))
     .sort((a, b) => a.season - b.season || (Number(a.episode_num) || 0) - (Number(b.episode_num) || 0));
   const at = all.findIndex((e) => String(e.id) === epId);
   const next = at >= 0 ? all[at + 1] : null;
-  if (!next || !/^\d{1,12}$/.test(String(next.id))) return; // last episode (or unknown): leave as is
+  if (!next || !/^\d{1,12}$/.test(String(next.id))) { clearAutoPointer(le); return; } // last episode: series is done
   userState.lastEpisode[seriesId] = {
     ...le,
     episode_id: String(next.id), season: next.season, episode_num: Number(next.episode_num) || null,
@@ -10633,7 +10633,7 @@ const MCP_TOOLS = [
         if (le?.episode_id == null || !/^\d+$/.test(String(le.episode_id))) continue;
         const pr = st.progress?.[`series:${le.episode_id}`];
         // Unfinished only: a saved position, or an "up next" pointer.
-        if (!hasPosition(pr) && le.auto !== true) continue;
+        if (!hasPosition(pr) && !autoPointerLive(le)) continue;
         seenEpisodes.add(String(le.episode_id));
         items.push({
           ref: `episode:${le.episode_id}:${String(le.container || "mp4").toLowerCase()}`,
