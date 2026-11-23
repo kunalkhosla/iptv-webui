@@ -93,6 +93,12 @@ test("contract: /api/stream/:mode/:id.:ext returns { direct, proxy, transcode, d
   const h = handlerFor(/app\.get\("\/api\/stream\/:mode/);
   expectFields("/api/stream/...", h, ["direct", "proxy", "transcode", "download", "url"]);
 });
+// Live: `liveChecked` (true = server liveness verdict is current; a client may
+// skip its own pre-play manifest GET). Additive; absent for VOD.
+test("contract: live /api/stream carries liveChecked", () => {
+  const h = handlerFor(/app\.get\("\/api\/stream\/:mode/);
+  expectFields("/api/stream/... (live)", h, ["liveChecked"]);
+});
 
 // --- /api/home/:mode — consumed by web, Android phone, Android TV.
 test("contract: /api/home/:mode returns { mode, rails, hero, chips }", () => {

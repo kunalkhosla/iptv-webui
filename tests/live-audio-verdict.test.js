@@ -120,3 +120,35 @@ test("firstVariantUri: master -> first variant, media/other -> null", () => {
   assert.equal(firstVariantUri("#EXTM3U\n#EXTINF:4,\nseg.ts\n"), null);
   assert.equal(firstVariantUri("#EXTM3U\n"), null);
 });
+
+const { clientRoutesLiveAudio, livenessOnlyEntry, liveVerdictTrusted, LIVE_ALIVE_RECHECK_MS } = require("../lib/live-audio-verdict");
+test("alive check on an unknown or recovered channel caches liveness only", () => {
+  const first = applyLiveCheck(undefined, { alive: true }, NOW);
+  assert.equal(first.kind, "alive");
+  assert.deepEqual(first.entry, { audio_codec: null, browser_safe: false, dead: false, ts: 0, live_ts: NOW });
+  const rec = applyLiveCheck({ audio_codec: "aac", dead: true, dead_reason: "http-404", ts: NOW - H }, { alive: true }, NOW);
+  assert.equal(rec.kind, "recovered");
+  assert.deepEqual(rec.entry, livenessOnlyEntry(NOW));
+  // Next zap inside the recheck window: no network check...
+  assert.equal(decideLiveHealth({ entry: first.entry, now: NOW + LIVE_ALIVE_RECHECK_MS - 1 }).action, "proceed");
+  assert.equal(decideLiveHealth({ entry: first.entry, now: NOW + LIVE_ALIVE_RECHECK_MS }).action, "check");
+  // ...but the codec is still unknown: clients that route on it still probe.
+  assert.equal(decideLiveAudio({ entry: first.entry, fresh: false, anyInflight: false }).wait, true);
+  // An inconclusive check never invents an entry.
+  assert.equal(applyLiveCheck(undefined, { alive: null, reason: "timeout" }, NOW).entry, undefined);
+});
+test("clientRoutesLiveAudio: Android okhttp UA or ?probe=0", () => {
+  assert.equal(clientRoutesLiveAudio({ userAgent: "okhttp/4.12.0" }), true);
+  assert.equal(clientRoutesLiveAudio({ userAgent: "Mozilla/5.0 (X11) Chrome/120" }), false);
+  assert.equal(clientRoutesLiveAudio({ userAgent: "Mozilla/5.0", probe: "0" }), true);
+  assert.equal(clientRoutesLiveAudio({ userAgent: "Mozilla/5.0", probe: "1" }), false);
+  assert.equal(clientRoutesLiveAudio({}), false);
+});
+test("liveVerdictTrusted: only a current, ungated verdict", () => {
+  assert.equal(liveVerdictTrusted({ viewerActive: false, healthAction: "proceed" }), true);
+  assert.equal(liveVerdictTrusted({ viewerActive: true, healthAction: "proceed" }), false);
+  assert.equal(liveVerdictTrusted({ viewerActive: false, healthAction: "check", checkKind: "alive" }), true);
+  assert.equal(liveVerdictTrusted({ viewerActive: false, healthAction: "check", checkKind: "recovered" }), true);
+  assert.equal(liveVerdictTrusted({ viewerActive: false, healthAction: "check", checkKind: "inconclusive" }), false);
+  assert.equal(liveVerdictTrusted({ viewerActive: false, healthAction: "check", checkKind: null }), false);
+});

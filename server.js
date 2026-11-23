@@ -993,10 +993,10 @@ function refreshLiveLiveness(key, direct, entry) {
       v = { alive: null, reason: v.reason };
     }
     const out = applyLiveCheck(entry, v);
-    if (out.kind === "dead") audioCodecCache[key] = out.entry;
-    else if (out.kind === "recovered") delete audioCodecCache[key];
-    else if (out.kind === "alive" && out.entry) audioCodecCache[key] = out.entry;
-    if (out.kind !== "inconclusive") scheduleAudioCodecCacheSave();
+    if (out.kind !== "inconclusive") {
+      audioCodecCache[key] = out.entry;
+      scheduleAudioCodecCacheSave();
+    }
     return out;
   })().finally(() => liveCheckInflight.delete(key));
   liveCheckInflight.set(key, p);
@@ -2697,7 +2697,7 @@ const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
 const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue");
 const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
 const { isLowQuality, lowQualityLast } = require("./lib/low-quality");
-const { decideLiveAudio, withDeadline, decideLiveHealth, applyLiveCheck, isPersistentDeadReason, deadTtlMs, manifestHasContent, firstVariantUri, LIVE_UNAVAILABLE } = require("./lib/live-audio-verdict");
+const { decideLiveAudio, withDeadline, decideLiveHealth, applyLiveCheck, isPersistentDeadReason, deadTtlMs, manifestHasContent, firstVariantUri, LIVE_UNAVAILABLE, clientRoutesLiveAudio, liveVerdictTrusted } = require("./lib/live-audio-verdict");
 const LIVE_AUDIO_PROBE_WAIT_MS = (() => { const n = parseInt(process.env.LIVE_AUDIO_PROBE_WAIT_MS ?? "", 10); return Number.isFinite(n) && n >= 0 ? n : 3500; })();
 const { segmentQuery } = require("./lib/segment-query");
 const { liveHlsListSize, panelReconnectArgs, liveTolerantArgs } = require("./lib/live-hls");
@@ -13325,8 +13325,13 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   // via the existing /api/stream → fragParsingError fallback.
   let forceTranscode = false;
   let forceReason = null;
+  let liveChecked;
   if (req.params.mode === "live" && req.params.ext === "m3u8") {
     const key = `${req.params.mode}:${req.params.id}`;
+    const zapT0 = Date.now();
+    let zapGate = "", zapProbe = "none";
+    // One line per live zap: where the time went (no URLs/creds).
+    const zapLog = (status) => console.log(`[zap] ${key} ${status} ${Date.now() - zapT0}ms gate=${zapGate} probe=${zapProbe}${viewerActive ? " viewer" : ""}${clientAudio ? " client-audio" : ""}`);
     let verdict = audioCodecCache[key];
     // Fail fast on dead/empty channels (see decideLiveHealth). A persistent-dead
     // verdict inside its TTL answers 503 with no network call; `?retry=1` (the
@@ -13335,22 +13340,31 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     // Other owners only: the requester's own current stream is still registered
     // while it zaps, and must not suppress its own codec probe.
     const viewerActive = streamingRecentlyIn(streams, null, LIVE_IDLE_GRACE_MS, Date.now(), ownerKeyOf(req));
+    // Android apps (and ?probe=0) never read forceTranscode/url: no codec probe for them.
+    const clientAudio = clientRoutesLiveAudio({ userAgent: req.get("user-agent"), probe: req.query.probe });
     const health = decideLiveHealth({ entry: verdict, now: Date.now(), viewerActive, retry: req.query.retry === "1" });
+    zapGate = health.action;
     if (health.action === "unavailable") {
+      zapLog(503);
       return res.status(503).json(LIVE_UNAVAILABLE);
     }
-    let skipProbe = viewerActive;
+    let skipProbe = viewerActive || clientAudio;
     let livenessVerified = false;
+    let checkKind = null;
     if (health.action === "check" && !audioProbeInflight.has(key)) {
-      const known = !!verdict;
+      const known = !!verdict && (verdict.dead || !!verdict.audio_codec); // liveness-only entries don't count
+      const tc = Date.now();
       const out = await refreshLiveLiveness(key, direct, verdict);
-      if (out.kind === "dead") return res.status(503).json(LIVE_UNAVAILABLE);
+      checkKind = out.kind;
+      zapGate = `check:${out.kind}(${Date.now() - tc}ms)`;
+      if (out.kind === "dead") { zapLog(503); return res.status(503).json(LIVE_UNAVAILABLE); }
       verdict = out.entry;
       if (out.kind === "recovered" || out.kind === "alive") livenessVerified = true;
       // Known channel + flapping panel: don't hammer it, play. An unknown
       // channel still gets its codec probe (with its own liveness retries).
       if (out.kind === "inconclusive" && known) skipProbe = true;
     }
+    liveChecked = liveVerdictTrusted({ viewerActive, healthAction: health.action, checkKind });
     // An unrechecked dead verdict never blocks playback or routes audio.
     if (verdict && verdict.dead) verdict = undefined;
     // Stale-while-revalidate: a known codec verdict (even past its TTL) routes
@@ -13364,17 +13378,21 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
       sameKeyInflight: audioProbeInflight.has(key),
       anyInflight: anyProbeInflight(),
     });
+    if (plan.wait && skipProbe) zapProbe = clientAudio ? "skip-client" : "skip";
     if (plan.wait && !skipProbe) {
+      const tp = Date.now();
       try {
-        const probed = await withDeadline(probeChannelAudioCodec(req.params.mode, req.params.id, undefined, { skipLiveness: livenessVerified }), LIVE_AUDIO_PROBE_WAIT_MS);
+        const probed = await withDeadline(probeChannelAudioCodec(req.params.mode, req.params.id, undefined, { skipLiveness: livenessVerified || liveChecked }), LIVE_AUDIO_PROBE_WAIT_MS);
         if (probed) verdict = probed;
+        zapProbe = `${probed ? (probed.dead ? "dead" : probed.audio_codec || "none") : "timeout"}(${Date.now() - tp}ms)`;
       } catch {}
-      if (verdict && verdict.dead) return res.status(503).json(LIVE_UNAVAILABLE);
+      if (verdict && verdict.dead) { zapLog(503); return res.status(503).json(LIVE_UNAVAILABLE); }
     }
     if (verdict && verdict.audio_codec && !verdict.browser_safe) {
       forceTranscode = true;
       forceReason = `audio:${verdict.audio_codec}`;
     }
+    zapLog(200);
   }
   const primaryUrl = forceTranscode ? transcodeUrl : direct;
   res.json({
@@ -13387,6 +13405,10 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     transcodeAnchorSecs: offsetSecs,
     forceTranscode,
     forceReason,
+    // Live only: true = the server's liveness verdict is current (fresh cache
+    // or a check that just passed), so the client can skip its own pre-play
+    // manifest GET. false/absent = check it yourself.
+    ...(liveChecked !== undefined ? { liveChecked } : {}),
     subtitles: streamSubtitles(req),
   });
 });
