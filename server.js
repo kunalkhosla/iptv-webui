@@ -2024,6 +2024,7 @@ async function prewarmTmdbCache(mode, actx = currentAccount()) {
 // ──────────────────────────────────────────────────────────────────
 const zlib = require("zlib");
 const { promisify } = require("util");
+const { calibrateEpgOffsets, cleanEpgIndexOverlaps } = require("./lib/epg-clean");
 const epgIndex = new Map(); // epg_channel_id → sorted [{ start, stop, title, desc }]
 let epgIndexBuiltAt = 0;
 const epgIndexFile = path.join(DATA_DIR, "epg-xmltv.json");
@@ -2234,6 +2235,7 @@ async function loadEpgIndexFromDisk(actx = currentAccount()) {
       for (const [k, v] of Object.entries(data.byChannel)) {
         if (Array.isArray(v)) epgIndex.set(k, v);
       }
+      cleanEpgIndexOverlaps(epgIndex); // idempotent; covers files written before the cleanup existed
       epgIndexBuiltAt = data.builtAt || 0;
       if (data.channels && typeof data.channels === "object") epgChannelMeta = new Map(Object.entries(data.channels));
       if (data.status && typeof data.status === "object") epgStatus = data.status;
@@ -2245,6 +2247,7 @@ async function loadEpgIndexFromDisk(actx = currentAccount()) {
       for (const [k, v] of Object.entries(data.byChannel)) {
         if (Array.isArray(v)) e.byChannel.set(k, v);
       }
+      cleanEpgIndexOverlaps(e.byChannel);
       e.builtAt = data.builtAt || 0;
       const totalProgs = [...e.byChannel.values()].reduce((a, b) => a + b.length, 0);
       console.log(`[epg] loaded ${e.byChannel.size} channels / ${totalProgs} programmes from disk (host=${hostHashOf(actx.host)})`);
@@ -2280,11 +2283,12 @@ async function prewarmEpgInner(actx) {
   const next = new Map();       // channel id -> sorted programmes
   const meta = new Map();       // channel id -> display names (external + provider)
   const sources = {};
+  const sourceOf = new Map();   // channel id -> source label that supplied its programmes
   const mergeIn = (label, parsed) => {
     let n = 0;
     for (const [id, names] of parsed.chans) if (!meta.has(id)) meta.set(id, names);
     for (const [id, arr] of parsed.progs) {
-      if (!next.has(id)) { next.set(id, arr); n += arr.length; }
+      if (!next.has(id)) { next.set(id, arr); sourceOf.set(id, label); n += arr.length; }
     }
     sources[label] = { channels: parsed.progs.size, programmes: n };
   };
@@ -2319,6 +2323,19 @@ async function prewarmEpgInner(actx) {
     }
   }
   for (const arr of next.values()) arr.sort((a, b) => a.start - b.start);
+  // Fix mis-labelled source time zones (measured against the epgshare
+  // feeds, which carry explicit offsets), then drop merged-schedule
+  // overlaps. See lib/epg-clean.js.
+  let calibration = null;
+  if (owner) {
+    try {
+      const r = calibrateEpgOffsets({ byChannel: next, names: meta, sourceOf, isReference: (l) => /^epg_ripper_/.test(l), nameKey: epgNameKey });
+      calibration = { shiftedChannels: r.applied.size, groups: r.groups };
+      for (const [gk, g] of Object.entries(r.groups)) if (g.shiftMin) console.log(`[epg] ${gk}: shifting ${g.channels} channel(s) by ${g.shiftMin} min (${JSON.stringify(g.votes)} of ${g.calibrated} calibrated)`);
+    } catch (e) { calibration = { error: e.message }; console.warn(`[epg] offset calibration failed: ${e.message}`); }
+  }
+  const overlaps = cleanEpgIndexOverlaps(next);
+  if (overlaps.channels) console.log(`[epg] dropped ${overlaps.programmesDropped} overlapping programme(s) on ${overlaps.channels} channel(s) (e.g. ${overlaps.examples.slice(0, 5).join(", ")})`);
   let total = 0;
   for (const arr of next.values()) total += arr.length;
   // Never replace a populated guide with an empty one (a failed/odd
@@ -2350,7 +2367,8 @@ async function prewarmEpgInner(actx) {
   }
   console.log(`[epg] indexed ${next.size} channels / ${total} programmes in ${((Date.now() - t0) / 1000).toFixed(1)}s total (${Object.entries(sources).map(([k, v]) => `${k}:${v.programmes ?? "err"}`).join(", ")})`);
   if (owner) {
-    epgStatus = { builtAt: epgIndexBuiltAt, channels: next.size, programmes: total, matchedStreams: 0, sources, lastAttempt: Date.now() };
+    epgStatus = { builtAt: epgIndexBuiltAt, channels: next.size, programmes: total, matchedStreams: 0, sources, lastAttempt: Date.now(),
+      calibration, overlaps: { channels: overlaps.channels, programmesDropped: overlaps.programmesDropped, emptied: overlaps.emptied } };
     applyEpgMatching(actx);
   }
   saveEpgIndexToDisk(actx);
@@ -13793,7 +13811,9 @@ app.listen(PORT, async () => {
   // the xmltv download / parse is in flight.
   loadEpgIndexFromDisk().then(() => {
     try { applyEpgMatching(actx); } catch (e) { console.warn(`[epg] boot match: ${e.message}`); }
-    if (Date.now() - epgIndexBuiltAt > EPG_XMLTV_STALE_MS) {
+    // Also rebuild a guide saved before time-zone calibration existed
+    // (status.calibration missing), so the fix doesn't wait up to 6h.
+    if (Date.now() - epgIndexBuiltAt > EPG_XMLTV_STALE_MS || !epgStatus.calibration) {
       prewarmEpg(actx).catch(e => console.warn(`[epg] boot prewarm: ${e.message}`));
     }
     scheduleEpgNightlyRefresh();
