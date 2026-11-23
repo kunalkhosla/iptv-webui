@@ -2457,6 +2457,8 @@ const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
 const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue");
 const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
 const { segmentQuery } = require("./lib/segment-query");
+const { liveHlsListSize, panelReconnectArgs } = require("./lib/live-hls");
+const { createDownloadQueue } = require("./lib/download-queue");
 const { streamingRecently: streamingRecentlyIn } = require("./lib/recent-stream");
 const certBackfill = { running: false, done: 0, total: 0 };
 async function tmdbRaw(pathAndQuery) {
@@ -4644,8 +4646,9 @@ const DL_MAX_BYTES = 40 * 1024 ** 3;
 const DL_TTL_MS = 48 * 3600 * 1000;
 const DL_MIN_FREE_BYTES = 8 * 1024 ** 3;
 const DL_MAX_FETCH_RETRIES = 6;
-const dlJobs = new Map();   // "mode_id" -> job
-const dlQueue = [];
+const dlq = createDownloadQueue({ maxActive: 12, maxPerProfile: 5, maxPending: 50 });
+const dlJobs = dlq.jobs;    // "mode_id" -> job
+const dlQueue = dlq.queue;
 let dlRunning = false;
 const DL_ID_RE = /^\d{1,12}$/;
 const dlKey = (mode, id) => {
@@ -4656,8 +4659,10 @@ const dlFile = (k) => path.join(DL_DIR, `${k}.mp4`);
 const dlSrcPath = (k) => path.join(DL_DIR, `${k}.src.part`);
 const dlOutPath = (k) => path.join(DL_DIR, `${k}.out.part.mp4`);
 const DL_MAX_JOB_AGE_MS = 24 * 3600 * 1000;
-const DL_MAX_ACTIVE_PER_PROFILE = 3;
-const DL_MAX_ACTIVE = 10;
+const DL_BATCH_MAX = 10;
+// Batch items beyond the active caps wait here (insertion-ordered = FIFO) and
+// are promoted from dlPump's finally / cancel. key -> {mode,id,actx,profileId}.
+const dlPending = dlq.pending;
 const DL_MIN_AGE_BEFORE_PRUNE_MS = 3600 * 1000;
 app.param("id", (req, res, next, id) => (DL_ID_RE.test(String(id).replace(/\.mp4$/, "")) || !req.path.startsWith("/api/download/")) ? next() : res.status(400).json({ error: "bad id" }));
 try {
@@ -4676,28 +4681,31 @@ function dlView(mode, id) {
   try { st = fs.statSync(dlFile(k)); } catch {}
   if (st && st.size > 0) return { state: "ready", pct: 100, size: st.size, url: dlSignedUrl(mode, id) };
   const j = dlJobs.get(k);
+  // Parked batch items look like ordinary queued jobs to clients.
+  if (!j && dlPending.has(k)) return { state: "queued", pct: 0, stage: "queued", bytes: 0, error: null, queue_position: dlq.position(k) };
   if (!j) return { state: "none" };
   if (j.state === "ready") { dlJobs.delete(k); return { state: "none" }; } // file vanished
   return {
     state: j.state, pct: Math.max(0, Math.min(99, Math.round(j.pct || 0))), stage: j.stage || null,
-    bytes: j.bytes || 0, error: j.error || null, queue_position: j.state === "queued" ? dlQueue.indexOf(j) + 1 : 0,
+    bytes: j.bytes || 0, error: j.error || null, queue_position: dlq.position(k),
   };
 }
-function ensureDownloadJob(mode, id, actx, profileId) {
+// Start (or report) a job. `deferWhenCapped`: instead of failing when the caps
+// are hit, park the request in the pending list (promoted as jobs finish).
+function ensureDownloadJob(mode, id, actx, profileId, deferWhenCapped = false) {
   const k = dlKey(mode, id);
   const view = dlView(mode, id);
   if (view.state === "ready") { try { fs.utimesSync(dlFile(k), new Date(), new Date()); } catch {} return view; }
-  const cur = dlJobs.get(k);
-  if (cur && cur.state !== "failed") return dlView(mode, id);
-  const active = [...dlJobs.values()].filter((j) => j.state === "queued" || j.state === "waiting" || j.state === "running");
-  if (active.length >= DL_MAX_ACTIVE || active.filter((j) => j.profileId === profileId).length >= DL_MAX_ACTIVE_PER_PROFILE) {
-    return { state: "failed", pct: 0, error: "too many downloads in progress — wait for one to finish" };
-  }
-  const job = { key: k, mode, id, actx, profileId, state: "queued", stage: "queued", pct: 0, bytes: 0, error: null, createdAt: Date.now(), cancelled: false, abort: null };
-  dlJobs.set(k, job);
-  dlQueue.push(job);
-  dlPump();
+  const r = dlq.admit(k, mode, id, actx, profileId, { defer: deferWhenCapped });
+  if (r.result === "capped") return { state: "failed", pct: 0, error: "too many downloads in progress — wait for one to finish" };
+  if (r.result === "full") return { state: "failed", pct: 0, error: "download queue is full" };
+  if (r.result === "started") dlPump();
   return dlView(mode, id);
+}
+// Promote parked batch items into real jobs while the caps allow.
+function dlPromotePending() {
+  const skip = (k) => { try { return fs.statSync(dlFile(k)).size > 0; } catch { return false; } };
+  if (dlq.promote(skip).length) dlPump();
 }
 function dlPump() {
   if (dlRunning) return;
@@ -4711,8 +4719,8 @@ function dlPump() {
       streams.delete(owner);
       if (job.state !== "ready") { try { fs.rmSync(dlOutPath(job.key), { force: true }); } catch {} }
       if (job.state === "failed" || job.cancelled) { try { fs.rmSync(dlSrcPath(job.key), { force: true }); } catch {} }
-      if (job.cancelled) dlJobs.delete(job.key);
-      dlRunning = false; pruneDownloadCache(); dlPump(); });
+      if (job.cancelled) dlq.dropJob(job);
+      dlRunning = false; pruneDownloadCache(); dlPromotePending(); dlPump(); });
 }
 function pruneDownloadCache() {
   try {
@@ -7623,15 +7631,46 @@ app.get("/api/download/status/:mode(movie|series)/:id", (req, res) => {
   res.set("Cache-Control", "no-store");
   res.json(dlView(req.params.mode, String(req.params.id)));
 });
+// "Download for the trip": enqueue up to DL_BATCH_MAX titles at once. Items over
+// the per-profile/global caps wait in a pending list and are promoted as jobs
+// finish, instead of failing with "too many".
+app.post("/api/download/prepare-batch", express.json(), (req, res) => {
+  const items = req.body?.items;
+  if (!Array.isArray(items) || items.length === 0 || items.length > DL_BATCH_MAX) {
+    return res.status(400).json({ error: `items must be an array of 1-${DL_BATCH_MAX}` });
+  }
+  const parsed = [];
+  for (const it of items) {
+    const mode = it && it.mode, id = it && it.id != null ? String(it.id) : "";
+    if ((mode !== "movie" && mode !== "series") || !DL_ID_RE.test(id)) return res.status(400).json({ error: "bad item" });
+    parsed.push({ mode, id });
+  }
+  const actx = currentAccount();
+  const out = parsed.map(({ mode, id }) => ({ mode, id, ...ensureDownloadJob(mode, id, actx, req.profileId, true) }));
+  res.json({ items: out });
+});
+app.get("/api/download/queue", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const items = [];
+  for (const j of dlJobs.values()) {
+    if (j.profileId === req.profileId) items.push({ mode: j.mode, id: j.id, ...dlView(j.mode, j.id) });
+  }
+  for (const p of dlPending.values()) {
+    if (p.profileId === req.profileId) items.push({ mode: p.mode, id: p.id, ...dlView(p.mode, p.id) });
+  }
+  res.json({ items });
+});
 // The phone calls this after it has saved the file, to free server disk.
 app.delete("/api/download/cache/:mode(movie|series)/:id", (req, res) => {
   const k = dlKey(req.params.mode, String(req.params.id));
+  if (dlPending.delete(k)) return res.json({ ok: true, cancelled: true });
   const j = dlJobs.get(k);
   if (j && (j.state === "running" || j.state === "waiting" || j.state === "queued")) {
     // cancel: the runner notices the flag, stops, and cleans its partial files
     j.cancelled = true; dlJobs.delete(k);
-    const qi = dlQueue.indexOf(j); if (qi >= 0) { dlQueue.splice(qi, 1); dlJobs.delete(k); }
+    dlq.removeFromQueue(j);
     try { j.abort?.(); } catch {}
+    dlPromotePending();
     return res.json({ ok: true, cancelled: true });
   }
   try { fs.rmSync(dlFile(k), { force: true }); } catch {}
@@ -12274,12 +12313,7 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     // Do NOT add -reconnect_at_eof: a real EOF is the genuine end (live
     // HLS segments EOF every few seconds; a VOD's true end EOFs once), so
     // it would reconnect-loop forever (the reverted c5540f0).
-    args.push(
-      "-rw_timeout", "15000000",
-      "-reconnect", "1",
-      "-reconnect_streamed", "1",
-      "-reconnect_delay_max", "5",
-    );
+    args.push(...panelReconnectArgs());
     // VOD on the iGPU: decode AND scale on the GPU (0.7 vs 42 CPU-seconds for
     // a 20s 4K HEVC clip — measured). Decoding in software and only encoding
     // on the GPU pinned ~7.5 cores per movie and starved everything else on
@@ -12342,13 +12376,13 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     "-hls_segment_filename", path.join(dir, "seg_%05d.ts"),
   );
   if (mode === "live") {
-    // Live: tight 40-second sliding window. Old segments age out
+    // Live: sliding window (liveHlsListSize() x 4 s, default 80 s so a client live offset of 20-30 s plus a rebuffer stays inside it). Old segments age out
     // because there's no concept of rewinding past the live edge,
     // and disk space matters more than seek-back range. On respawn,
     // append_list + a continued start_number extend the SAME playlist so
     // the player's media sequence keeps advancing (brief rebuffer, no reset).
     args.push(
-      "-hls_list_size", "10",
+      "-hls_list_size", String(liveHlsListSize()),
       "-start_number", String(startNumber),
       // append_list continues the same media sequence on respawn. The inline
       // #EXT-X-DISCONTINUITY marker the player needs at the boundary is injected
@@ -12400,7 +12434,7 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     // Mark the boundary so the manifest route emits #EXT-X-DISCONTINUITY before
     // this segment — the player resets its decoder timeline across the restart.
     entry.discontinuities.add(startNumber);
-    for (const d of entry.discontinuities) if (d < startNumber - 30) entry.discontinuities.delete(d);
+    for (const d of entry.discontinuities) if (d < startNumber - liveHlsListSize() - 2) entry.discontinuities.delete(d);
   }
   ffmpeg.on("exit", (code) => {
     const tail = stderrBuf.split("\n").filter(Boolean).slice(-3).join(" | ");
