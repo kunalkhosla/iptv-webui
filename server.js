@@ -2335,6 +2335,7 @@ async function prewarmEpgInner(actx) {
         previous: shiftsToPersist(epgStatus.calibration?.groups),
       });
       calibration = { shiftedChannels: r.applied.size, groups: r.groups };
+      for (const gk of r.absent) console.warn(`[epg] ${gk}: no channels this build; remembering its ${r.groups[gk].remembered.shiftMin} min shift (miss ${r.groups[gk].remembered.misses})`);
       for (const [gk, g] of Object.entries(r.groups)) if (g.shiftMin) console.log(`[epg] ${gk}: shifting ${g.channels} channel(s) by ${g.shiftMin} min (${g.reused ? "reused from last build" : `${JSON.stringify(g.votes)} of ${g.calibrated} calibrated`})`);
     } catch (e) {
       // Keep the last known shifts so the next build can still reuse them.

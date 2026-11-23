@@ -168,13 +168,14 @@ test("reference outage: no evidence leaves data unchanged, or reuses the persist
   const r = calibrateEpgOffsets({ ...sc, previous: { "provider/in": -330 } });
   assert.equal(r.applied.size, 6);
   assert.equal(r.groups["provider/in"].reused, true);
-  assert.deepEqual(shiftsToPersist(r.groups), { "provider/in": -330 });
+  assert.deepEqual(shiftsToPersist(r.groups), { "provider/in": { shiftMin: -330, misses: 1 } });
 });
 
 test("persisted shift survives a build where the group is absent, and is cleared by a consensus of 0", () => {
   const empty = { byChannel: new Map(), names: new Map(), sourceOf: new Map(), isReference: () => false, isCandidate: () => true, nameKey: (s) => s };
   const r = calibrateEpgOffsets({ ...empty, previous: { "provider/in": -330 } });
-  assert.deepEqual(shiftsToPersist(r.groups), { "provider/in": -330 });
+  assert.deepEqual(shiftsToPersist(r.groups), { "provider/in": { shiftMin: -330, misses: 1 } });
+  assert.deepEqual(r.absent, ["provider/in"]);
   const fixed = scenario({ provShiftH: 0, n: 6 }); // provider fixed its feed
   const r2 = calibrateEpgOffsets({ ...fixed, previous: { "provider/in": -330 } });
   assert.equal(r2.applied.size, 0);
@@ -200,4 +201,61 @@ test("only candidate sources are calibrated (epg.pw-style feeds left alone)", ()
     sc.byChannel.set(`Pw${i}.in`, day(0, shows)); sc.names.set(`Pw${i}.in`, [`Pw ${i}`]); sc.sourceOf.set(`Pw${i}.in`, "epg_ripper_IN1");
   }
   assert.equal(calibrateEpgOffsets(sc).applied.size, 0);
+});
+
+// Provider group where `fixed` channels measure 0 and `late` ones measure +5.5h.
+function mixed(fixed, late) {
+  const sc = scenario({ provShiftH: 0, n: 0 });
+  const add = (tag, shiftH) => {
+    const shows = SHOWS.map((x) => `${x} ${tag}`);
+    sc.byChannel.set(`${tag}.in`, day(shiftH, shows)); sc.names.set(`${tag}.in`, [`IN: ${tag}`]); sc.sourceOf.set(`${tag}.in`, "provider");
+    sc.byChannel.set(`R${tag}.in`, day(0, shows)); sc.names.set(`R${tag}.in`, [tag]); sc.sourceOf.set(`R${tag}.in`, "epg_ripper_IN1");
+  };
+  for (let i = 0; i < fixed; i++) add(`f${i}`, 0);
+  for (let i = 0; i < late; i++) add(`l${i}`, 5.5);
+  sc.byChannel.set("nomeas.in", [P(10, 30, "Unmatched")]); sc.names.set("nomeas.in", ["IN: Nothing"]); sc.sourceOf.set("nomeas.in", "provider");
+  return sc;
+}
+
+test("stale shift: a few 0 votes below minGroup clear it (no double correction)", () => {
+  const sc = mixed(2, 0);
+  const r = calibrateEpgOffsets({ ...sc, previous: { "provider/in": { shiftMin: -330, misses: 0 } } });
+  assert.equal(r.applied.size, 0);
+  assert.equal(sc.byChannel.get("nomeas.in")[0].start, T0 + 10 * H);
+  assert.deepEqual(shiftsToPersist(r.groups), {});
+});
+
+test("split votes: 0 as plurality clears; a minority of 0s blocks reuse but keeps the memory", () => {
+  const plural = calibrateEpgOffsets({ ...mixed(2, 2), previous: { "provider/in": -330 } });
+  assert.equal(plural.applied.size, 0);
+  assert.deepEqual(shiftsToPersist(plural.groups), {});
+  const minority = calibrateEpgOffsets({ ...mixed(1, 3), previous: { "provider/in": -330 } });
+  assert.equal(minority.applied.size, 0); // contradicted -> not applied
+  assert.deepEqual(shiftsToPersist(minority.groups), { "provider/in": { shiftMin: -330, misses: 1 } });
+});
+
+test("uncontradicted reuse expires after 4 builds without a fresh consensus", () => {
+  let previous = { "provider/in": -330 };
+  for (let build = 1; build <= 5; build++) {
+    const sc = mixed(0, 2); // 2 channels agree on -330 but < minGroup: no consensus, no contradiction
+    const r = calibrateEpgOffsets({ ...sc, previous });
+    if (build <= 4) assert.equal(r.applied.size, 3, `build ${build}`);
+    else assert.equal(r.applied.size, 0, `build ${build}`);
+    previous = shiftsToPersist(r.groups);
+  }
+  assert.deepEqual(previous, {});
+});
+
+test("a fresh consensus resets the reuse counter", () => {
+  const r = calibrateEpgOffsets({ ...mixed(0, 6), previous: { "provider/in": { shiftMin: -330, misses: 3 } } });
+  assert.equal(r.applied.size, 7);
+  assert.deepEqual(shiftsToPersist(r.groups), { "provider/in": { shiftMin: -330, misses: 0 } });
+});
+
+test("deletion rule needs enough dropped programmes", () => {
+  const long = Array.from({ length: 6 }, (_, i) => P(i + 2, 60, `S${i}`));
+  // 2 of 8 dropped (25%, <50%) with upcoming programmes -> trimmed, not deleted
+  const m = new Map([["c", [P(0, 60, "X"), P(0, 60, "Y"), ...long]]]);
+  cleanEpgIndexOverlaps(m, T0);
+  assert.equal(m.get("c").length, 6);
 });
