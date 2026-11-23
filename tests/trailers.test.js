@@ -6,9 +6,10 @@ const path = require("node:path");
 const http = require("node:http");
 const express = require("express");
 const {
-  createTrailerCache, isValidTrailerKey, trailerRouteHandler, makeYtDlpDownloader, ytDlpArgs, newestVersion,
+  createTrailerCache, isValidTrailerKey, trailerRouteHandler, makeYtDlpDownloader, ytDlpArgs, newestVersion, ytDlpEnv,
 } = require("../lib/trailer-cache");
 const {
+  buildTrailerKeyIndex, trailerKeyAllowed,
   pickTrailerKey, releaseMsOf, selectNewTrailers, backfillCandidates, applyReleaseInfo,
 } = require("../lib/new-trailers");
 
@@ -266,10 +267,114 @@ test("applyReleaseInfo stores the date and a trailer, keeps an existing trailer"
   assert.deepEqual(m, { release_date: null, trailer_key: "new", trailer_checked_at: 6 });
 });
 
+test("timeouts are remembered briefly; clearNegative forgets all failures", async () => {
+  const dir = tmp(); let now = 1e12; let mode = "timeout";
+  const c = createTrailerCache({
+    dir, now: () => now, negTtlMs: 6 * 3600_000, timeoutNegTtlMs: 15 * 60_000,
+    download: async () => { throw new Error(mode === "timeout" ? "yt-dlp exit null:  timed out" : "Video unavailable"); },
+  });
+  assert.equal(await c.ensure("slowkey1"), null);
+  mode = "gone";
+  assert.equal(await c.ensure("gonekey1"), null);
+  now += 16 * 60_000;
+  assert.ok(!c.isNegative("slowkey1"), "timeout memory is 15 min");
+  assert.ok(c.isNegative("gonekey1"), "hard failure memory is 6 h");
+  assert.equal(c.clearNegative(), 1);
+  assert.ok(!c.isNegative("gonekey1"));
+});
+
+test("backstop frees the slot when a download never settles", async () => {
+  const dir = tmp();
+  const c = createTrailerCache({ dir, concurrency: 1, timeoutMs: 20, backstopMs: 20, download: () => new Promise(() => {}) });
+  const t0 = Date.now();
+  assert.equal(await c.ensure("hungkey1"), null);
+  assert.ok(Date.now() - t0 < 1000);
+  assert.equal(c.busy(), false);
+  assert.ok(c.isNegative("hungkey1"));
+});
+
+test("GET /api/trailer: stable ETag across requests; If-Range and If-None-Match work", async () => {
+  const dir = tmp();
+  const c = createTrailerCache({ dir, download: fakeDownload() });
+  await withServer(trailerRouteHandler({ cache: c }), async (base) => {
+    const u = `${base}/api/trailer/etagkey1.mp4`;
+    const r1 = await fetch(u); await r1.arrayBuffer();
+    const r2 = await fetch(u); await r2.arrayBuffer();
+    const etag = r1.headers.get("etag");
+    assert.equal(etag, `"etagkey1-${BIG}"`);
+    assert.equal(r2.headers.get("etag"), etag);
+    let r = await fetch(u, { headers: { Range: "bytes=10-19", "If-Range": etag } });
+    assert.equal(r.status, 206); assert.equal((await r.arrayBuffer()).byteLength, 10);
+    r = await fetch(u, { headers: { Range: "bytes=10-19", "If-Range": '"other"' } });
+    assert.equal(r.status, 200); assert.equal((await r.arrayBuffer()).byteLength, BIG);
+    // http.get, not fetch: fetch adds Cache-Control: no-cache to conditional requests.
+    const status = await new Promise((resolve, reject) => {
+      http.get(u, { headers: { "If-None-Match": etag } }, (resp) => { resp.resume(); resolve(resp.statusCode); }).on("error", reject);
+    });
+    assert.equal(status, 304);
+  });
+});
+
+test("GET /api/trailer: allowKey gates keys (404, no download); HEAD never downloads", async () => {
+  const dir = tmp(); const log = [];
+  const c = createTrailerCache({ dir, download: fakeDownload({ log }) });
+  const handler = trailerRouteHandler({ cache: c, allowKey: (k) => k !== "notallowed" });
+  const app = express();
+  app.get("/api/trailer/:key.mp4", handler);
+  const srv = http.createServer(app);
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    let r = await fetch(`${base}/api/trailer/notallowed.mp4`);
+    assert.equal(r.status, 404);
+    assert.deepEqual(await r.json(), { error: "trailer_unavailable" });
+    r = await fetch(`${base}/api/trailer/headkey1.mp4`, { method: "HEAD" });
+    assert.equal(r.status, 404);
+    assert.deepEqual(log, [], "neither a disallowed key nor HEAD downloads");
+    await (await fetch(`${base}/api/trailer/headkey1.mp4`)).arrayBuffer();
+    r = await fetch(`${base}/api/trailer/headkey1.mp4`, { method: "HEAD" });
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get("content-length"), String(BIG));
+  } finally { srv.close(); }
+});
+
+test("trailer key allow-list: known keys only; kids need a title rated within their certs", () => {
+  const idx = buildTrailerKeyIndex([
+    ["movie:1", { source: "tmdb", tmdb_id: 1, trailer_key: "familyK", us_cert: "PG" }],
+    ["movie:2", { source: "tmdb", tmdb_id: 2, trailer_key: "adultK1", us_cert: "R" }],
+    ["movie:3", { source: "tmdb", tmdb_id: 3, trailer_key: "unratedK", us_cert: "" }],
+    ["movie:4", { source: "no-match", tmdb_id: null, trailer_key: "ghostK1" }],
+  ]);
+  const kid = new Set(["G", "PG"]);
+  assert.ok(trailerKeyAllowed(idx, "familyK", null));
+  assert.ok(trailerKeyAllowed(idx, "adultK1", null));
+  assert.ok(!trailerKeyAllowed(idx, "randomYT", null), "arbitrary YouTube ids are refused");
+  assert.ok(!trailerKeyAllowed(idx, "ghostK1", null));
+  assert.ok(trailerKeyAllowed(idx, "familyK", kid));
+  assert.ok(!trailerKeyAllowed(idx, "adultK1", kid));
+  assert.ok(!trailerKeyAllowed(idx, "unratedK", kid));
+});
+
+test("yt-dlp gets a minimal environment (no server secrets)", async () => {
+  const env = ytDlpEnv("/x/tmp/k", { PATH: "/bin", HOME: "/root", LANG: "C.UTF-8", TMDB_API_KEY: "s", PROXY_SECRET: "s", IPTV_PASS: "s" });
+  assert.deepEqual(Object.keys(env).sort(), ["HOME", "LANG", "PATH", "XDG_CACHE_HOME"]);
+  // And the spawned process really sees only that.
+  const bin = path.join(tmp(), "envdump");
+  fs.writeFileSync(bin, "#!/bin/sh\nenv > env.txt\nhead -c 70000 /dev/zero > out.mp4\n", { mode: 0o755 });
+  process.env.TRAILER_TEST_SECRET = "do-not-leak";
+  try {
+    const d = tmp();
+    await makeYtDlpDownloader({ bin })("envkey01", d, { timeoutMs: 5000 });
+    const dumped = fs.readFileSync(path.join(d, "env.txt"), "utf8");
+    assert.doesNotMatch(dumped, /TRAILER_TEST_SECRET|do-not-leak/);
+    assert.match(dumped, /^XDG_CACHE_HOME=/m);
+  } finally { delete process.env.TRAILER_TEST_SECRET; }
+});
+
 // --- server.js wiring (static) ----------------------------------------------
 test("server.js wires the trailer route, rail and release_date", () => {
   const s = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  assert.match(s, /app\.get\("\/api\/trailer\/:key\.mp4", trailerRouteHandler\(/);
+  assert.match(s, /app\.get\("\/api\/trailer\/:key\.mp4", trailerRouteHandler\(\{[\s\S]{0,200}allowKey: /);
   assert.match(s, /title: "New trailers",\s*\n\s*category_id: "__rail-new-trailers"/);
   assert.match(s, /tile\.trailer_key = t\.trailer_key/);
   assert.match(s, /release_date:\s+\/\^/);

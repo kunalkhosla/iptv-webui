@@ -596,7 +596,7 @@ const inflight = new Map();
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const { pickTrailerKey, selectNewTrailers, backfillCandidates, applyReleaseInfo } = require("./lib/new-trailers");
+const { pickTrailerKey, selectNewTrailers, backfillCandidates, applyReleaseInfo, buildTrailerKeyIndex, trailerKeyAllowed } = require("./lib/new-trailers");
 // Last good get_vod_info / get_series_info per title, for stale-if-error
 // on the detail endpoint (survives restarts, unlike `cache`).
 const { createInfoStore, getInfoStaleIfError, isUsableInfo } = require("./lib/info-cache");
@@ -779,7 +779,9 @@ const tmdbGuard = createGuardedTmdbCache({
 const tmdbCache = tmdbGuard.cache;
 const tmdbEntryVerdict = tmdbGuard.verdict;
 let tmdbCacheSaveTimer = null;
+let tmdbCacheVersion = 0; // bumped on every change; consumers rebuild derived indexes lazily
 function scheduleTmdbCacheSave() {
+  tmdbCacheVersion++;
   if (tmdbCacheSaveTimer) return;
   tmdbCacheSaveTimer = setTimeout(async () => {
     tmdbCacheSaveTimer = null;
@@ -6428,16 +6430,32 @@ async function pickYtDlp() {
     if (fs.existsSync(bin)) cands.push({ bin, version: await ytdlpVersionOf(bin) });
   }
   const best = newestVersion(cands);
+  const prev = ytdlp.version;
   ytdlp.bin = best ? best.bin : null;
   ytdlp.version = best ? best.version : null;
+  // A new yt-dlp may fix what failed: forget remembered failures.
+  if (best && prev && best.version !== prev) {
+    const n = trailerCache.clearNegative();
+    if (n) console.log(`[trailer] yt-dlp ${prev} -> ${best.version}: cleared ${n} remembered failures`);
+  }
   console.log(best ? `[trailer] yt-dlp ${best.version} (${best.bin})` : "[trailer] yt-dlp not available — trailers disabled");
   return best;
 }
 // `yt-dlp -U` on the data-volume copy (seeded from the image binary).
 // Weekly, and after a streak of download failures (at most every 12 h).
+// Last -U time persists as the mtime of a stamp file on the data volume, so
+// frequent redeploys don't keep postponing the weekly update.
+const YTDLP_STAMP = path.join(DATA_DIR, "bin", ".yt-dlp-updated");
+function ytdlpLastUpdate() {
+  try { return fs.statSync(YTDLP_STAMP).mtimeMs; } catch { return 0; }
+}
+function maybeWeeklyYtDlpUpdate() {
+  if (Date.now() - ytdlpLastUpdate() > 7 * 86400_000) selfUpdateYtDlp("weekly");
+}
 function selfUpdateYtDlp(reason) {
   if (ytdlp.updating) return ytdlp.updating;
   ytdlp.lastUpdate = Date.now();
+  try { fs.mkdirSync(path.dirname(YTDLP_STAMP), { recursive: true }); fs.writeFileSync(YTDLP_STAMP, new Date().toISOString()); } catch { /* ignore */ }
   ytdlp.updating = (async () => {
     try {
       if (!fs.existsSync(YTDLP_LOCAL_BIN)) {
@@ -6506,7 +6524,9 @@ function scheduleTrailers() {
   pickYtDlp().catch(() => {}).then(() => {
     if (!ytdlp.bin && fs.existsSync(YTDLP_IMAGE_BIN)) selfUpdateYtDlp("boot");
   });
-  const t1 = setInterval(() => selfUpdateYtDlp("weekly"), 7 * 86400_000); t1.unref?.();
+  ytdlp.lastUpdate = ytdlpLastUpdate();
+  setTimeout(maybeWeeklyYtDlpUpdate, 3 * 60_000).unref?.();
+  const t1 = setInterval(maybeWeeklyYtDlpUpdate, 6 * 3600_000); t1.unref?.();
   const evict = () => { try { const r = trailerCache.evict(); if (r.removed) console.log(`[trailer] evicted ${r.removed} (${(r.totalBytes / 1073741824).toFixed(2)} GB left)`); } catch (e) { console.warn(`[trailer] evict: ${e.message}`); } };
   setTimeout(evict, 60_000).unref?.();
   const t2 = setInterval(evict, 6 * 3600_000); t2.unref?.();
@@ -6560,7 +6580,35 @@ async function backfillReleaseDates({ reason = "cron", gapMs = 250 } = {}) {
   }
 }
 
-app.get("/api/trailer/:key.mp4", trailerRouteHandler({ cache: trailerCache, available: () => !!ytdlp.bin }));
+// Only keys that are the TMDB trailer of a cached title are served (no
+// arbitrary YouTube downloads); kid profiles additionally need one such
+// title rated within their allowed certs. Index rebuilt lazily when the TMDB
+// cache changed (at most every 30 s) and at least every 5 min.
+const trailerKeyIdx = { idx: new Map(), builtAt: 0, version: -1 };
+function trailerKeyIndex() {
+  const age = Date.now() - trailerKeyIdx.builtAt;
+  if (age > 5 * 60_000 || (trailerKeyIdx.version !== tmdbCacheVersion && age > 30_000)) {
+    const version = tmdbCacheVersion;
+    trailerKeyIdx.idx = buildTrailerKeyIndex(Object.keys(tmdbStore).map((k) => [k, tmdbCache[k]]), effCert);
+    trailerKeyIdx.builtAt = Date.now();
+    trailerKeyIdx.version = version;
+  }
+  return trailerKeyIdx.idx;
+}
+function kidCertsForProfile(profile) {
+  const by = profile?.kidsBirthYear;
+  if (!by) return null;
+  const age = new Date().getFullYear() - by;
+  if (!Number.isFinite(age)) return null;
+  const s = new Set();
+  for (const tier of KIDS_CERT_TIERS) if (age >= tier.minAge) tier.add.forEach((c) => s.add(c));
+  return s;
+}
+app.get("/api/trailer/:key.mp4", trailerRouteHandler({
+  cache: trailerCache,
+  available: () => !!ytdlp.bin,
+  allowKey: (key, req) => trailerKeyAllowed(trailerKeyIndex(), key, kidCertsForProfile(findProfile(req.profileId))),
+}));
 
 app.get("/api/admin/trailers", (req, res) => {
   if (!requireOwner(req, res)) return;

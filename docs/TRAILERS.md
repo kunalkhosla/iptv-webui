@@ -10,9 +10,11 @@ and serves it as an mp4.
 |---|---|
 | `:key` | YouTube video key, from a tile's `trailer_key` or `/api/poster` `trailer_key`. Must match `^[A-Za-z0-9_-]{6,20}$`, else `400 {"error":"bad_key"}` |
 | Auth | Normal session (cookie / Basic Auth, same as every other `/api` route). No signed URL. Unauthenticated: `401`. |
-| Cached | `200` (or `206` for a `Range` request) immediately. `Content-Type: video/mp4`, `Accept-Ranges: bytes`, `Content-Length`, `ETag`, `Cache-Control: private, max-age=86400`. `HEAD` works. |
+| Allowed keys | Only keys that are the `trailer_key` of a title in the TMDB cache. On a kid profile, at least one title with that trailer must be rated within the profile's allowed ratings. Any other key: `404 trailer_unavailable` at once, nothing downloaded. |
+| Cached | `200` (or `206` for a `Range` request) immediately. `Content-Type: video/mp4`, `Accept-Ranges: bytes`, `Content-Length`, `ETag` (stable: `"<key>-<size>"`, so `If-Range` / `If-None-Match` work), `Cache-Control: private, max-age=86400`. |
+| `HEAD` | Answers from the cache only: `200` with headers if cached, else `404`. Never starts a download. |
 | Not cached | The response waits while the server downloads the trailer (typically 10-15 s, at most ~45 s), then it is served as above. Concurrent requests for the same key share the one download. |
-| Unavailable | `404 {"error":"trailer_unavailable"}` (`Cache-Control: no-store`). Video removed, region-blocked, yt-dlp broken, timeout. The failure is remembered for 6 h, during which the same key answers `404` immediately. |
+| Unavailable | `404 {"error":"trailer_unavailable"}` (`Cache-Control: no-store`). Video removed, region-blocked, yt-dlp broken, timeout. The failure is remembered for 6 h (15 min for a timeout), during which the same key answers `404` immediately. All remembered failures are forgotten when yt-dlp is updated. |
 
 File format: mp4 with H.264 video up to 720p and AAC audio, `moov` atom at
 the start (playback can begin before the whole file arrives). Typical size
@@ -25,7 +27,7 @@ fallback is the best single mp4 up to 720p (often 360p).
   / OkHttp default to 8-10 s). Show a spinner; treat `404` as "no trailer"
   (hide or fall back to YouTube).
 - Seeking uses normal HTTP Range requests.
-- Do not retry a `404` in a loop: the server will answer `404` for 6 h.
+- Do not retry a `404` in a loop: the server keeps answering `404` until the failure memory expires.
 
 ## 2. TMDB cache fields
 
@@ -93,9 +95,13 @@ opens the title's detail page as usual.
   `TRAILER_CACHE_MAX_GB` (default 8).
 - yt-dlp: pinned in the Dockerfile (standalone musl build, sha256-checked),
   YouTube JS challenges solved with the image's node (`--js-runtimes node`).
-  The server keeps `data/bin/yt-dlp` updated with `yt-dlp -U` (weekly, and
-  after 3 failed downloads in a row, at most every 12 h) and uses the newer
-  of the two binaries.
+  The server keeps `data/bin/yt-dlp` updated with `yt-dlp -U` (weekly,
+  tracked by the stamp file `data/bin/.yt-dlp-updated` so redeploys don't
+  postpone it; and after 3 failed downloads in a row, at most every 12 h) and
+  uses the newer of the two binaries. yt-dlp runs with a minimal environment
+  (PATH, HOME, LANG, XDG_CACHE_HOME), never the server's secrets.
+- A download that never finishes gives its slot back 15 s after the 45 s
+  timeout.
 - Trailers talk to YouTube only. They never open an IPTV panel connection
   and do not count toward the panel's 1-stream limit.
 - Owner diagnostics: `GET /api/admin/trailers`.

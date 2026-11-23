@@ -132,8 +132,11 @@ full client contract: [docs/TRAILERS.md](docs/TRAILERS.md).
 
 - `GET /api/trailer/<youtubeKey>.mp4` (normal session auth): served from
   `data/trailers/` with HTTP Range; on a miss the server downloads it first
-  with yt-dlp (720p H.264/AAC mp4, ~10 MB, ~10-15 s), then serves it. Failure:
-  `404 {"error":"trailer_unavailable"}`, remembered for 6 h.
+  with yt-dlp (720p H.264/AAC mp4, ~10 MB, ~10-15 s), then serves it. Only
+  keys that are a cached title's TMDB `trailer_key` are accepted (kid profiles:
+  a title within their ratings); `HEAD` never downloads. Failure:
+  `404 {"error":"trailer_unavailable"}`, remembered for 6 h (timeouts 15 min,
+  cleared when yt-dlp updates).
 - Cache: max 2 downloads at once (viewer requests before background ones),
   same-key requests share one download, files unused for 30 days are
   deleted, total capped at `TRAILER_CACHE_MAX_GB` (default 8).
@@ -143,7 +146,8 @@ full client contract: [docs/TRAILERS.md](docs/TRAILERS.md).
   The top of the rail is downloaded in the background, one at a time, only
   while nobody is watching.
 - yt-dlp is pinned in the Dockerfile (`YTDLP_VERSION` + sha256). The server
-  keeps a self-updated copy in `data/bin/yt-dlp` (`yt-dlp -U` weekly and after
+  keeps a self-updated copy in `data/bin/yt-dlp` (`yt-dlp -U` weekly, by a stamp
+  file on the data volume, and after
   3 failures in a row, at most every 12 h) and uses whichever is newer.
   `YTDLP_BIN` overrides the image path.
 - This talks to YouTube only; it never opens an IPTV panel connection.
