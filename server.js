@@ -2024,7 +2024,7 @@ async function prewarmTmdbCache(mode, actx = currentAccount()) {
 // ──────────────────────────────────────────────────────────────────
 const zlib = require("zlib");
 const { promisify } = require("util");
-const { calibrateEpgOffsets, cleanEpgIndexOverlaps } = require("./lib/epg-clean");
+const { calibrateEpgOffsets, cleanEpgIndexOverlaps, shiftsToPersist, epgIdCountry } = require("./lib/epg-clean");
 const epgIndex = new Map(); // epg_channel_id → sorted [{ start, stop, title, desc }]
 let epgIndexBuiltAt = 0;
 const epgIndexFile = path.join(DATA_DIR, "epg-xmltv.json");
@@ -2174,7 +2174,6 @@ function epgPrefixCountry(name) {
   const m = /^\|?\s*([A-Za-z]{2,3})\s*(?:\||:)+\s*/.exec(String(name || ""));
   return m ? (EPG_COUNTRY_OF_PREFIX[m[1].toUpperCase()] || m[1].toLowerCase()) : null;
 }
-const epgIdCountry = (id) => { const m = /\.([a-z]{2,3})(?:@[^.]*)?$/i.exec(String(id)); return m ? m[1].toLowerCase() : null; };
 const epgIdKey = (id) => String(id).toLowerCase().replace(/[^a-z0-9]+/g, "");
 
 // Point live streams at an external channel that has programme data.
@@ -2329,10 +2328,19 @@ async function prewarmEpgInner(actx) {
   let calibration = null;
   if (owner) {
     try {
-      const r = calibrateEpgOffsets({ byChannel: next, names: meta, sourceOf, isReference: (l) => /^epg_ripper_/.test(l), nameKey: epgNameKey });
+      // Only the panel's own feed is shifted; epgshare feeds are the reference.
+      const r = calibrateEpgOffsets({
+        byChannel: next, names: meta, sourceOf, nameKey: epgNameKey,
+        isReference: (l) => /^epg_ripper_/.test(l), isCandidate: (l) => l === "provider",
+        previous: shiftsToPersist(epgStatus.calibration?.groups),
+      });
       calibration = { shiftedChannels: r.applied.size, groups: r.groups };
-      for (const [gk, g] of Object.entries(r.groups)) if (g.shiftMin) console.log(`[epg] ${gk}: shifting ${g.channels} channel(s) by ${g.shiftMin} min (${JSON.stringify(g.votes)} of ${g.calibrated} calibrated)`);
-    } catch (e) { calibration = { error: e.message }; console.warn(`[epg] offset calibration failed: ${e.message}`); }
+      for (const [gk, g] of Object.entries(r.groups)) if (g.shiftMin) console.log(`[epg] ${gk}: shifting ${g.channels} channel(s) by ${g.shiftMin} min (${g.reused ? "reused from last build" : `${JSON.stringify(g.votes)} of ${g.calibrated} calibrated`})`);
+    } catch (e) {
+      // Keep the last known shifts so the next build can still reuse them.
+      calibration = { error: e.message, groups: epgStatus.calibration?.groups || {} };
+      console.warn(`[epg] offset calibration failed: ${e.message}`);
+    }
   }
   const overlaps = cleanEpgIndexOverlaps(next);
   if (overlaps.channels) console.log(`[epg] dropped ${overlaps.programmesDropped} overlapping programme(s) on ${overlaps.channels} channel(s) (e.g. ${overlaps.examples.slice(0, 5).join(", ")})`);
@@ -2346,12 +2354,12 @@ async function prewarmEpgInner(actx) {
   const failedSources = Object.values(sources).filter((v) => v.error).length;
   if (total > 0 && failedSources > 0 && oldTotal > 0 && total < oldTotal * 0.5) {
     console.warn(`[epg] ${failedSources} source(s) failed and the result (${total}) is under half the current guide (${oldTotal}) — keeping the current guide`);
-    if (owner) epgStatus = { ...epgStatus, sources, lastAttempt: Date.now(), lastError: `${failedSources} source(s) failed` };
+    if (owner) { epgStatus = { ...epgStatus, sources, lastAttempt: Date.now(), lastError: `${failedSources} source(s) failed`, calibration: epgStatus.calibration ?? null }; saveEpgIndexToDisk(actx); }
     return false;
   }
   if (total === 0) {
     console.warn(`[epg] refresh produced 0 programmes — keeping the existing guide (${oldCount} channels)`);
-    if (owner) epgStatus = { ...epgStatus, sources, lastAttempt: Date.now(), lastError: "0 programmes" };
+    if (owner) { epgStatus = { ...epgStatus, sources, lastAttempt: Date.now(), lastError: "0 programmes", calibration: epgStatus.calibration ?? null }; saveEpgIndexToDisk(actx); }
     return false;
   }
   if (owner) {
@@ -13812,8 +13820,10 @@ app.listen(PORT, async () => {
   loadEpgIndexFromDisk().then(() => {
     try { applyEpgMatching(actx); } catch (e) { console.warn(`[epg] boot match: ${e.message}`); }
     // Also rebuild a guide saved before time-zone calibration existed
-    // (status.calibration missing), so the fix doesn't wait up to 6h.
-    if (Date.now() - epgIndexBuiltAt > EPG_XMLTV_STALE_MS || !epgStatus.calibration) {
+    // (calibration === undefined), so the fix doesn't wait up to 6h. Any
+    // attempt, even a failed one, persists a calibration value (null when it
+    // never got that far), so a failing build can't re-trigger on every boot.
+    if (Date.now() - epgIndexBuiltAt > EPG_XMLTV_STALE_MS || epgStatus.calibration === undefined) {
       prewarmEpg(actx).catch(e => console.warn(`[epg] boot prewarm: ${e.message}`));
     }
     scheduleEpgNightlyRefresh();

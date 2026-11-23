@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { cleanEpgOverlaps, cleanEpgIndexOverlaps, calibrateEpgOffsets, alignOffset } = require("../lib/epg-clean");
+const { cleanEpgOverlaps, cleanEpgIndexOverlaps, calibrateEpgOffsets, shiftsToPersist, alignOffset, epgIdCountry } = require("../lib/epg-clean");
 
 const H = 3600e3, M = 60e3;
 const T0 = Date.UTC(2026, 10, 23, 17, 0);
@@ -42,14 +42,57 @@ test("a clean channel is returned untouched (same array)", () => {
   assert.equal(cleanEpgOverlaps(arr).progs, arr);
 });
 
-test("index cleanup deletes channels left empty and reports stats", () => {
-  const m = new Map([["ok", [P(0, 30, "A")]], ["bad", [P(0, 60, "X"), P(0, 60, "Y")]], ["mixed", [P(0, 60, "X"), P(0, 60, "Y"), P(2, 60, "Z")]]]);
-  const st = cleanEpgIndexOverlaps(m);
-  assert.deepEqual([...m.keys()].sort(), ["mixed", "ok"]);
-  assert.deepEqual(m.get("mixed").map((p) => p.title), ["Z"]);
-  assert.equal(st.channels, 2);
-  assert.equal(st.emptied, 1);
-  assert.equal(st.programmesDropped, 4);
+test("index cleanup: gutted channels are deleted, lightly-affected ones trimmed", () => {
+  const clean10 = Array.from({ length: 10 }, (_, i) => P(i, 60, `S${i}`));
+  const m = new Map([
+    ["ok", [P(0, 30, "A")]],
+    ["bad", [P(0, 60, "X"), P(0, 60, "Y")]],
+    // 2 of 3 dropped (>25%) -> whole channel removed so streams can fall back
+    ["mostlyBad", [P(0, 60, "X"), P(0, 60, "Y"), P(2, 60, "Z")]],
+    // 2 of 12 dropped (<25%) and still has upcoming programmes -> trimmed
+    ["light", [...clean10, P(20, 60, "X"), P(20, 60, "Y")]],
+    // 2 of 12 dropped but nothing left in now..+6h -> removed
+    ["noUpcoming", [P(0, 60, "X"), P(0, 60, "Y"), ...clean10.map((p) => ({ ...p, start: p.start + 10 * H, stop: p.stop + 10 * H }))]],
+  ]);
+  const st = cleanEpgIndexOverlaps(m, T0);
+  assert.deepEqual([...m.keys()].sort(), ["light", "ok"]);
+  assert.equal(m.get("light").length, 10);
+  assert.equal(st.channels, 4);
+  assert.equal(st.emptied, 3);
+  assert.deepEqual(st.removed.sort(), ["bad", "mostlyBad", "noUpcoming"]);
+});
+
+test("index cleanup is idempotent", () => {
+  const m = new Map([["light", [...Array.from({ length: 10 }, (_, i) => P(i, 60, `S${i}`)), P(20, 60, "X"), P(20, 60, "Y"), P(1, 60, "S1")]], ["bad", [P(0, 60, "X"), P(0, 60, "Y")]]]);
+  cleanEpgIndexOverlaps(m, T0);
+  const snap = JSON.stringify([...m]);
+  const st = cleanEpgIndexOverlaps(m, T0);
+  assert.equal(JSON.stringify([...m]), snap);
+  assert.equal(st.channels + st.emptied, 0);
+});
+
+test("fallback after partial cleanup: gutted provider id disappears, the clean reference stays", () => {
+  const m = new Map([
+    ["colorsinfinityhd.in", [P(0, 60, "Shark Tank"), P(0, 60, "MasterChef Australia"), P(1, 60, "Game of Thrones"), P(1, 60, "Accused"), P(2, 60, "Veep")]],
+    ["Colors.Infinity.SD.in", [P(0, 60, "Chesapeake Shores"), P(1, 60, "Billions")]],
+  ]);
+  cleanEpgIndexOverlaps(m, T0);
+  assert.deepEqual([...m.keys()], ["Colors.Infinity.SD.in"]);
+});
+
+test("same-slot flag dedupe is tight: unrelated containing titles are not merged", () => {
+  const r = cleanEpgOverlaps([P(0, 30, "News"), P(0, 30, "Business News Tonight")]);
+  assert.equal(r.progs.length, 0); // a real conflict, not a flag variant
+  assert.equal(r.dropped, 2);
+  assert.equal(cleanEpgOverlaps([P(0, 30, "BBC News at Six"), P(0, 30, "BBC News at Six LIVE")]).progs.length, 1);
+});
+
+test("epgIdCountry handles numbered and @variant ids", () => {
+  assert.equal(epgIdCountry("Sony.Max.Hd.in2"), "in");
+  assert.equal(epgIdCountry("ATN.Colors.ca2"), "ca");
+  assert.equal(epgIdCountry("bbcone.uk@HD"), "uk");
+  assert.equal(epgIdCountry("colorshd.in"), "in");
+  assert.equal(epgIdCountry("577081"), null);
 });
 
 const day = (shiftH, names) => names.map((t, i) => P(i * 0.5 + shiftH, 30, t));
@@ -69,7 +112,7 @@ function scenario({ provShiftH, n, extra = {} }) {
     byChannel.set(`Chan${i}.in`, day(0, shows)); names.set(`Chan${i}.in`, [`Chan ${i}`]); sourceOf.set(`Chan${i}.in`, "epg_ripper_IN1");
   }
   for (const [id, v] of Object.entries(extra)) { byChannel.set(id, v.progs); names.set(id, v.names); sourceOf.set(id, v.source); }
-  return { byChannel, names, sourceOf, isReference: (l) => /^epg_ripper_/.test(l), nameKey: (s) => String(s).replace(/^IN:\s*/, "").replace(/\bHD\b/, "").toLowerCase().replace(/[^a-z0-9]/g, "") };
+  return { byChannel, names, sourceOf, isReference: (l) => /^epg_ripper_/.test(l), isCandidate: (l) => l === "provider", nameKey: (s) => String(s).replace(/^IN:\s*/, "").replace(/\bHD\b/, "").toLowerCase().replace(/[^a-z0-9]/g, "") };
 }
 
 test("group consensus shifts the whole source+country group, incl. uncalibrated channels", () => {
@@ -114,4 +157,47 @@ test("a lone non-zero single-channel measurement is not applied", () => {
   } });
   const r = calibrateEpgOffsets(sc);
   assert.equal(r.applied.size, 0);
+});
+
+test("reference outage: no evidence leaves data unchanged, or reuses the persisted shift", () => {
+  const sc = scenario({ provShiftH: 5.5, n: 6 });
+  for (const id of [...sc.sourceOf.keys()]) if (sc.sourceOf.get(id) !== "provider") { sc.byChannel.delete(id); sc.sourceOf.delete(id); }
+  const before = JSON.stringify([...sc.byChannel]);
+  assert.equal(calibrateEpgOffsets(sc).applied.size, 0);
+  assert.equal(JSON.stringify([...sc.byChannel]), before);
+  const r = calibrateEpgOffsets({ ...sc, previous: { "provider/in": -330 } });
+  assert.equal(r.applied.size, 6);
+  assert.equal(r.groups["provider/in"].reused, true);
+  assert.deepEqual(shiftsToPersist(r.groups), { "provider/in": -330 });
+});
+
+test("persisted shift survives a build where the group is absent, and is cleared by a consensus of 0", () => {
+  const empty = { byChannel: new Map(), names: new Map(), sourceOf: new Map(), isReference: () => false, isCandidate: () => true, nameKey: (s) => s };
+  const r = calibrateEpgOffsets({ ...empty, previous: { "provider/in": -330 } });
+  assert.deepEqual(shiftsToPersist(r.groups), { "provider/in": -330 });
+  const fixed = scenario({ provShiftH: 0, n: 6 }); // provider fixed its feed
+  const r2 = calibrateEpgOffsets({ ...fixed, previous: { "provider/in": -330 } });
+  assert.equal(r2.applied.size, 0);
+  assert.deepEqual(shiftsToPersist(r2.groups), {});
+});
+
+test("conflicting references for a channel give it no vote", () => {
+  const shows = SHOWS.map((s) => `${s} x`);
+  const sc = scenario({ provShiftH: 0, n: 0, extra: {
+    "x.in": { progs: day(0, shows), names: ["IN: X"], source: "provider" },
+    "X.in": { progs: day(0, shows), names: ["X"], source: "epg_ripper_IN1" },
+    "X.uk": { progs: day(2, shows), names: ["X"], source: "epg_ripper_UK1" },
+  } });
+  const r = calibrateEpgOffsets(sc);
+  assert.equal(r.groups["provider/in"], undefined);
+});
+
+test("only candidate sources are calibrated (epg.pw-style feeds left alone)", () => {
+  const sc = scenario({ provShiftH: 0, n: 0 });
+  for (let i = 0; i < 6; i++) {
+    const shows = SHOWS.map((s) => `${s} pw${i}`);
+    sc.byChannel.set(`5770${i}`, day(8, shows)); sc.names.set(`5770${i}`, [`Pw ${i}`]); sc.sourceOf.set(`5770${i}`, "epg_IN");
+    sc.byChannel.set(`Pw${i}.in`, day(0, shows)); sc.names.set(`Pw${i}.in`, [`Pw ${i}`]); sc.sourceOf.set(`Pw${i}.in`, "epg_ripper_IN1");
+  }
+  assert.equal(calibrateEpgOffsets(sc).applied.size, 0);
 });
