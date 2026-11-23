@@ -12420,6 +12420,7 @@ const transcoders = new Map();
 const hwDecodeFailed = new Set();
 // When a VOD run using VAAPI dies with no output, retry it once in software.
 const { vodSoftwareFallbackEligible, transcodeSourceUnavailable } = require("./lib/transcode-fallback");
+const { parseStopRequest, ownStreamTarget, selectTranscodersToStop } = require("./lib/transcode-stop");
 
 // Circuit breaker: transcoderKey -> timestamp of the last give-up where the
 // source never connected (invalid/broken upstream). A fresh request for that
@@ -13132,6 +13133,10 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     proc: ffmpeg, lastAccess: Date.now(), dir, sourceUrl, mode, id, quality,
     audio, preset, offsetSecs, diskSel, restarts: [], stopping: false, respawning: false,
     discontinuities: new Set(),
+    // Panel account this ffmpeg pulls from (the request's account, same one
+    // streamUrl() used above). /api/transcode/stop only lets a caller stop
+    // transcoders of their own account.
+    accountKey: accountKeyOf(currentAccount()),
   };
   entry.proc = ffmpeg;
   entry.sourceUrl = sourceUrl;
@@ -13399,28 +13404,22 @@ setInterval(() => {
   }
 }, 10_000);
 
-// Kills the transcoder for a specific (mode, id), or all transcoders
-// when neither is given. Called by the client immediately before
-// switching streams so that the previous ffmpeg process — which would
-// otherwise hold an upstream panel connection until the idle grace
-// elapses — does not collide with the new stream against the panel's
-// max_connections=1 limit.
+// Stops transcoders on the client's request, scoped to the caller:
+//  - { mode, id }: every quality/offset variant of that title, but only
+//    transcoders pulling from the caller's own panel account. Called by the
+//    client right before switching streams so the previous ffmpeg (which would
+//    otherwise hold the upstream slot until the idle grace elapses) doesn't
+//    collide with the new stream against the panel's max_connections=1.
+//  - no args: only the caller's own current stream (the admission map's entry
+//    for this owner) — used on closePlayer / beforeunload / deep-link resume.
+// Never stops other viewers' or other accounts' transcoders.
 app.post("/api/transcode/stop", express.json(), (req, res) => {
-  const { mode, id } = req.body || {};
-  let killed = 0;
-  if (mode && id) {
-    // Prefix-match so a quality switch (which spawns a new transcoder
-    // under a different key) and the kill-prev call from the client
-    // both clean up *any* transcoder for this id, not just one
-    // quality variant.
-    const prefix = `${mode}-${id}-`;
-    for (const [k, t] of transcoders) {
-      if (k.startsWith(prefix)) { stopTranscoder(t, "client-stop"); killed++; }
-    }
-  } else {
-    for (const t of transcoders.values()) { stopTranscoder(t, "client-stop-all"); killed++; }
-  }
-  res.json({ ok: true, killed });
+  const parsed = parseStopRequest(req.body);
+  if (!parsed.ok) return res.status(400).json({ ok: false, error: parsed.error });
+  const target = parsed.target || ownStreamTarget(streams.get(ownerKeyOf(req)));
+  const victims = selectTranscodersToStop(transcoders, target, accountKeyOf(currentAccount()));
+  for (const t of victims) stopTranscoder(t, parsed.target ? "client-stop" : "client-stop-own");
+  res.json({ ok: true, killed: victims.length });
 });
 
 app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) => {
