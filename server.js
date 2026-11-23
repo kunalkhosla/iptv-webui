@@ -6263,7 +6263,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       // upscale. Earlier w185 forced the TV's Coil to decode bitmaps
       // ~40% larger than the tile needs, which the GC measurements
       // pinned as the main jank source on Chromecast silicon.
-      poster: t?.poster_path ? `https://image.tmdb.org/t/p/w154${t.poster_path}` : null,
+      poster: t?.poster_path ? `https://image.tmdb.org/t/p/w342${t.poster_path}` : null,
       us_cert: cert,
       // Pre-computed group/genre/4K tags. Lets the chip strip on
       // Movies / Series filter rails client-side without re-running
@@ -7557,7 +7557,7 @@ app.get("/api/collection/:lang/:mode(movie|series)", (req, res) => {
       name: s.name,
       icon: s.icon || null,
       year: s.year || null,
-      poster: t?.poster_path ? `https://image.tmdb.org/t/p/w154${t.poster_path}` : null,
+      poster: t?.poster_path ? `https://image.tmdb.org/t/p/w342${t.poster_path}` : null,
       us_cert: effCert(t) || null,
       tags: s.tags || ["other"],
       container: s.container || null,
@@ -8299,7 +8299,7 @@ app.get("/api/search/all", async (req, res, next) => {
         id: s.id,
         name: s.name,
         icon: s.icon || null,
-        poster: t?.poster_path ? `${TMDB_IMG_BASE}/w154${t.poster_path}` : null,
+        poster: t?.poster_path ? `${TMDB_IMG_BASE}/w342${t.poster_path}` : null,
         year: s.year || null,
         rating: s.rating || null,
         us_cert: s.us_cert || null,
@@ -8689,7 +8689,7 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
       id: s.id,
       name: s.name,
       icon: s.icon || null,
-      poster: t?.poster_path ? `${TMDB_IMG_BASE}/w154${t.poster_path}` : null,
+      poster: t?.poster_path ? `${TMDB_IMG_BASE}/w342${t.poster_path}` : null,
       category_id: s.category_id,
       category_name: catName.get(String(s.category_id)) || null,
       isSeriesGroup: s.isSeriesGroup || undefined,
@@ -8823,7 +8823,7 @@ app.get("/api/:mode(live|movie|series|disk)/streams", async (req, res, next) => 
       if (mode === "live") return s;
       const t = tmdbCache[`${mode}:${s.id}`];
       if (!t?.poster_path) return s;
-      return { ...s, icon: `${TMDB_IMG_BASE}/w154${t.poster_path}` };
+      return { ...s, icon: `${TMDB_IMG_BASE}/w342${t.poster_path}` };
     };
     // Optional offset/limit — opt-in only. Without `limit` the response
     // stays a bare array (unchanged), which the Android app's
@@ -11232,7 +11232,7 @@ app.get("/api/person/credits", async (req, res) => {
           id: s.id,
           name: s.name,
           icon: s.icon || null,
-          poster: t?.poster_path ? `${TMDB_IMG_BASE}/w154${t.poster_path}` : null,
+          poster: t?.poster_path ? `${TMDB_IMG_BASE}/w342${t.poster_path}` : null,
           year: s.year || (t?.year || null),
           us_cert: s.us_cert || null,
           rating: s.rating || (t?.rating || null),
@@ -11310,7 +11310,7 @@ app.get("/api/similar/:mode/:id", (req, res) => {
       id: s.id,
       name: s.name,
       icon: s.icon || null,
-      poster: t?.poster_path ? `${TMDB_IMG_BASE}/w154${t.poster_path}` : null,
+      poster: t?.poster_path ? `${TMDB_IMG_BASE}/w342${t.poster_path}` : null,
       year: s.year || (t?.year || null),
       rating: s.rating || (t?.rating || null),
       us_cert: s.us_cert || null,
@@ -11682,7 +11682,7 @@ app.get("/api/refine/candidates/:mode(movie|series)", (req, res) => {
       name: s.name,
       icon: s.icon || null,
       year: s.year || null,
-      poster: t?.poster_path ? `https://image.tmdb.org/t/p/w154${t.poster_path}` : null,
+      poster: t?.poster_path ? `https://image.tmdb.org/t/p/w342${t.poster_path}` : null,
       us_cert: effCert(t) || null,
       tags: s.tags || ["other"],
       container: s.container || null,
