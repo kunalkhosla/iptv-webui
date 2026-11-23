@@ -26,3 +26,28 @@ test("withDeadline resolves null on timeout and swallows rejection", async () =>
   assert.equal(await withDeadline(Promise.reject(new Error("x")), 50), null);
   assert.deepEqual(await withDeadline(Promise.resolve({ a: 1 }), 50), { a: 1 });
 });
+
+const { decideLiveHealth, manifestHasContent, LIVE_UNAVAILABLE } = require("../lib/live-audio-verdict");
+const H = 3600e3, M = 60e3, NOW = 1e12;
+
+test("health: no entry proceeds", () => {
+  assert.equal(decideLiveHealth({ entry: undefined, now: NOW }).action, "proceed");
+});
+test("health: recent dead -> unavailable; older dead -> check; viewer active skips check", () => {
+  assert.equal(decideLiveHealth({ entry: { dead: true, ts: NOW - 9 * M }, now: NOW }).action, "unavailable");
+  assert.equal(decideLiveHealth({ entry: { dead: true, ts: NOW - 11 * M }, now: NOW }).action, "check");
+  assert.equal(decideLiveHealth({ entry: { dead: true, ts: NOW - 11 * M }, now: NOW, viewerActive: true }).action, "proceed");
+  assert.equal(decideLiveHealth({ entry: { dead: true, ts: NOW - 9 * M }, now: NOW, viewerActive: true }).action, "unavailable");
+});
+test("health: alive stale >24h -> check, fresh proceeds, live_ts counts", () => {
+  assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 25 * H }, now: NOW }).action, "check");
+  assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 25 * H }, now: NOW, viewerActive: true }).action, "proceed");
+  assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 23 * H }, now: NOW }).action, "proceed");
+  assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 25 * H, live_ts: NOW - H }, now: NOW }).action, "proceed");
+});
+test("manifest content detection and 503 contract", () => {
+  assert.equal(manifestHasContent("#EXTM3U\n#EXT-X-VERSION:3\n"), false);
+  assert.equal(manifestHasContent("#EXTM3U\n#EXTINF:4.0,\nseg.ts\n"), true);
+  assert.equal(manifestHasContent("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n"), true);
+  assert.equal(LIVE_UNAVAILABLE.error, "channel_unavailable");
+});

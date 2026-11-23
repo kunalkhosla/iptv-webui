@@ -22,3 +22,10 @@ test("panel reconnect retries are bounded", () => {
   assert.equal(a[a.indexOf("-reconnect_delay_total_max") + 1], "10");
   assert.equal(a[a.indexOf("-reconnect_max_retries") + 1], "2");
 });
+
+test("live tolerant args raise max_error_rate", () => {
+  const { liveTolerantArgs } = require("../lib/live-hls");
+  const a = liveTolerantArgs();
+  assert.equal(a[a.indexOf("-max_error_rate") + 1], "1");
+  assert.ok(!a.includes("-xerror"));
+});

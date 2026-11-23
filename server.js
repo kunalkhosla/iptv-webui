@@ -7,6 +7,9 @@ const { spawn, spawnSync, execFile } = require("child_process");
 const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 const { AsyncLocalStorage } = require("async_hooks");
+const { redactUrl, redactAllUrls, installConsoleRedaction } = require("./lib/redact");
+// Provider URLs embed credentials; scrub every console line (Axiom ships stdout).
+installConsoleRedaction();
 
 // Request-scoped account context. The auth middleware wraps `next()` in
 // `accountStore.run(req.account, …)` so any panel-touching helper down
@@ -841,9 +844,9 @@ const audioProbeInflight = new Map();
 // Manifest liveness check — short GET with redirect follow. Catches
 // the panel-side 403 / 404 / "empty body" failure modes BEFORE we
 // pay 1s of ffprobe runtime on a dead channel.
-async function _probeManifestOnce(direct) {
+async function _probeManifestOnce(direct, timeoutMs = 3500) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3500);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const r = await fetch(direct, {
       method: "GET",
@@ -856,6 +859,9 @@ async function _probeManifestOnce(direct) {
     if (!text || text.length < 20 || !text.includes("#EXTM3U")) {
       return { alive: false, reason: "empty-manifest" };
     }
+    // A header-only playlist (no segments, no variants) is what the provider
+    // serves for a broken channel; players spin on it forever.
+    if (!manifestHasContent(text)) return { alive: false, reason: "empty-playlist" };
     return { alive: true };
   } catch (e) {
     return { alive: false, reason: e?.name === "AbortError" ? "timeout" : "fetch-error" };
@@ -878,6 +884,39 @@ async function probeManifestLiveness(direct) {
     lastReason = v.reason;
   }
   return { alive: false, reason: lastReason };
+}
+// Liveness-only refresh of a cached verdict: ONE manifest GET (2.5 s), coalesced
+// per channel. Returns the verdict to route on (a dead entry, an alive entry with
+// live_ts bumped, or undefined when a previously-dead channel recovered and the
+// codec must be re-probed).
+const LIVE_CHECK_TIMEOUT_MS = 2500;
+const liveCheckInflight = new Map();
+function refreshLiveLiveness(key, direct, entry) {
+  if (liveCheckInflight.has(key)) return liveCheckInflight.get(key);
+  const p = (async () => {
+    const v = await _probeManifestOnce(direct, LIVE_CHECK_TIMEOUT_MS);
+    const now = Date.now();
+    if (!v.alive) {
+      const dead = { ...(entry || {}), audio_codec: entry?.audio_codec ?? null, browser_safe: !!entry?.browser_safe,
+        dead: true, dead_reason: v.reason, ts: now, live_ts: now };
+      audioCodecCache[key] = dead;
+      scheduleAudioCodecCacheSave();
+      return dead;
+    }
+    if (entry && entry.dead) {
+      // Recovered: the codec is unknown, drop the entry so the normal path re-probes.
+      delete audioCodecCache[key];
+      scheduleAudioCodecCacheSave();
+      return undefined;
+    }
+    if (entry) {
+      entry.live_ts = now;
+      scheduleAudioCodecCacheSave();
+    }
+    return entry;
+  })().finally(() => liveCheckInflight.delete(key));
+  liveCheckInflight.set(key, p);
+  return p;
 }
 function probeChannelAudioCodec(mode, id, actx = currentAccount()) {
   const key = `${mode}:${id}`;
@@ -2090,12 +2129,12 @@ async function prewarmEpgInner(actx) {
     mergeIn("provider", parsed);
   } catch (e) {
     console.warn(`[epg] provider xmltv failed: ${e.message}`);
-    sources.provider = { error: e.message };
+    sources.provider = { error: redactAllUrls(e.message) };
   }
   // 2) community XMLTV feeds (owner guide only; no provider connection)
   if (owner) {
     for (const url of EPG_SOURCES) {
-      if (!/^https:\/\//i.test(url)) { console.warn(`[epg] ignoring non-https source ${url}`); continue; }
+      if (!/^https:\/\//i.test(url)) { console.warn(`[epg] ignoring non-https source ${redactUrl(url)}`); continue; }
       const label = url.split("/").pop().replace(/\.xml(\.gz)?$/, "");
       try {
         const text = await fetchXmltvText(url, 90_000);
@@ -2105,7 +2144,7 @@ async function prewarmEpgInner(actx) {
         await new Promise((r) => setImmediate(r)); // let the loop breathe between big parses
       } catch (e) {
         console.warn(`[epg] ${label} failed: ${e.message}`);
-        sources[label] = { error: e.message };
+        sources[label] = { error: redactAllUrls(e.message) };
       }
     }
   }
@@ -2461,10 +2500,10 @@ const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
 const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue");
 const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
 const { isLowQuality, lowQualityLast } = require("./lib/low-quality");
-const { decideLiveAudio, withDeadline } = require("./lib/live-audio-verdict");
+const { decideLiveAudio, withDeadline, decideLiveHealth, manifestHasContent, LIVE_UNAVAILABLE } = require("./lib/live-audio-verdict");
 const LIVE_AUDIO_PROBE_WAIT_MS = (() => { const n = parseInt(process.env.LIVE_AUDIO_PROBE_WAIT_MS ?? "", 10); return Number.isFinite(n) && n >= 0 ? n : 3500; })();
 const { segmentQuery } = require("./lib/segment-query");
-const { liveHlsListSize, panelReconnectArgs } = require("./lib/live-hls");
+const { liveHlsListSize, panelReconnectArgs, liveTolerantArgs } = require("./lib/live-hls");
 const { createDownloadQueue } = require("./lib/download-queue");
 const { streamingRecently: streamingRecentlyIn } = require("./lib/recent-stream");
 const certBackfill = { running: false, done: 0, total: 0 };
@@ -4019,7 +4058,7 @@ async function runDiskDownloadJob(job) {
   const { sourceUrl, ext, error: probeErr } = await resolveDownloadSourceUrl(job.mode, job.id, ownerAccount);
   if (!sourceUrl) {
     job.status = "failed";
-    job.error = `source unavailable: ${probeErr}`;
+    job.error = `source unavailable: ${redactAllUrls(probeErr)}`;
     saveDiskDownloadJobs();
     return;
   }
@@ -4163,7 +4202,7 @@ async function runDiskDownloadJob(job) {
         continue;
       }
       job.retries += 1;
-      job.error = e.message;
+      job.error = redactAllUrls(e.message);
       streams.delete(owner);
       if (job.retries > DISK_DOWNLOAD_MAX_ERROR_RETRIES) {
         job.status = "failed";
@@ -4633,7 +4672,7 @@ async function resolveDownloadSourceUrl(mode, id, actx = currentAccount()) {
       }
       lastProbeErr = `${ext}: ct=${ct} bytes=${buf.length}`;
     } catch (e) {
-      lastProbeErr = `${ext}: ${e.message}`;
+      lastProbeErr = `${ext}: ${redactAllUrls(e.message)}`;
     }
   }
   return { sourceUrl: null, ext: null, error: lastProbeErr };
@@ -4722,7 +4761,7 @@ function dlPump() {
   if (!job) return;
   dlRunning = true;
   runDownloadJob(job)
-    .catch((e) => { job.state = "failed"; job.error = e.message; console.warn(`[download] ${job.key} crashed: ${e.message}`); })
+    .catch((e) => { job.state = "failed"; job.error = redactAllUrls(e.message); console.warn(`[download] ${job.key} crashed: ${redactUrl(e.message)}`); })
     .finally(() => {
       const owner = `phone-download:${job.key}`;
       streams.delete(owner);
@@ -4750,7 +4789,7 @@ function pruneDownloadCache() {
 setInterval(pruneDownloadCache, 30 * 60 * 1000).unref?.();
 
 // Provider URLs carry credentials; never let them reach logs or job.error.
-const redactUrls = (m) => String(m ?? "").replace(/https?:\/\/[^\s'")]+/g, "<url>");
+const redactUrls = redactAllUrls;
 
 async function runDownloadJob(job) {
   const { mode, id, actx, key } = job;
@@ -4889,7 +4928,7 @@ async function runDownloadJob(job) {
   if (!okOut && useHw0 && !job.cancelled) { res = await encode(false); okOut = res.code === 0 && await outOk(); }
   if (okOut || res.code === 0) { try { fs.rmSync(srcPath, { force: true }); } catch {} }
   if (job.cancelled) return;
-  if (!okOut) { job.state = "failed"; job.error = `could not prepare the file (${(res.err || "ffmpeg failed or output was incomplete").slice(-200)})`; try { fs.rmSync(outPath, { force: true }); } catch {} return; }
+  if (!okOut) { job.state = "failed"; job.error = `could not prepare the file (${redactAllUrls((res.err || "ffmpeg failed or output was incomplete").slice(-200))})`; try { fs.rmSync(outPath, { force: true }); } catch {} return; }
   fs.renameSync(outPath, dlFile(key));
   job.state = "ready"; job.pct = 100;
   console.log(`[download] ${key} ready (${(fs.statSync(dlFile(key)).size / 1024 / 1024).toFixed(0)} MB, encode ${Math.round((Date.now() - encT0) / 1000)}s)`);
@@ -4969,7 +5008,7 @@ app.get("/api/download/:mode(movie|series)/:id.mp4", async (req, res) => {
   });
   ff.on("close", (code) => {
     if (code !== 0 && code !== null) {
-      console.warn(`[download] ${mode}/${id} ffmpeg exit ${code}\n${stderrBuf.slice(-1024)}`);
+      console.warn(`[download] ${mode}/${id} ffmpeg exit ${code}\n${redactUrl(stderrBuf.slice(-1024))}`);
     }
   });
 });
@@ -10495,7 +10534,7 @@ async function runAssistant(req, utterance) {
       try {
         out = await tools.execute(tu.name, tu.input);
       } catch (e) {
-        out = { error: e.message };
+        out = { error: redactAllUrls(e.message) };
       }
       results.push({ type: "tool_result", tool_use_id: tu.id, content: JSON.stringify(out) });
     }
@@ -11225,7 +11264,7 @@ app.get("/api/person/credits", async (req, res) => {
     personCache.set(cacheKey, { ts: Date.now(), payload });
     res.json(payload);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: redactAllUrls(e.message) });
   }
 });
 
@@ -11562,7 +11601,7 @@ app.post("/api/admin/reindex-account", express.json(), async (req, res) => {
     await buildAllIndexes(actx, { noYield: true });
     res.json({ ok: true, userId, host: actx.host });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: redactAllUrls(e.message) });
   }
 });
 
@@ -11575,7 +11614,7 @@ app.post("/api/admin/backfill-tmdb-v2", (req, res) => {
   backfillTmdbCacheV2({
     onProgress: (e) => res.write(JSON.stringify(e) + "\n"),
   }).then(() => res.end()).catch(e => {
-    res.write(JSON.stringify({ phase: "fatal", error: e.message }) + "\n");
+    res.write(JSON.stringify({ phase: "fatal", error: redactAllUrls(e.message) }) + "\n");
     res.end();
   });
 });
@@ -11591,7 +11630,7 @@ app.post("/api/admin/retry-tmdb-no-matches", (req, res) => {
   retryTmdbNoMatches({
     onProgress: (e) => res.write(JSON.stringify(e) + "\n"),
   }).then(() => res.end()).catch(e => {
-    res.write(JSON.stringify({ phase: "fatal", error: e.message }) + "\n");
+    res.write(JSON.stringify({ phase: "fatal", error: redactAllUrls(e.message) }) + "\n");
     res.end();
   });
 });
@@ -11622,7 +11661,7 @@ app.post("/api/admin/rebuild-taste-profiles", async (req, res) => {
     const r = await rebuildTasteProfiles({ reason: "admin" });
     res.status(r.ok ? 200 : 409).json(r);
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: redactAllUrls(e.message) });
   }
 });
 
@@ -11673,7 +11712,7 @@ app.post("/api/refine/rebuild", async (req, res) => {
     if (built) { tasteProfiles[pid] = built; saveTasteProfiles(); }
     res.json({ ok: true, built: !!built });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: redactAllUrls(e.message) });
   } finally {
     refineInFlight.delete(pid);
   }
@@ -11686,7 +11725,7 @@ app.post("/api/admin/rebuild-editorial-rails", async (req, res) => {
     const r = await rebuildEditorialRails({ reason: "admin" });
     res.status(r.ok ? 200 : 409).json(r);
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: redactAllUrls(e.message) });
   }
 });
 
@@ -11697,7 +11736,7 @@ app.post("/api/admin/rebuild-tonight", async (req, res) => {
     const r = await rebuildTonight({ reason: "admin" });
     res.status(r.ok ? 200 : 409).json(r);
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: redactAllUrls(e.message) });
   }
 });
 
@@ -11713,7 +11752,7 @@ app.post("/api/admin/revalidate-tmdb-years", (req, res) => {
   revalidateTmdbYears({
     onProgress: (e) => res.write(JSON.stringify(e) + "\n"),
   }).then(() => res.end()).catch(e => {
-    res.write(JSON.stringify({ phase: "fatal", error: e.message }) + "\n");
+    res.write(JSON.stringify({ phase: "fatal", error: redactAllUrls(e.message) }) + "\n");
     res.end();
   });
 });
@@ -12329,6 +12368,9 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     // HLS segments EOF every few seconds; a VOD's true end EOFs once), so
     // it would reconnect-loop forever (the reverted c5540f0).
     args.push(...panelReconnectArgs());
+    // Live only: a corrupt-frame ratio must not abort the whole channel (exit 255
+    // on "reference frames exceeds max" / mmco errors from flaky provider feeds).
+    if (mode === "live") args.push(...liveTolerantArgs());
     // VOD on the iGPU: decode AND scale on the GPU (0.7 vs 42 CPU-seconds for
     // a 20s 4K HEVC clip — measured). Decoding in software and only encoding
     // on the GPU pinned ~7.5 cores per movie and starved everything else on
@@ -12452,7 +12494,7 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     for (const d of entry.discontinuities) if (d < startNumber - liveHlsListSize() - 2) entry.discontinuities.delete(d);
   }
   ffmpeg.on("exit", (code) => {
-    const tail = stderrBuf.split("\n").filter(Boolean).slice(-3).join(" | ");
+    const tail = redactUrl(stderrBuf.split("\n").filter(Boolean).slice(-3).join(" | "));
     const now = Date.now();
     entry.restarts = (entry.restarts || []).filter((ts) => now - ts < RESTART_WINDOW_MS);
     // Self-heal: an unexpected exit (provider EOF / I/O error, CDN-host
@@ -12653,14 +12695,14 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
       // up entirely, instead of just continuing on software indefinitely.
       spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel, { startNumber: nextStart, entry }, audioTrack, entry.swTried)
         .catch((e) => {
-          console.log(`[transcode ${key}] respawn failed: ${e?.message || e}`);
+          console.log(`[transcode ${key}] respawn failed: ${redactUrl(e?.message || e)}`);
           transcoders.delete(key);
           fs.rmSync(dir, { recursive: true, force: true });
         });
     }, backoff);
   });
   if (!respawn) transcoders.set(key, entry);
-  console.log(`[transcode ${key}] ${respawn ? "respawned" : "started"} → ${sourceUrl}`);
+  console.log(`[transcode ${key}] ${respawn ? "respawned" : "started"} → ${redactUrl(sourceUrl)}`);
   return entry;
 }
 
@@ -12902,6 +12944,17 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   if (req.params.mode === "live" && req.params.ext === "m3u8") {
     const key = `${req.params.mode}:${req.params.id}`;
     let verdict = audioCodecCache[key];
+    // Fail fast on dead/empty channels (see decideLiveHealth): a recently-dead
+    // verdict answers 503 immediately; stale (>24h alive / >10min dead)
+    // verdicts get ONE bounded manifest GET first, unless a viewer is active.
+    const health = decideLiveHealth({ entry: verdict, now: Date.now(), viewerActive: streamingRecently(currentAccount()) });
+    if (health.action === "unavailable") {
+      return res.status(503).json(LIVE_UNAVAILABLE);
+    }
+    if (health.action === "check") {
+      verdict = await refreshLiveLiveness(key, direct, verdict);
+      if (verdict && verdict.dead) return res.status(503).json(LIVE_UNAVAILABLE);
+    }
     // Stale-while-revalidate: a known codec verdict (even past its TTL) routes
     // immediately; only an unknown channel waits, and only up to
     // LIVE_AUDIO_PROBE_WAIT_MS (default 3500; the probe keeps running and
@@ -12918,6 +12971,7 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
         const probed = await withDeadline(probeChannelAudioCodec(req.params.mode, req.params.id), LIVE_AUDIO_PROBE_WAIT_MS);
         if (probed) verdict = probed;
       } catch {}
+      if (verdict && verdict.dead) return res.status(503).json(LIVE_UNAVAILABLE);
     }
     if (verdict && verdict.audio_codec && !verdict.browser_safe) {
       forceTranscode = true;

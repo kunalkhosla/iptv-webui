@@ -3825,7 +3825,17 @@ async function resolveStreamUrl(mode, id, ext, anchorSecs, diskSel) {
   if (diskSel && Number.isFinite(diskSel.sub)) params.push(`sub=${diskSel.sub}`);
   const qs = params.length ? `?${params.join("&")}` : "";
   const r = await fetch(`/api/stream/${mode}/${id}.${ext}${qs}`);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  if (!r.ok) {
+    const err = new Error(`HTTP ${r.status}`);
+    // 503 {error:"channel_unavailable", message} = dead/empty live channel.
+    if (r.status === 503) {
+      try {
+        const j = await r.json();
+        if (j && j.error === "channel_unavailable") { err.channelUnavailable = true; err.userMessage = j.message; }
+      } catch {}
+    }
+    throw err;
+  }
   return r.json();
 }
 
@@ -4012,7 +4022,9 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
     // forever. Surface it and put the UI back in a clean state.
     if (el.spinner) el.spinner.hidden = true;
     toast(
-      e && /^HTTP 410/.test(e.message)
+      e && e.channelUnavailable
+        ? (e.userMessage || "This channel isn't available right now.")
+        : e && /^HTTP 410/.test(e.message)
         ? "Another device started watching — try again in a moment."
         : "Couldn't start playback — this title may be unavailable.",
       4500,
@@ -5680,7 +5692,9 @@ async function castMedia(p) {
     // Same unhandled-rejection gap as the direct-play path (see play()) —
     // a dead source or a displaced cap=1 slot failed completely silently.
     toast(
-      e && /^HTTP 410/.test(e.message)
+      e && e.channelUnavailable
+        ? (e.userMessage || "This channel isn't available right now.")
+        : e && /^HTTP 410/.test(e.message)
         ? "Another device started watching — try again in a moment."
         : "Couldn't start casting — this title may be unavailable.",
       4500,
