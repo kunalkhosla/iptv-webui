@@ -73,11 +73,11 @@ test("applyLiveCheck: persistent vs transient vs recovery", () => {
   assert.equal(ok.kind, "alive"); assert.equal(ok.entry.live_ts, NOW);
   assert.equal(applyLiveCheck({ ...e, dead: true, dead_reason: "http-404" }, { alive: true }, NOW).kind, "recovered");
 });
-test("health: alive rechecked after 10 min, fresh proceeds, live_ts counts, retry checks", () => {
+test("health: alive rechecked after 30 min, fresh proceeds, live_ts counts, retry checks", () => {
   assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 25 * H }, now: NOW }).action, "check");
-  assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 11 * M }, now: NOW }).action, "check");
+  assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 31 * M }, now: NOW }).action, "check");
   assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 25 * H }, now: NOW, viewerActive: true }).action, "proceed");
-  assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 9 * M }, now: NOW }).action, "proceed");
+  assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 29 * M }, now: NOW }).action, "proceed");
   assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 25 * H, live_ts: NOW - M }, now: NOW }).action, "proceed");
   // Client Retry on a fresh alive entry re-verifies (it just failed to play).
   assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - M }, now: NOW, retry: true }).action, "check");
