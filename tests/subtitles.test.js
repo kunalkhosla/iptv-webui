@@ -1,9 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { srtToVtt, cacheName, pickBest, createSubtitleService } = require("../lib/subtitles");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
+const { srtToVtt, cacheName, pickBest } = require("../lib/subtitles");
 
 test("srtToVtt converts header, commas and strips BOM/CRLF", () => {
   const out = srtToVtt("﻿1\r\n00:00:01,000 --> 00:00:02,500\r\nHello, world\r\n\r\n2\r\n0:00:03,5 --> 0:00:04,25\r\nBye\r\n");
