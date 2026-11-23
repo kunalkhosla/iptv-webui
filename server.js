@@ -774,16 +774,19 @@ const audioCodecCache = (() => {
   } catch { return {}; }
 })();
 let audioCodecCacheSaveTimer = null;
+let audioCodecCacheSaving = false;
 function scheduleAudioCodecCacheSave() {
   if (audioCodecCacheSaveTimer) return;
   audioCodecCacheSaveTimer = setTimeout(async () => {
     audioCodecCacheSaveTimer = null;
+    if (audioCodecCacheSaving) { scheduleAudioCodecCacheSave(); return; }
+    audioCodecCacheSaving = true;
     try {
       await fs.promises.writeFile(audioCodecCacheFile + ".tmp", JSON.stringify(audioCodecCache));
       await fs.promises.rename(audioCodecCacheFile + ".tmp", audioCodecCacheFile);
     } catch (e) {
       console.warn(`save audio-codec-cache failed: ${e.message}`);
-    }
+    } finally { audioCodecCacheSaving = false; }
   }, 500);
 }
 // Panel VOD audio-track lists, keyed `${mode}:${id}`, from a network
@@ -910,6 +913,7 @@ function probeChannelAudioCodec(mode, id, actx = currentAccount()) {
         direct,
       ];
       const proc = spawn("ffprobe", args);
+      proc.on("error", () => { audioProbeInflight.delete(key); resolve(null); });
       let buf = "";
       proc.stdout.on("data", d => { buf += d.toString(); });
       proc.stderr.on("data", () => {});
@@ -2458,7 +2462,7 @@ const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue"
 const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
 const { isLowQuality, lowQualityLast } = require("./lib/low-quality");
 const { decideLiveAudio, withDeadline } = require("./lib/live-audio-verdict");
-const LIVE_AUDIO_PROBE_WAIT_MS = Math.max(0, parseInt(process.env.LIVE_AUDIO_PROBE_WAIT_MS || "3500", 10) || 3500);
+const LIVE_AUDIO_PROBE_WAIT_MS = (() => { const n = parseInt(process.env.LIVE_AUDIO_PROBE_WAIT_MS ?? "", 10); return Number.isFinite(n) && n >= 0 ? n : 3500; })();
 const { segmentQuery } = require("./lib/segment-query");
 const { liveHlsListSize, panelReconnectArgs } = require("./lib/live-hls");
 const { createDownloadQueue } = require("./lib/download-queue");
@@ -12909,10 +12913,11 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
       sameKeyInflight: audioProbeInflight.has(key),
       anyInflight: anyProbeInflight(),
     });
-    if (plan.background) probeChannelAudioCodec(req.params.mode, req.params.id).catch(() => {});
     if (plan.wait) {
-      const probed = await withDeadline(probeChannelAudioCodec(req.params.mode, req.params.id), LIVE_AUDIO_PROBE_WAIT_MS);
-      if (probed) verdict = probed;
+      try {
+        const probed = await withDeadline(probeChannelAudioCodec(req.params.mode, req.params.id), LIVE_AUDIO_PROBE_WAIT_MS);
+        if (probed) verdict = probed;
+      } catch {}
     }
     if (verdict && verdict.audio_codec && !verdict.browser_safe) {
       forceTranscode = true;

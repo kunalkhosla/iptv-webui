@@ -7,9 +7,8 @@ const alive = { audio_codec: "mp2", browser_safe: false, dead: false, ts: 1 };
 test("fresh verdict is used with no probe", () => {
   assert.deepEqual(decideLiveAudio({ entry: alive, fresh: true, anyInflight: false }), { use: alive, wait: false, background: false });
 });
-test("stale alive verdict is used immediately and revalidated in background", () => {
-  assert.deepEqual(decideLiveAudio({ entry: alive, fresh: false, anyInflight: false }), { use: alive, wait: false, background: true });
-  assert.equal(decideLiveAudio({ entry: alive, fresh: false, anyInflight: true }).background, false);
+test("stale alive verdict is used immediately with no probe", () => {
+  assert.deepEqual(decideLiveAudio({ entry: alive, fresh: false, anyInflight: false }), { use: alive, wait: false, background: false });
 });
 test("unknown channel waits (bounded) for a probe", () => {
   assert.deepEqual(decideLiveAudio({ entry: undefined, fresh: false, anyInflight: false }), { use: null, wait: true, background: false });
