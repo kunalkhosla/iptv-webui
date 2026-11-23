@@ -16,3 +16,9 @@ test("panel reconnect args never retry 4xx or EOF", () => {
   assert.equal(a[a.indexOf("-reconnect_on_http_error") + 1], "5xx");
   assert.ok(a.includes("-rw_timeout"));
 });
+
+test("panel reconnect retries are bounded", () => {
+  const a = panelReconnectArgs();
+  assert.equal(a[a.indexOf("-reconnect_delay_total_max") + 1], "10");
+  assert.equal(a[a.indexOf("-reconnect_max_retries") + 1], "2");
+});
