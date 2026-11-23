@@ -112,6 +112,19 @@ MCP_PUBLIC_URL=https://iptv.example.com
 - Read tools reuse the real HTTP handlers via a loopback request as the
   token's user, so results match what the web UI shows.
 
+## Live stream URLs (`/api/stream/live/:id.m3u8`)
+
+- Liveness is checked with one playlist GET (no segments) when the cached
+  verdict is older than 30 min; persistent failures (404/410/empty playlist)
+  answer `503 channel_unavailable`. Checks and probes are skipped while
+  another viewer streams (the panel allows one connection).
+- `liveChecked: true` means the server's liveness verdict is current, so a
+  client may skip its own pre-play manifest check.
+- `?probe=0` (implied for the Android apps' okhttp user agent): the client
+  picks direct vs transcode itself and never reads `forceTranscode`/`url`, so
+  the server skips the audio-codec ffprobe.
+- Each call logs one `[zap]` line with total, check and probe timings.
+
 ## Running locally
 
 ```

@@ -98,6 +98,8 @@ test("contract: /api/stream/:mode/:id.:ext returns { direct, proxy, transcode, d
 test("contract: live /api/stream carries liveChecked", () => {
   const h = handlerFor(/app\.get\("\/api\/stream\/:mode/);
   expectFields("/api/stream/... (live)", h, ["liveChecked"]);
+  assert.match(h, /liveChecked\s*=\s*liveVerdictTrusted\(/, "liveChecked must come from liveVerdictTrusted");
+  assert.match(h, /\.\.\.\(liveChecked !== undefined \? \{ liveChecked \} : \{\}\)/, "liveChecked must be in the res.json payload (live only)");
 });
 
 // --- /api/home/:mode — consumed by web, Android phone, Android TV.

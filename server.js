@@ -994,7 +994,15 @@ function refreshLiveLiveness(key, direct, entry) {
     }
     const out = applyLiveCheck(entry, v);
     if (out.kind !== "inconclusive") {
-      audioCodecCache[key] = out.entry;
+      // A full codec probe may have landed while this check was in flight:
+      // on alive, keep that newer entry and only bump its liveness.
+      const cur = audioCodecCache[key];
+      if (out.kind === "alive" && cur && !cur.dead && (Number(cur.ts) || 0) > (Number(entry?.ts) || 0)) {
+        audioCodecCache[key] = { ...cur, live_ts: out.entry.live_ts };
+        out.entry = audioCodecCache[key];
+      } else {
+        audioCodecCache[key] = out.entry;
+      }
       scheduleAudioCodecCacheSave();
     }
     return out;
@@ -13331,7 +13339,7 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     const zapT0 = Date.now();
     let zapGate = "", zapProbe = "none";
     // One line per live zap: where the time went (no URLs/creds).
-    const zapLog = (status) => console.log(`[zap] ${key} ${status} ${Date.now() - zapT0}ms gate=${zapGate} probe=${zapProbe}${viewerActive ? " viewer" : ""}${clientAudio ? " client-audio" : ""}`);
+    const zapLog = (status) => console.log(`[zap] live:${idInt} ${status} ${Date.now() - zapT0}ms gate=${zapGate} probe=${zapProbe}${viewerActive ? " viewer" : ""}${clientAudio ? " client-audio" : ""}`);
     let verdict = audioCodecCache[key];
     // Fail fast on dead/empty channels (see decideLiveHealth). A persistent-dead
     // verdict inside its TTL answers 503 with no network call; `?retry=1` (the

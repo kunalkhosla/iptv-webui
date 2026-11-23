@@ -128,7 +128,11 @@ test("alive check on an unknown or recovered channel caches liveness only", () =
   assert.deepEqual(first.entry, { audio_codec: null, browser_safe: false, dead: false, ts: 0, live_ts: NOW });
   const rec = applyLiveCheck({ audio_codec: "aac", dead: true, dead_reason: "http-404", ts: NOW - H }, { alive: true }, NOW);
   assert.equal(rec.kind, "recovered");
-  assert.deepEqual(rec.entry, livenessOnlyEntry(NOW));
+  // Recovery keeps the known codec but leaves ts 0 (codec re-probed once).
+  assert.deepEqual(rec.entry, { ...livenessOnlyEntry(NOW), audio_codec: "aac", browser_safe: false });
+  const rec2 = applyLiveCheck({ audio_codec: "mp2", browser_safe: false, dead: true, dead_reason: "empty-playlist", ts: NOW - H }, { alive: true }, NOW);
+  assert.equal(rec2.entry.audio_codec, "mp2"); assert.equal(rec2.entry.dead, false); assert.equal(rec2.entry.live_ts, NOW);
+  assert.deepEqual(applyLiveCheck({ dead: true, dead_reason: "http-404", ts: 1 }, { alive: true }, NOW).entry, livenessOnlyEntry(NOW));
   // Next zap inside the recheck window: no network check...
   assert.equal(decideLiveHealth({ entry: first.entry, now: NOW + LIVE_ALIVE_RECHECK_MS - 1 }).action, "proceed");
   assert.equal(decideLiveHealth({ entry: first.entry, now: NOW + LIVE_ALIVE_RECHECK_MS }).action, "check");
