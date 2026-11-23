@@ -596,6 +596,7 @@ const inflight = new Map();
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 fs.mkdirSync(DATA_DIR, { recursive: true });
+const { pickTrailerKey, selectNewTrailers, backfillCandidates, applyReleaseInfo } = require("./lib/new-trailers");
 // Last good get_vod_info / get_series_info per title, for stale-if-error
 // on the detail endpoint (survives restarts, unlike `cache`).
 const { createInfoStore, getInfoStaleIfError, isUsableInfo } = require("./lib/info-cache");
@@ -1426,16 +1427,7 @@ function projectTmdbDetail(mode, detail, baseTitle) {
   // Trailer — first official YouTube "Trailer", else first Teaser,
   // else first YouTube video of any type. Stored as the YouTube key
   // so the client can embed via https://www.youtube.com/embed/<key>.
-  const videos = (detail.videos && Array.isArray(detail.videos.results))
-    ? detail.videos.results : [];
-  const trailerKey = (() => {
-    const ytOnly = videos.filter(v => v.site === "YouTube" && v.key);
-    const off = ytOnly.find(v => v.official && v.type === "Trailer")
-            || ytOnly.find(v => v.type === "Trailer")
-            || ytOnly.find(v => v.type === "Teaser")
-            || ytOnly[0];
-    return off ? off.key : null;
-  })();
+  const trailerKey = pickTrailerKey(detail.videos);
 
   // Top 1-2 reviews — author + a clipped excerpt. Full review URLs
   // and content are too big for the cache; we keep what's useful for
@@ -1483,6 +1475,9 @@ function projectTmdbDetail(mode, detail, baseTitle) {
     backdrop_path: detail.backdrop_path || null,
     plot:          detail.overview || null,
     year:          dateStr ? String(dateStr).slice(0, 4) : null,
+    // Full date (movie release_date / tv first_air_date) for the
+    // "New trailers" rail; older entries get it via backfillReleaseDates.
+    release_date:  /^\d{4}-\d{2}-\d{2}$/.test(String(dateStr || "")) ? String(dateStr) : null,
     rating:        Number.isFinite(detail.vote_average) ? Number(detail.vote_average.toFixed(1)) : null,
     vote_count:    Number.isFinite(detail.vote_count) ? detail.vote_count : 0,
     popularity:    Number.isFinite(detail.popularity) ? Number(detail.popularity.toFixed(2)) : 0,
@@ -1548,6 +1543,7 @@ function tmdbToResponse(entry) {
     directors:   entry.directors || [],
     keywords:    entry.keywords || [],
     trailer_key: entry.trailer_key || null,
+    release_date: entry.release_date || null,
     reviews:     entry.reviews || [],
     recommendations: entry.recommendations || [],
     similar:     entry.similar || [],
@@ -6405,6 +6401,178 @@ function homeGroupKeysOf(catName) {
   return out.length ? out : ["other"];
 }
 
+// ── Native trailers (GET /api/trailer/:key.mp4) ─────────────────────
+// TMDB trailer keys are YouTube videos. Instead of sending the apps to
+// YouTube, the server downloads the trailer once with yt-dlp (720p H.264 +
+// AAC mp4) into DATA_DIR/trailers/ and serves it with Range support. This
+// talks to YouTube only — never the IPTV panel, never the 1-stream
+// admission. See lib/trailer-cache.js and docs/TRAILERS.md.
+const { createTrailerCache, trailerRouteHandler, makeYtDlpDownloader, newestVersion } = require("./lib/trailer-cache");
+const TRAILER_DIR = path.join(DATA_DIR, "trailers");
+const YTDLP_IMAGE_BIN = process.env.YTDLP_BIN || "/usr/local/bin/yt-dlp";
+// Self-updated copy lives on the data volume so `yt-dlp -U` survives a
+// container recreate; the newer of the two (by --version) is used.
+const YTDLP_LOCAL_BIN = path.join(DATA_DIR, "bin", "yt-dlp");
+const ytdlp = { bin: null, version: null, lastUpdate: 0, updating: null, failStreak: 0 };
+function ytdlpVersionOf(bin) {
+  return new Promise((resolve) => {
+    execFile(bin, ["--version"], { timeout: 15_000 }, (err, out) => {
+      const v = !err && String(out || "").trim();
+      resolve(v && /^\d{4}\.\d{2}\.\d{2}/.test(v) ? v : null);
+    });
+  });
+}
+async function pickYtDlp() {
+  const cands = [];
+  for (const bin of [YTDLP_LOCAL_BIN, YTDLP_IMAGE_BIN]) {
+    if (fs.existsSync(bin)) cands.push({ bin, version: await ytdlpVersionOf(bin) });
+  }
+  const best = newestVersion(cands);
+  ytdlp.bin = best ? best.bin : null;
+  ytdlp.version = best ? best.version : null;
+  console.log(best ? `[trailer] yt-dlp ${best.version} (${best.bin})` : "[trailer] yt-dlp not available — trailers disabled");
+  return best;
+}
+// `yt-dlp -U` on the data-volume copy (seeded from the image binary).
+// Weekly, and after a streak of download failures (at most every 12 h).
+function selfUpdateYtDlp(reason) {
+  if (ytdlp.updating) return ytdlp.updating;
+  ytdlp.lastUpdate = Date.now();
+  ytdlp.updating = (async () => {
+    try {
+      if (!fs.existsSync(YTDLP_LOCAL_BIN)) {
+        if (!fs.existsSync(YTDLP_IMAGE_BIN)) return;
+        fs.mkdirSync(path.dirname(YTDLP_LOCAL_BIN), { recursive: true });
+        fs.copyFileSync(YTDLP_IMAGE_BIN, YTDLP_LOCAL_BIN + ".tmp");
+        fs.chmodSync(YTDLP_LOCAL_BIN + ".tmp", 0o755);
+        fs.renameSync(YTDLP_LOCAL_BIN + ".tmp", YTDLP_LOCAL_BIN);
+      }
+      await new Promise((resolve) => {
+        execFile(YTDLP_LOCAL_BIN, ["-U"], { timeout: 180_000 }, (err, out, errOut) => {
+          const msg = String(out || errOut || (err && err.message) || "").trim().split("\n").slice(-1)[0];
+          console.log(`[trailer] yt-dlp -U (${reason}): ${msg.slice(0, 160)}`);
+          resolve();
+        });
+      });
+      await pickYtDlp();
+    } catch (e) {
+      console.warn(`[trailer] yt-dlp self-update failed: ${e.message}`);
+    } finally {
+      ytdlp.updating = null;
+    }
+  })();
+  return ytdlp.updating;
+}
+const ytDlpDownload = makeYtDlpDownloader({
+  bin: () => ytdlp.bin,
+  onError: () => {
+    if (++ytdlp.failStreak >= 3 && Date.now() - ytdlp.lastUpdate > 12 * 3600_000) {
+      ytdlp.failStreak = 0;
+      selfUpdateYtDlp("failures");
+    }
+  },
+});
+const trailerCache = createTrailerCache({
+  dir: TRAILER_DIR,
+  download: async (key, tmpDir, opts) => {
+    if (!ytdlp.bin) throw new Error("yt-dlp not available");
+    const out = await ytDlpDownload(key, tmpDir, opts);
+    ytdlp.failStreak = 0;
+    return out;
+  },
+  concurrency: 2,
+  timeoutMs: 45_000,
+  negTtlMs: 6 * 3600_000,
+  ttlMs: 30 * 86400_000,
+  maxBytes: (() => { const g = parseFloat(process.env.TRAILER_CACHE_MAX_GB || ""); return (Number.isFinite(g) && g > 0 ? g : 8) * 1024 ** 3; })(),
+  log: (m) => console.log(m),
+});
+// Background prefetch of the "New trailers" rail: one at a time, gap
+// between downloads, waits while anyone is watching or a viewer-triggered
+// trailer download runs; 5 failures in a row pause it 10 min.
+const trailerPrefetch = createPrewarmQueue({
+  fetcher: async (e) => {
+    if (!ytdlp.bin) throw new Error("yt-dlp not available");
+    const f = await trailerCache.ensure(e.trailerKey, { priority: "low" });
+    if (!f) throw new Error("unavailable");
+  },
+  isCached: (e) => trailerCache.has(e.trailerKey) || trailerCache.isNegative(e.trailerKey),
+  shouldYield: () => trailerCache.busy() || streamingRecentlyIn(streams, null, 60_000),
+  gapMs: 5_000,
+  yieldMs: 30_000,
+  cap: 40,
+});
+function scheduleTrailers() {
+  pickYtDlp().catch(() => {}).then(() => {
+    if (!ytdlp.bin && fs.existsSync(YTDLP_IMAGE_BIN)) selfUpdateYtDlp("boot");
+  });
+  const t1 = setInterval(() => selfUpdateYtDlp("weekly"), 7 * 86400_000); t1.unref?.();
+  const evict = () => { try { const r = trailerCache.evict(); if (r.removed) console.log(`[trailer] evicted ${r.removed} (${(r.totalBytes / 1073741824).toFixed(2)} GB left)`); } catch (e) { console.warn(`[trailer] evict: ${e.message}`); } };
+  setTimeout(evict, 60_000).unref?.();
+  const t2 = setInterval(evict, 6 * 3600_000); t2.unref?.();
+  setTimeout(() => backfillReleaseDates({ reason: "boot" }).catch((e) => console.warn(`[trailer] backfill: ${e.message}`)), 5 * 60_000).unref?.();
+  const t3 = setInterval(() => backfillReleaseDates().catch((e) => console.warn(`[trailer] backfill: ${e.message}`)), 6 * 3600_000); t3.unref?.();
+}
+
+// Lazy backfill of release_date (+ a missing trailer_key) for TMDB cache
+// entries written before release_date was stored. Library titles only,
+// only ones recent enough to matter (year >= last year), one TMDB call per
+// tmdb_id at a time with a gap, capped per run.
+const releaseBackfill = { running: false, done: 0, total: 0 };
+async function backfillReleaseDates({ reason = "cron", gapMs = 250 } = {}) {
+  if (!TMDB_API_KEY) return { ok: false, error: "no TMDB_API_KEY" };
+  if (releaseBackfill.running) return { ok: false, error: "already running" };
+  releaseBackfill.running = true;
+  try {
+    const entries = [];
+    for (const m of ["movie", "series"]) {
+      const ix = indexes[m];
+      if (!ix?.byId) continue;
+      for (const s of ix.byId.values()) {
+        const key = `${m}:${s.id}`;
+        entries.push([key, tmdbCache[key]]);
+      }
+    }
+    const todo = backfillCandidates({ entries });
+    releaseBackfill.done = 0; releaseBackfill.total = todo.length;
+    if (!todo.length) return { ok: true, checked: 0 };
+    console.log(`[trailer] release-date backfill: ${todo.length} titles (${reason})`);
+    let updated = 0, nulls = 0;
+    for (const c of todo) {
+      const res = await tmdbRaw(`/${c.kind === "series" ? "tv" : "movie"}/${c.tmdbId}?append_to_response=videos`);
+      releaseBackfill.done++;
+      if (res === null) {
+        if (++nulls >= 20) { console.warn("[trailer] TMDB failing repeatedly — stopping backfill"); break; }
+      } else {
+        nulls = 0;
+        for (const key of c.keys) {
+          const e = tmdbCache[key];
+          if (e && e.source === "tmdb" && e.tmdb_id === c.tmdbId) { applyReleaseInfo(e, c.kind, res); updated++; }
+        }
+      }
+      await new Promise((r) => setTimeout(r, gapMs));
+    }
+    if (updated) { scheduleTmdbCacheSave(); catalogGen++; }
+    console.log(`[trailer] release-date backfill done: ${releaseBackfill.done} fetched, ${updated} entries updated`);
+    return { ok: true, checked: releaseBackfill.done, updated };
+  } finally {
+    releaseBackfill.running = false;
+  }
+}
+
+app.get("/api/trailer/:key.mp4", trailerRouteHandler({ cache: trailerCache, available: () => !!ytdlp.bin }));
+
+app.get("/api/admin/trailers", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  res.json({ ytdlp: { bin: ytdlp.bin, version: ytdlp.version }, cache: trailerCache.stats(), prefetch: { ...trailerPrefetch.stats, queued: trailerPrefetch.size }, backfill: releaseBackfill });
+});
+app.post("/api/admin/backfill-release-dates", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  if (releaseBackfill.running) return res.json({ ok: false, error: "already running", progress: releaseBackfill });
+  backfillReleaseDates({ reason: "admin" }).catch((e) => console.warn(`[trailer] backfill: ${e.message}`));
+  res.json({ ok: true, started: true });
+});
+
 app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // No browser cache — the response varies per profile + per filter
   // change + per server-side rule update (e.g. title-language guard).
@@ -7081,6 +7249,41 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
         total: recentTiles.length,
         items: slice,
       });
+    }
+  }
+
+  // New trailers — recent releases (movies <=120 d, series first aired
+  // <=90 d, by TMDB release_date) that the library carries and that have a
+  // TMDB trailer. One tile per tmdb_id (4K/FHD copies), same language /
+  // variant / low-quality / kid gates as Recently Added, newest first,
+  // hidden when empty. Tiles carry `trailer_key` (+ `release_date`) so the
+  // apps play GET /api/trailer/<key>.mp4 natively. The top of the rail is
+  // prefetched in the background (one at a time, only while idle).
+  if (mode === "movie" || mode === "series") {
+    const picked = selectNewTrailers({
+      items: indexes[mode].byId.values(),
+      tmdbFor,
+      mode,
+      passes: (s) => titleLangPasses(s.name) && !variantHidden(s) && !isLQ(s),
+    });
+    const trailerTiles = [];
+    for (const { s, t } of picked) {
+      const tile = tileFor(s);
+      if (!tile || !isKidSafe(tile)) continue;
+      tile.trailer_key = t.trailer_key;
+      tile.release_date = t.release_date;
+      trailerTiles.push(tile);
+    }
+    if (trailerTiles.length) {
+      rails.push({
+        title: "New trailers",
+        category_id: "__rail-new-trailers",
+        total: trailerTiles.length,
+        items: trailerTiles.slice(0, 40),
+      });
+      if (!req.get("x-khouch-internal")) {
+        trailerPrefetch.enqueue(trailerTiles.slice(0, 12).map((x) => ({ key: x.trailer_key, trailerKey: x.trailer_key })));
+      }
     }
   }
 
@@ -13879,4 +14082,5 @@ app.listen(PORT, async () => {
   scheduleStreamingBuzz();
   scheduleStreamingArrivals();
   scheduleAltCerts();
+  scheduleTrailers();
 });

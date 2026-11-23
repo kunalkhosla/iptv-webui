@@ -125,6 +125,31 @@ MCP_PUBLIC_URL=https://iptv.example.com
   the server skips the audio-codec ffprobe.
 - Each call logs one `[zap]` line with total, check and probe timings.
 
+## Native trailers (`/api/trailer/:key.mp4`)
+
+Trailers play inside the apps instead of opening YouTube. Details and the
+full client contract: [docs/TRAILERS.md](docs/TRAILERS.md).
+
+- `GET /api/trailer/<youtubeKey>.mp4` (normal session auth): served from
+  `data/trailers/` with HTTP Range; on a miss the server downloads it first
+  with yt-dlp (720p H.264/AAC mp4, ~10 MB, ~10-15 s), then serves it. Failure:
+  `404 {"error":"trailer_unavailable"}`, remembered for 6 h.
+- Cache: max 2 downloads at once (viewer requests before background ones),
+  same-key requests share one download, files unused for 30 days are
+  deleted, total capped at `TRAILER_CACHE_MAX_GB` (default 8).
+- Home rail **New trailers** (`category_id: "__rail-new-trailers"`, movies and
+  series): library titles released in the last 120 days (series: first aired
+  in the last 90), newest first; tiles add `trailer_key` and `release_date`.
+  The top of the rail is downloaded in the background, one at a time, only
+  while nobody is watching.
+- yt-dlp is pinned in the Dockerfile (`YTDLP_VERSION` + sha256). The server
+  keeps a self-updated copy in `data/bin/yt-dlp` (`yt-dlp -U` weekly and after
+  3 failures in a row, at most every 12 h) and uses whichever is newer.
+  `YTDLP_BIN` overrides the image path.
+- This talks to YouTube only; it never opens an IPTV panel connection.
+- Owner: `GET /api/admin/trailers` (yt-dlp version, cache/prefetch stats),
+  `POST /api/admin/backfill-release-dates`.
+
 ## Running locally
 
 ```
@@ -169,6 +194,7 @@ Browser / TV ──HTTPS──► Traefik ──HTTP──► Express (server.js
                                               ├── /api/search/{mode}      (substring search)
                                               ├── /api/epg/short/{id}     (EPG window for one channel)
                                               ├── /api/poster/{mode}/{id} (TMDB enrichment)
+                                              ├── /api/trailer/{key}.mp4  (YouTube trailer via yt-dlp, cached on disk)
                                               ├── /api/stream/{mode}/{id} (returns SIGNED proxy + transcode URLs)
                                               ├── /api/proxy?u=…&s=…      (HMAC-signed; bypasses Basic Auth)
                                               └── /api/transcode/...      (ffmpeg → /tmp/iptv-transcode/)
