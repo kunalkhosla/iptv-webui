@@ -19,7 +19,7 @@ test("just-pressed movie (p<=5) is history, not continue", () => {
 
 test("series with auto up-next pointer continues; plain pointer does not", () => {
   const r = selectContinueAndHistory({ mode: "series", progressById: pm({}), recentIds: [10, 11],
-    lastEpisode: { 10: { auto: true, when: 5 }, 11: { when: 9 } } });
+    lastEpisode: { 10: { auto: true, when: Date.now() }, 11: { when: 9 } } });
   assert.deepEqual(r.continueIds, [10]);
   assert.deepEqual(r.historyIds, [11]);
 });
