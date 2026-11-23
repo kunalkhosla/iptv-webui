@@ -598,7 +598,7 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 // Last good get_vod_info / get_series_info per title, for stale-if-error
 // on the detail endpoint (survives restarts, unlike `cache`).
-const { createInfoStore, getInfoStaleIfError } = require("./lib/info-cache");
+const { createInfoStore, getInfoStaleIfError, isUsableInfo } = require("./lib/info-cache");
 const infoStore = createInfoStore({ dir: path.join(DATA_DIR, "info-cache") });
 const indexFilePath =(mode) => path.join(DATA_DIR, `index-${mode}.json`);
 const categoriesFilePath = (mode) => path.join(DATA_DIR, `categories-${mode}.json`);
@@ -9134,12 +9134,26 @@ app.get("/api/:mode(movie|series)/info/:id", async (req, res, next) => {
     const actx = currentAccount();
     const params = { [key]: req.params.id };
     const cacheKey = xtreamKey(actx, m.info, params);
+    // Snapshot BEFORE the live call: xtream() caches whatever the panel
+    // returns, so a degraded shell could otherwise replace the good copy.
+    const entryBefore = cache.get(cacheKey);
     let r;
     try {
       r = await getInfoStaleIfError({
         key: cacheKey,
+        mode,
+        // The cap is enforced here, not only via xtream's own timeout:
+        // xtream dedupes in-flight calls, so this may join a 90 s prewarm.
         fetchLive: () => xtream(m.info, params, { actx, timeout: INFO_PANEL_TIMEOUT_MS }),
-        memStale: () => cache.get(cacheKey)?.v,
+        timeoutMs: INFO_PANEL_TIMEOUT_MS,
+        memStale: entryBefore?.v,
+        // Don't pin an empty/degraded answer in the 24 h cache: put the
+        // previous good entry back (keeping its age, so it's refetched
+        // next time), else drop the shell.
+        onUnusableLive: () => {
+          if (entryBefore && isUsableInfo(entryBefore.v, mode)) cache.set(cacheKey, entryBefore);
+          else cache.delete(cacheKey);
+        },
         store: infoStore,
         onStale: (s, err) => console.warn(`[info] ${mode} ${req.params.id}: panel failed (${redactAllUrls(err && err.message)}); serving stale ${s.source} copy`),
       });

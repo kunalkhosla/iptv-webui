@@ -4577,6 +4577,9 @@ async function openMovie(s, mode = "movie") {
 
   try {
     const r = await fetch(`/api/movie/info/${s.id}`);
+    // 503 info_unavailable (panel down, no cached copy): keep the
+    // rail metadata already on screen — Play works without panel info.
+    if (!r.ok) return;
     const d = await r.json();
     // Stale-response guard — the user can navigate to a different detail
     // panel (movie, series, or a disk series group) before this fetch
@@ -4752,7 +4755,18 @@ async function openSeries(s) {
 
   try {
     const r = await fetch(`/api/series/info/${s.id}`);
+    if (state.openSeries !== s) return; // user moved on
+    if (!r.ok) {
+      // 503 info_unavailable: panel down and no cached copy. Say so and
+      // offer Retry instead of "No episodes found." / a stuck placeholder.
+      el.seriesEpisodes.innerHTML = `<div class="empty">Episodes aren't available right now. <button type="button" class="series-info-retry">Retry</button></div>`;
+      el.seriesPlayBtn.disabled = true;
+      const btn = el.seriesEpisodes.querySelector(".series-info-retry");
+      if (btn) btn.addEventListener("click", () => { if (state.openSeries === s) openSeries(s); });
+      return;
+    }
     const d = await r.json();
+    if (state.openSeries !== s) return;
     state.openSeriesData = d;
     refreshSeriesDiskBtn();
     const backdrop = (d.info && (d.info.backdrop_path?.[0] || d.info.movie_image)) || s.icon;
