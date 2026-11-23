@@ -576,6 +576,9 @@ function isLocalMode(mode) { return !!MODES[mode]?.local; }
 
 const cache = new Map();
 const TTL_MS = 24 * 60 * 60 * 1000;
+// Detail-screen info calls fail over to a stale copy after this long
+// rather than holding the TV on a spinner for the 90 s default.
+const INFO_PANEL_TIMEOUT_MS = 30_000;
 
 // Window for the "Recently Added" home rail. 7 days matches the
 // "anything new this week?" mental model. The panel batches drops
@@ -593,7 +596,11 @@ const inflight = new Map();
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const indexFilePath = (mode) => path.join(DATA_DIR, `index-${mode}.json`);
+// Last good get_vod_info / get_series_info per title, for stale-if-error
+// on the detail endpoint (survives restarts, unlike `cache`).
+const { createInfoStore, getInfoStaleIfError } = require("./lib/info-cache");
+const infoStore = createInfoStore({ dir: path.join(DATA_DIR, "info-cache") });
+const indexFilePath =(mode) => path.join(DATA_DIR, `index-${mode}.json`);
 const categoriesFilePath = (mode) => path.join(DATA_DIR, `categories-${mode}.json`);
 
 // Serialize concurrent saves per-mode. Two callers (buildIndex and the
@@ -9121,7 +9128,35 @@ app.get("/api/:mode(movie|series)/info/:id", async (req, res, next) => {
     const mode = req.params.mode;
     const m = MODES[mode];
     const key = mode === "series" ? "series_id" : "vod_id";
-    const v = await xtream(m.info, { [key]: req.params.id });
+    // Stale-if-error: a panel 500/timeout serves the last good copy
+    // (in-memory even past TTL, else disk) instead of failing the detail
+    // screen; with no copy at all it's a fast structured 503.
+    const actx = currentAccount();
+    const params = { [key]: req.params.id };
+    const cacheKey = xtreamKey(actx, m.info, params);
+    let r;
+    try {
+      r = await getInfoStaleIfError({
+        key: cacheKey,
+        fetchLive: () => xtream(m.info, params, { actx, timeout: INFO_PANEL_TIMEOUT_MS }),
+        memStale: () => cache.get(cacheKey)?.v,
+        store: infoStore,
+        onStale: (s, err) => console.warn(`[info] ${mode} ${req.params.id}: panel failed (${redactAllUrls(err && err.message)}); serving stale ${s.source} copy`),
+      });
+    } catch (e) {
+      if (e && e.code === "info_unavailable") {
+        console.warn(`[info] ${mode} ${req.params.id}: unavailable (${redactAllUrls(e.cause && e.cause.message)})`);
+        res.set({ "Cache-Control": "no-store", "Retry-After": "30" });
+        return res.status(503).json({ error: "info_unavailable" });
+      }
+      throw e;
+    }
+    const v = r.v;
+    if (r.stale) {
+      // Short client cache so a recovered panel is picked up soon.
+      res.set({ "Cache-Control": "private, max-age=60", "X-Khouch-Stale": "1" });
+      return res.json(v);
+    }
     // Opportunistic TMDB shortcut: panel ships info.tmdb_id alongside
     // VOD / series detail. Caching it here means the next ensureTmdb
     // for this item (poster / kids cert lookup) skips the title-search
