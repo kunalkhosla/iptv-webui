@@ -12947,7 +12947,9 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     // verdict inside its TTL answers 503 with no network call; `?retry=1` (the
     // clients' Retry) bypasses it once. Any network check/probe is skipped while
     // ANY viewer is streaming (cap=1 account) -- then we just play, as before.
-    const viewerActive = streamingNow(null);
+    // Other owners only: the requester's own current stream is still registered
+    // while it zaps, and must not suppress its own codec probe.
+    const viewerActive = streamingRecentlyIn(streams, null, LIVE_IDLE_GRACE_MS, Date.now(), ownerKeyOf(req));
     const health = decideLiveHealth({ entry: verdict, now: Date.now(), viewerActive, retry: req.query.retry === "1" });
     if (health.action === "unavailable") {
       return res.status(503).json(LIVE_UNAVAILABLE);

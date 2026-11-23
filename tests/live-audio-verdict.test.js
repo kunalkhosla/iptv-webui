@@ -89,3 +89,16 @@ test("manifest content detection and 503 contract", () => {
   assert.equal(manifestHasContent(undefined), false);
   assert.equal(LIVE_UNAVAILABLE.error, "channel_unavailable");
 });
+
+test("recent-stream: excludeOwner ignores own stream, respects other owners, ignores stale", () => {
+  const { streamingRecently } = require("../lib/recent-stream");
+  const now = 1e12;
+  const mk = (o) => new Map(Object.entries(o));
+  const own = mk({ "ip:a": { mode: "live", accountKey: "k", lastSeen: now - 1000 } });
+  assert.equal(streamingRecently(own, null, 180e3, now, "ip:a"), false);
+  assert.equal(streamingRecently(own, null, 180e3, now), true);
+  const both = mk({ "ip:a": { mode: "live", accountKey: "k", lastSeen: now - 1000 }, "ip:b": { mode: "live", accountKey: "k", lastSeen: now - 5000 } });
+  assert.equal(streamingRecently(both, null, 180e3, now, "ip:a"), true);
+  const stale = mk({ "ip:a": { mode: "live", accountKey: "k", lastSeen: now - 1000 }, "ip:b": { mode: "live", accountKey: "k", lastSeen: now - 400e3 } });
+  assert.equal(streamingRecently(stale, null, 180e3, now, "ip:a"), false);
+});
