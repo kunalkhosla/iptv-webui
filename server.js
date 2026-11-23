@@ -5988,6 +5988,7 @@ const CHIP_KINDS = {
 // filtering is uniform across rails, search, index, and per-mode
 // streams.
 const { KIDS_CERT_TIERS, makeKidsBlocker } = require("./lib/kids-filter");
+const { selectContinueAndHistory, hasPosition } = require("./lib/continue-rails");
 
 // "<genre> | <lang>: <name>" is a common alternate convention where
 // the word BEFORE the pipe is the genre hint ("News | Ar: Al Jazeera",
@@ -6408,7 +6409,8 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     .map(s => tileFor(s))
     .filter(t => t && isKidSafe(t));
 
-  // Continue Watching — merged rail (#48). Union of `userState.progress`
+  // Continue Watching (unfinished only) + Recently Watched (history) rails,
+  // split by lib/continue-rails.js from the union of `userState.progress`
   // (items with a saved playback position) and `userState.recents`
   // (items the user just pressed play on, no position). Recency comes
   // from progress.t when available, else lastPlayed[mode][id] (per-
@@ -6466,39 +6468,51 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       const key = String(normalizeId(parseInt(rawId, 10)));
       if (!lpForMode[key] || ts > lpForMode[key]) lpForMode[key] = ts;
     }
-    const unionIds = new Set([...progressById.keys(), ...recentIds]);
-    const idsByRecency = [...unionIds]
-      .map((id) => {
-        const p = progressById.get(id);
-        if (p?.t) return [id, p.t];
-        const lp = lpForMode[String(id)];
-        return [id, lp || 0];
-      })
-      .sort((a, b) => b[1] - a[1])
-      .map(([id]) => id);
-    const cwTiles = idsByRecency
+    const watchedIds = [];
+    for (const w of userState.watched || []) {
+      const w2 = String(w);
+      if (w2.startsWith(mode + ":")) {
+        const n = parseInt(w2.slice(mode.length + 1), 10);
+        if (Number.isFinite(n)) watchedIds.push(normalizeId(n));
+      }
+    }
+    const { continueIds, historyIds } = selectContinueAndHistory({
+      mode, progressById, recentIds, lpForMode, watchedIds,
+      lastEpisode: userState.lastEpisode || {},
+    });
+    const tilesFor = (ids, withProgress) => ids
       .map((id) => ix.byId.get(id))
       .filter((s) => s && titleLangPasses(s.name))
       .map((s) => {
         const tile = tileFor(s);
         if (!tile) return null;
         const p = progressById.get(s.id);
-        if (p && Number.isFinite(p.p) && p.p > 5) {
+        if (withProgress && p && Number.isFinite(p.p) && p.p > 5) {
           tile.progress = { p: p.p, d: p.d || null };
         }
         return tile;
       })
       .filter((t) => t && isKidSafe(t));
+    const cwTiles = tilesFor(continueIds, true);
+    const histTiles = tilesFor(historyIds, false);
     if (cwTiles.length) {
+      // No category_id: "See all" for __recents lists recents (incl.
+      // finished titles), which is the history rail's job. 12 is enough
+      // for unfinished items; no client change needed.
       rails.push({
         title: "Continue Watching",
-        // Web client's PSEUDO.RECENTS pseudo-category id. Surfaces a
-        // "See all ›" button on the rail header and selectCategory()
-        // already knows how to render this view. Server doesn't render
-        // this value anywhere — it's a hint for the client.
-        category_id: "__recents",
         total: cwTiles.length,
         items: cwTiles.slice(0, 12),
+      });
+    }
+    if (histTiles.length) {
+      // __recents = web PSEUDO.RECENTS / Android CategoryScreen: client-side
+      // "See all" over userState.recents. Hint only; server doesn't render it.
+      rails.push({
+        title: "Recently Watched",
+        category_id: "__recents",
+        total: histTiles.length,
+        items: histTiles.slice(0, 12),
       });
     }
   }
@@ -10617,8 +10631,10 @@ const MCP_TOOLS = [
       const seenEpisodes = new Set();
       for (const [seriesId, le] of Object.entries(st.lastEpisode || {})) {
         if (le?.episode_id == null || !/^\d+$/.test(String(le.episode_id))) continue;
-        seenEpisodes.add(String(le.episode_id));
         const pr = st.progress?.[`series:${le.episode_id}`];
+        // Unfinished only: a saved position, or an "up next" pointer.
+        if (!hasPosition(pr) && le.auto !== true) continue;
+        seenEpisodes.add(String(le.episode_id));
         items.push({
           ref: `episode:${le.episode_id}:${String(le.container || "mp4").toLowerCase()}`,
           kind: "episode",
@@ -10633,7 +10649,7 @@ const MCP_TOOLS = [
         if (mode === "series" || !/^\d+$/.test(id || "")) continue;
         if (mode !== "movie" && mode !== "disk") continue;
         const item = ix[mode]?.byId?.get(parseInt(id, 10));
-        if (!item) continue;
+        if (!item || !hasPosition(pr)) continue;
         items.push({ ...mcpHit(mode, item), position: pr.p, duration: pr.d ?? null, t: pr.t || 0 });
       }
       items.sort((a, b) => b.t - a.t);
