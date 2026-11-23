@@ -923,16 +923,17 @@ async function _probeManifestOnce(direct, timeoutMs = 3500) {
     const variant = firstVariantUri(text);
     if (variant) {
       try {
+        // Same controller: master + variant share one timeoutMs budget.
         const vr = await fetch(new URL(variant, r.url || direct).href, {
           method: "GET", redirect: "follow",
           headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 12; Smart TV) AppleWebKit/537.36" },
-          signal: AbortSignal.timeout(timeoutMs),
+          signal: controller.signal,
         });
         if (!vr.ok) return { alive: false, reason: `variant-http-${vr.status}` };
         const vt = await vr.text();
-        // Dead only if it is clearly an HLS media playlist with no segments;
-        // anything else (HTML, nested master) stays inconclusive -> plays.
-        if (vt.includes("#EXTM3U") && !/#EXTINF:|#EXT-X-STREAM-INF:/.test(vt)) {
+        // Dead only if it is clearly an HLS playlist with no segment/variant
+        // URIs; anything else (HTML, ...) stays inconclusive -> plays.
+        if (vt.includes("#EXTM3U") && !manifestHasContent(vt)) {
           return { alive: false, reason: "empty-playlist" };
         }
       } catch (e) {
@@ -958,16 +959,20 @@ async function probeManifestLiveness(direct) {
     if (attempt > 0) await new Promise(r => setTimeout(r, 600));
     const v = await _probeManifestOnce(direct);
     if (v.alive) return v;
+    // Two consecutive persistent failures (empty playlist / 404 / 410) are
+    // confirmation enough; a third GET only delays the 503.
+    if (attempt > 0 && isPersistentDeadReason(v.reason) && isPersistentDeadReason(lastReason)) return v;
     lastReason = v.reason;
   }
   return { alive: false, reason: lastReason };
 }
 // Liveness-only refresh of a cached verdict, coalesced per channel. One GET
-// (2.5 s); only a PERSISTENT failure (empty-playlist / 404 / 410) is confirmed
+// (3 s); only a PERSISTENT failure (empty-playlist / 404 / 410) is confirmed
 // with a second GET before it counts as dead. Timeouts, fetch errors, 403, 429,
 // 5xx and blank bodies are inconclusive: nothing is cached and the caller plays.
 // Resolves { kind: "dead"|"recovered"|"alive"|"inconclusive", entry }.
-const LIVE_CHECK_TIMEOUT_MS = 2500;
+// Covers master + first-variant GET together (alive channels measure 1-2 s).
+const LIVE_CHECK_TIMEOUT_MS = 3000;
 const liveCheckInflight = new Map();
 function refreshLiveLiveness(key, direct, entry) {
   if (liveCheckInflight.has(key)) return liveCheckInflight.get(key);
@@ -13261,11 +13266,14 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     let skipProbe = viewerActive;
     let livenessVerified = false;
     if (health.action === "check" && !audioProbeInflight.has(key)) {
+      const known = !!verdict;
       const out = await refreshLiveLiveness(key, direct, verdict);
       if (out.kind === "dead") return res.status(503).json(LIVE_UNAVAILABLE);
       verdict = out.entry;
-      if (out.kind === "recovered") livenessVerified = true;
-      if (out.kind === "inconclusive") skipProbe = true; // don't hammer a flapping panel; play
+      if (out.kind === "recovered" || out.kind === "alive") livenessVerified = true;
+      // Known channel + flapping panel: don't hammer it, play. An unknown
+      // channel still gets its codec probe (with its own liveness retries).
+      if (out.kind === "inconclusive" && known) skipProbe = true;
     }
     // An unrechecked dead verdict never blocks playback or routes audio.
     if (verdict && verdict.dead) verdict = undefined;
