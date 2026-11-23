@@ -2456,6 +2456,9 @@ const effCert = (t) => (t ? (t.us_cert || t.cert_alt || "") : "");
 const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
 const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue");
 const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
+const { isLowQuality, lowQualityLast } = require("./lib/low-quality");
+const { decideLiveAudio, withDeadline } = require("./lib/live-audio-verdict");
+const LIVE_AUDIO_PROBE_WAIT_MS = Math.max(0, parseInt(process.env.LIVE_AUDIO_PROBE_WAIT_MS || "1200", 10) || 1200);
 const { segmentQuery } = require("./lib/segment-query");
 const { liveHlsListSize, panelReconnectArgs } = require("./lib/live-hls");
 const { createDownloadQueue } = require("./lib/download-queue");
@@ -2837,12 +2840,12 @@ function assignVariants(mode, actx = currentAccount()) {
       if (/\b(HD|720P?)\b/i.test(s.name)) return 2;
       return 3;
     };
-    const isCam = (s) => (s.tags || []).includes("cam") || /\bCAM\b/i.test(s.name);
+    const isCam = (s) => (s.tags || []).includes("cam") || isLowQuality(s, catNames.get(String(s.category_id)));
     const langRank = (s) => {
       if (!orig || !s.audioLang) return 1;
       return s.audioLang === orig ? 0 : s.audioLang === "multi" ? 3 : 2;
     };
-    const score = (s) => [langRank(s), s.audioLang === "multi" ? 1 : 0, isCam(s) ? 1 : 0, quality(s), (s.tags || []).includes("surround") ? 0 : 1, s.id];
+    const score = (s) => [isCam(s) ? 1 : 0, langRank(s), s.audioLang === "multi" ? 1 : 0, quality(s), (s.tags || []).includes("surround") ? 0 : 1, s.id];
     members.sort((a, b) => {
       const x = score(a), y = score(b);
       for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
@@ -2867,7 +2870,9 @@ function makeVariantHider(ix, passes, profileIso) {
   const chosen = new Map(); // canonicalId -> chosen stream id
   const decide = (canon) => {
     if (chosen.has(canon.id)) return chosen.get(canon.id);
-    const list = (canon.variants || []).map((v) => ix.byId.get(v.id)).filter(Boolean).filter(passes);
+    // Camera-recorded copies only represent a title when nothing else passes.
+    const vs = (canon.variants || []).filter((v) => ix.byId.get(v.id));
+    const list = [...vs.filter((v) => !v.cam), ...vs.filter((v) => v.cam)].map((v) => ix.byId.get(v.id)).filter(passes);
     let pick = list[0];
     if (profileIso && profileIso.size && pick && pick.audioLang && !profileIso.has(pick.audioLang)) {
       pick = list.find((m) => m.audioLang && profileIso.has(m.audioLang)) || pick;
@@ -6307,6 +6312,10 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     onboarded ? new Set([...onboardedKeys].map((k) => LANG_TAG_TO_ISO[k]).filter(Boolean)) : null,
   );
 
+  // Camera-recorded copies (CAM/HDTS/...) stay browsable in category rails
+  // (sorted last) and searchable, but never headline the hero or a curated rail.
+  const isLQ = (s) => !!s && mode !== "live" && isLowQuality(s, variantCatName.get(String(s.category_id)));
+
   // Group eligible items by category in one pass over the index.
   // Cached per gate signature (language/kid/account) like the smart pool: the
   // grouping is request-independent and costs a regex test per catalog item.
@@ -6353,6 +6362,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     const seenTitle = new Set();
     const out = [];
     let totalEligible = 0;
+    if (mode !== "live") bucket = lowQualityLast(bucket, (x) => variantCatName.get(String(x.category_id)));
     for (const s of bucket) {
       const titleKey = dedupKeyOf(s);
       if (titleKey && seenTitle.has(titleKey)) continue;
@@ -6637,7 +6647,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       const seenFy = new Set();
       const fyTiles = ordered
         .map((id) => variantHidden.resolve(ix.byId.get(id) ?? ix.byId.get(parseInt(id, 10))))
-        .filter((s) => s && titleLangPasses(s.name))
+        .filter((s) => s && titleLangPasses(s.name) && !isLQ(s))
         .filter((s) => {
           const key = s.tmdb_id || `id:${s.id}`;
           if (seenFy.has(key)) return false;
@@ -6713,7 +6723,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       .filter(([, e]) => e.viewers.size >= 2)
       .sort((a, b) => b[1].viewers.size - a[1].viewers.size || b[1].last - a[1].last)
       .map(([id]) => variantHidden.resolve(ix.byId.get(id)))
-      .filter((s) => s && titleLangPasses(s.name))
+      .filter((s) => s && titleLangPasses(s.name) && !isLQ(s))
       .map((s) => tileFor(s, null))
       .filter((t) => t && !isKidBlocked(t));
     const seenH = new Set();
@@ -6741,7 +6751,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
         : members;
       for (const m of ordered) {
         const s = variantHidden.resolve(m);
-        if (!s || !titleLangPasses(s.name) || !allowedCatIds.has(String(s.category_id))) continue;
+        if (!s || !titleLangPasses(s.name) || !allowedCatIds.has(String(s.category_id)) || isLQ(s)) continue;
         const tl = tileFor(s, null);
         if (tl && !isKidBlocked(tl)) { tile = tl; break; }
       }
@@ -6804,7 +6814,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       })
       .filter(Boolean)
       .sort((a, b) => b.added - a.added)
-      .filter(({ s }) => titleLangPasses(s.name) && !variantHidden(s))
+      .filter(({ s }) => titleLangPasses(s.name) && !variantHidden(s) && !isLQ(s))
       .map(({ s }) => tileFor(s))
       .filter((t) => t && isKidSafe(t));
     if (recentTiles.length) {
@@ -6837,7 +6847,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     // the kept copy is the best one: a non-CAM print, then most-voted.
     const seenFamily = new Set();
     const familyTiles = [...indexes[mode].byId.values()]
-      .filter((s) => titleLangPasses(s.name) && !variantHidden(s))
+      .filter((s) => titleLangPasses(s.name) && !variantHidden(s) && !isLQ(s))
       .map((s) => ({ s, t: tmdbFor(s.id) }))
       .filter((x) => x.t && effCert(x.t) && FAMILY_CERTS.has(effCert(x.t)))
       .sort((a, b) => {
@@ -6901,7 +6911,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       if (er.mode !== mode) continue;
       const edTiles = (er.picks || [])
         .map((id) => variantHidden.resolve(ix.byId.get(id) ?? ix.byId.get(parseInt(id, 10))))
-        .filter((s) => s && titleLangPasses(s.name))
+        .filter((s) => s && titleLangPasses(s.name) && !isLQ(s))
         .filter((s) => {
           const key = s.tmdb_id || `id:${s.id}`;
           if (seenEdTmdb.has(key)) return false;
@@ -6975,7 +6985,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       const seenTmdb = new Set();
       for (const s of ix.byId.values()) {
         if (!titleLangPasses(s.name)) continue;
-        if (variantHidden(s)) continue;
+        if (variantHidden(s) || isLQ(s)) continue;
         const t = tmdbBy(s);
         if (!t || t.source === "no-match") continue;
         if (t.tmdb_id) {
@@ -7353,6 +7363,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       if (titleKey && seenTitle.has(titleKey)) continue;
       if (s.tmdb_id && seenTmdb.has(s.tmdb_id)) continue;
       if (isAdultForHero(s)) { seen.add(s.id); continue; }
+      if (isLQ(s)) continue;
       heroPool.push(s); seen.add(s.id);
       if (titleKey) seenTitle.add(titleKey);
       if (s.tmdb_id) seenTmdb.add(s.tmdb_id);
@@ -12887,17 +12898,21 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   if (req.params.mode === "live" && req.params.ext === "m3u8") {
     const key = `${req.params.mode}:${req.params.id}`;
     let verdict = audioCodecCache[key];
-    // Skip only while another probe is in flight. No streamingNow check:
-    // on a channel change the viewer's own previous channel holds the slot,
-    // and skipping would play MP2/AC3 channels direct with no audio.
-    if (!isProbeFresh(verdict) && !anyProbeInflight()) {
-      try {
-        const probed = await Promise.race([
-          probeChannelAudioCodec(req.params.mode, req.params.id),
-          new Promise((resolve) => setTimeout(() => resolve(null), 3500)),
-        ]);
-        if (probed) verdict = probed;
-      } catch {}
+    // Stale-while-revalidate: a known codec verdict (even past its TTL) routes
+    // immediately; only an unknown channel waits, and only up to
+    // LIVE_AUDIO_PROBE_WAIT_MS (the probe keeps running and caches for next
+    // zap). A verdict that arrives late means that one first zap plays direct;
+    // clients recover via BUFFER_CODECS / codec-error -> transcode.
+    const plan = decideLiveAudio({
+      entry: verdict,
+      fresh: isProbeFresh(verdict),
+      sameKeyInflight: audioProbeInflight.has(key),
+      anyInflight: anyProbeInflight(),
+    });
+    if (plan.background) probeChannelAudioCodec(req.params.mode, req.params.id).catch(() => {});
+    if (plan.wait) {
+      const probed = await withDeadline(probeChannelAudioCodec(req.params.mode, req.params.id), LIVE_AUDIO_PROBE_WAIT_MS);
+      if (probed) verdict = probed;
     }
     if (verdict && verdict.audio_codec && !verdict.browser_safe) {
       forceTranscode = true;

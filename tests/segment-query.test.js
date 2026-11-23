@@ -27,7 +27,7 @@ const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
 test("server uses segmentQuery and guards probes", () => {
   assert.match(src, /const qq = segmentQuery\(\{/);
   assert.match(src, /if \(streamingRecently\(actx\)\) return \{ audioTracks: \[\], busy: true \}/);
-  assert.match(src, /!isProbeFresh\(verdict\) && !anyProbeInflight\(\)/);
+  assert.match(src, /anyInflight: anyProbeInflight\(\)/); // live-zap probe guard (decideLiveAudio)
 });
 
 const { streamingRecently } = require("../lib/recent-stream");
