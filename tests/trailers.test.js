@@ -339,12 +339,12 @@ test("GET /api/trailer: allowKey gates keys (404, no download); HEAD never downl
 });
 
 test("trailer key allow-list: known keys only; kids need a title rated within their certs", () => {
-  const idx = buildTrailerKeyIndex([
-    ["movie:1", { source: "tmdb", tmdb_id: 1, trailer_key: "familyK", us_cert: "PG" }],
-    ["movie:2", { source: "tmdb", tmdb_id: 2, trailer_key: "adultK1", us_cert: "R" }],
-    ["movie:3", { source: "tmdb", tmdb_id: 3, trailer_key: "unratedK", us_cert: "" }],
-    ["movie:4", { source: "no-match", tmdb_id: null, trailer_key: "ghostK1" }],
-  ]);
+  const idx = buildTrailerKeyIndex({
+    "movie:1": { source: "tmdb", tmdb_id: 1, trailer_key: "familyK", us_cert: "PG" },
+    "movie:2": { source: "tmdb", tmdb_id: 2, trailer_key: "adultK1", us_cert: "R" },
+    "movie:3": { source: "tmdb", tmdb_id: 3, trailer_key: "unratedK", us_cert: "" },
+    "movie:4": { source: "no-match", tmdb_id: null, trailer_key: "ghostK1" },
+  });
   const kid = new Set(["G", "PG"]);
   assert.ok(trailerKeyAllowed(idx, "familyK", null));
   assert.ok(trailerKeyAllowed(idx, "adultK1", null));
@@ -353,6 +353,30 @@ test("trailer key allow-list: known keys only; kids need a title rated within th
   assert.ok(trailerKeyAllowed(idx, "familyK", kid));
   assert.ok(!trailerKeyAllowed(idx, "adultK1", kid));
   assert.ok(!trailerKeyAllowed(idx, "unratedK", kid));
+});
+
+test("trailer key index: only raw entries with a trailer go through the view; view rejections excluded", () => {
+  const store = {
+    "movie:1": { source: "tmdb", tmdb_id: 1, trailer_key: "keepK01", us_cert: "PG" },
+    "movie:2": { source: "tmdb", tmdb_id: 2, trailer_key: "implaus1", us_cert: "R" },
+    "movie:3": { source: "tmdb", tmdb_id: 3, trailer_key: null },
+    "movie:4": { source: "no-match", tmdb_id: null },
+    "series:5": { source: "tmdb", tmdb_id: 5, trailer_key: "keepK01", us_cert: "TV-MA" },
+  };
+  const viewed = [];
+  const view = (k) => { viewed.push(k); return k === "movie:2" ? { source: "no-match", tmdb_id: null } : store[k]; };
+  const idx = buildTrailerKeyIndex(store, view, (e) => e.us_cert || "");
+  assert.deepEqual(viewed.sort(), ["movie:1", "movie:2", "series:5"]);
+  assert.deepEqual([...idx.keys()], ["keepK01"]);
+  assert.deepEqual([...idx.get("keepK01")].sort(), ["PG", "TV-MA"]);
+});
+
+test("ytDlpEnv passes non-secret proxy/CA settings through", () => {
+  const env = ytDlpEnv("/x/t/k", { PATH: "/bin", HTTPS_PROXY: "http://p:3128", NO_PROXY: "localhost", SSL_CERT_FILE: "/ca.pem", API_TOKEN: "s" });
+  assert.equal(env.HTTPS_PROXY, "http://p:3128");
+  assert.equal(env.NO_PROXY, "localhost");
+  assert.equal(env.SSL_CERT_FILE, "/ca.pem");
+  assert.ok(!("API_TOKEN" in env));
 });
 
 test("yt-dlp gets a minimal environment (no server secrets)", async () => {
@@ -377,6 +401,8 @@ test("server.js wires the trailer route, rail and release_date", () => {
   assert.match(s, /app\.get\("\/api\/trailer\/:key\.mp4", trailerRouteHandler\(\{[\s\S]{0,200}allowKey: /);
   assert.match(s, /title: "New trailers",\s*\n\s*category_id: "__rail-new-trailers"/);
   assert.match(s, /tile\.trailer_key = t\.trailer_key/);
+  // Index miss forces one rebuild before refusing (no first-play 404 from index lag).
+  assert.match(s, /!idx\.has\(key\) && Date\.now\(\) - trailerKeyIdx\.builtAt > 2_000\) idx = trailerKeyIndex\(true\)/);
   assert.match(s, /release_date:\s+\/\^/);
   // The trailer route must sit behind the session-auth middleware.
   const auth = s.indexOf("if (PUBLIC_PATHS.has(req.path)) return next();");

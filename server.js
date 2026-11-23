@@ -6455,7 +6455,6 @@ function maybeWeeklyYtDlpUpdate() {
 function selfUpdateYtDlp(reason) {
   if (ytdlp.updating) return ytdlp.updating;
   ytdlp.lastUpdate = Date.now();
-  try { fs.mkdirSync(path.dirname(YTDLP_STAMP), { recursive: true }); fs.writeFileSync(YTDLP_STAMP, new Date().toISOString()); } catch { /* ignore */ }
   ytdlp.updating = (async () => {
     try {
       if (!fs.existsSync(YTDLP_LOCAL_BIN)) {
@@ -6469,6 +6468,10 @@ function selfUpdateYtDlp(reason) {
         execFile(YTDLP_LOCAL_BIN, ["-U"], { timeout: 180_000 }, (err, out, errOut) => {
           const msg = String(out || errOut || (err && err.message) || "").trim().split("\n").slice(-1)[0];
           console.log(`[trailer] yt-dlp -U (${reason}): ${msg.slice(0, 160)}`);
+          // Stamp only a successful run, so a failed weekly update retries in 6 h.
+          if (!err) {
+            try { fs.mkdirSync(path.dirname(YTDLP_STAMP), { recursive: true }); fs.writeFileSync(YTDLP_STAMP, new Date().toISOString()); } catch { /* ignore */ }
+          }
           resolve();
         });
       });
@@ -6567,7 +6570,7 @@ async function backfillReleaseDates({ reason = "cron", gapMs = 250 } = {}) {
         nulls = 0;
         for (const key of c.keys) {
           const e = tmdbCache[key];
-          if (e && e.source === "tmdb" && e.tmdb_id === c.tmdbId) { applyReleaseInfo(e, c.kind, res); updated++; }
+          if (e && e.source === "tmdb" && e.tmdb_id === c.tmdbId) { applyReleaseInfo(e, c.kind, res); updated++; tmdbCacheVersion++; }
         }
       }
       await new Promise((r) => setTimeout(r, gapMs));
@@ -6585,11 +6588,11 @@ async function backfillReleaseDates({ reason = "cron", gapMs = 250 } = {}) {
 // title rated within their allowed certs. Index rebuilt lazily when the TMDB
 // cache changed (at most every 30 s) and at least every 5 min.
 const trailerKeyIdx = { idx: new Map(), builtAt: 0, version: -1 };
-function trailerKeyIndex() {
+function trailerKeyIndex(force = false) {
   const age = Date.now() - trailerKeyIdx.builtAt;
-  if (age > 5 * 60_000 || (trailerKeyIdx.version !== tmdbCacheVersion && age > 30_000)) {
+  if (force || age > 5 * 60_000 || (trailerKeyIdx.version !== tmdbCacheVersion && age > 30_000)) {
     const version = tmdbCacheVersion;
-    trailerKeyIdx.idx = buildTrailerKeyIndex(Object.keys(tmdbStore).map((k) => [k, tmdbCache[k]]), effCert);
+    trailerKeyIdx.idx = buildTrailerKeyIndex(tmdbStore, (k) => tmdbCache[k], effCert);
     trailerKeyIdx.builtAt = Date.now();
     trailerKeyIdx.version = version;
   }
@@ -6607,7 +6610,14 @@ function kidCertsForProfile(profile) {
 app.get("/api/trailer/:key.mp4", trailerRouteHandler({
   cache: trailerCache,
   available: () => !!ytdlp.bin,
-  allowKey: (key, req) => trailerKeyAllowed(trailerKeyIndex(), key, kidCertsForProfile(findProfile(req.profileId))),
+  allowKey: (key, req) => {
+    let idx = trailerKeyIndex();
+    // A key the index has not seen yet (just added by a TMDB fetch/backfill):
+    // rebuild once (at most every 2 s) before refusing, so a tile's
+    // trailer_key never 404s because of index lag.
+    if (!idx.has(key) && Date.now() - trailerKeyIdx.builtAt > 2_000) idx = trailerKeyIndex(true);
+    return trailerKeyAllowed(idx, key, kidCertsForProfile(findProfile(req.profileId)));
+  },
 }));
 
 app.get("/api/admin/trailers", (req, res) => {
