@@ -27,17 +27,50 @@ test("withDeadline resolves null on timeout and swallows rejection", async () =>
   assert.deepEqual(await withDeadline(Promise.resolve({ a: 1 }), 50), { a: 1 });
 });
 
-const { decideLiveHealth, manifestHasContent, LIVE_UNAVAILABLE } = require("../lib/live-audio-verdict");
+const { decideLiveHealth, applyLiveCheck, deadTtlMs, isPersistentDeadReason, manifestHasContent, LIVE_UNAVAILABLE } = require("../lib/live-audio-verdict");
 const H = 3600e3, M = 60e3, NOW = 1e12;
 
 test("health: no entry proceeds", () => {
   assert.equal(decideLiveHealth({ entry: undefined, now: NOW }).action, "proceed");
 });
-test("health: recent dead -> unavailable; older dead -> check; viewer active skips check", () => {
-  assert.equal(decideLiveHealth({ entry: { dead: true, ts: NOW - 9 * M }, now: NOW }).action, "unavailable");
-  assert.equal(decideLiveHealth({ entry: { dead: true, ts: NOW - 11 * M }, now: NOW }).action, "check");
-  assert.equal(decideLiveHealth({ entry: { dead: true, ts: NOW - 11 * M }, now: NOW, viewerActive: true }).action, "proceed");
-  assert.equal(decideLiveHealth({ entry: { dead: true, ts: NOW - 9 * M }, now: NOW, viewerActive: true }).action, "unavailable");
+test("health: persistent dead honors per-reason TTL; retry bypasses; viewer skips check", () => {
+  const d404 = { dead: true, dead_reason: "http-404", ts: NOW - 9 * M };
+  assert.equal(decideLiveHealth({ entry: d404, now: NOW }).action, "unavailable");
+  assert.equal(decideLiveHealth({ entry: { ...d404, ts: NOW - 11 * M }, now: NOW }).action, "check");
+  const empty = { dead: true, dead_reason: "empty-playlist", ts: NOW - 30e3 };
+  assert.equal(decideLiveHealth({ entry: empty, now: NOW }).action, "unavailable");
+  assert.equal(decideLiveHealth({ entry: { ...empty, ts: NOW - 61e3 }, now: NOW }).action, "check");
+  assert.equal(decideLiveHealth({ entry: d404, now: NOW, retry: true }).action, "check");
+  assert.equal(decideLiveHealth({ entry: d404, now: NOW, retry: true, viewerActive: true }).action, "proceed");
+  // viewerActive + dead + old: no network check, play
+  assert.equal(decideLiveHealth({ entry: { ...d404, ts: NOW - 11 * M }, now: NOW, viewerActive: true }).action, "proceed");
+  // viewerActive + dead + recent still 503 (no network call needed)
+  assert.equal(decideLiveHealth({ entry: d404, now: NOW, viewerActive: true }).action, "unavailable");
+});
+test("health: dead with transient/legacy reason never 503s", () => {
+  for (const r of ["timeout", "fetch-error", "http-403", "http-429", "http-502", undefined]) {
+    assert.equal(decideLiveHealth({ entry: { dead: true, dead_reason: r, ts: NOW - 1000 }, now: NOW }).action, "check");
+  }
+});
+test("dead reasons and TTLs", () => {
+  assert.ok(["empty-playlist", "http-404", "http-410"].every(isPersistentDeadReason));
+  assert.ok(!["timeout", "fetch-error", "http-403", "http-429", "http-500", "empty-manifest"].some(isPersistentDeadReason));
+  assert.equal(deadTtlMs("http-404"), 10 * M);
+  assert.equal(deadTtlMs("empty-playlist"), 60e3);
+});
+test("applyLiveCheck: persistent vs transient vs recovery", () => {
+  const e = { audio_codec: "aac", browser_safe: true, dead: false, ts: 1 };
+  const dead = applyLiveCheck(e, { alive: false, reason: "http-404" }, NOW);
+  assert.equal(dead.kind, "dead"); assert.equal(dead.entry.dead, true); assert.equal(dead.entry.dead_reason, "http-404");
+  for (const r of ["timeout", "fetch-error", "http-403", "http-429", "http-503", "empty-manifest"]) {
+    const t = applyLiveCheck(e, { alive: false, reason: r }, NOW);
+    assert.equal(t.kind, "inconclusive"); assert.equal(t.entry, e);
+    assert.equal(applyLiveCheck(e, { alive: null, reason: r }, NOW).kind, "inconclusive");
+  }
+  assert.equal(applyLiveCheck({ ...e, dead: true, dead_reason: "http-404" }, { alive: null }, NOW).entry, undefined);
+  const ok = applyLiveCheck(e, { alive: true }, NOW);
+  assert.equal(ok.kind, "alive"); assert.equal(ok.entry.live_ts, NOW);
+  assert.equal(applyLiveCheck({ ...e, dead: true, dead_reason: "http-404" }, { alive: true }, NOW).kind, "recovered");
 });
 test("health: alive stale >24h -> check, fresh proceeds, live_ts counts", () => {
   assert.equal(decideLiveHealth({ entry: { audio_codec: "aac", ts: NOW - 25 * H }, now: NOW }).action, "check");
@@ -49,5 +82,10 @@ test("manifest content detection and 503 contract", () => {
   assert.equal(manifestHasContent("#EXTM3U\n#EXT-X-VERSION:3\n"), false);
   assert.equal(manifestHasContent("#EXTM3U\n#EXTINF:4.0,\nseg.ts\n"), true);
   assert.equal(manifestHasContent("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n"), true);
+  assert.equal(manifestHasContent("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhttp://x/rel/v.m3u8\n"), true); // master
+  assert.equal(manifestHasContent("#EXTM3U\n#EXT-X-ENDLIST\n"), false);
+  assert.equal(manifestHasContent("#EXTM3U\n#EXT-X-PART-INF:PART-TARGET=0.5\n#EXTINF:4.0,\na.ts\n#EXT-X-PART:DURATION=0.5,URI=\"p.ts\"\n"), true); // LL-HLS
+  assert.equal(manifestHasContent("<html><body>Not found</body></html>"), false);
+  assert.equal(manifestHasContent(undefined), false);
   assert.equal(LIVE_UNAVAILABLE.error, "channel_unavailable");
 });

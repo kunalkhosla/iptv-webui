@@ -28,3 +28,32 @@ test("console patch redacts strings and Errors", () => {
   assert.equal(out[0][0], "x http://h/live/<u>/<p>/5.m3u8");
   assert.ok(!out[0][1].message.includes("u1"));
 });
+
+test("only provider-shaped paths are redacted", () => {
+  assert.equal(redactUrl("/api/series/12/season/3/x"), "/api/series/12/season/3/x");
+  assert.equal(redactUrl("GET /media/series/Show/Season1/ep1.mkv"), "GET /media/series/Show/Season1/ep1.mkv");
+  assert.equal(redactUrl("http://h:8080/series/u/p/12.mkv"), "http://h:8080/series/<u>/<p>/12.mkv");
+  assert.equal(redactUrl("src /live/u/p/9.ts"), "src /live/<u>/<p>/9.ts");
+});
+test("JSON-shaped credentials", () => {
+  assert.equal(redactUrl('{"username":"bob","password":"s3"}'), '{"username":"<u>","password":"<p>"}');
+});
+test("objects with credentials are logged redacted; clean objects untouched", () => {
+  const { redactArg } = require("../lib/redact");
+  const clean = { a: 1 };
+  assert.equal(redactArg(clean), clean);
+  const out = redactArg({ url: "http://h/live/bob/pw/1.m3u8", nested: [1] });
+  assert.equal(typeof out, "string");
+  assert.ok(!out.includes("bob") && !out.includes("pw/"));
+});
+test("errors: cause scrubbed, frozen errors copied not mutated", () => {
+  const { redactArg } = require("../lib/redact");
+  const inner = new Error("x http://h/live/bob/pw/1.m3u8");
+  const outer = new Error("wrap", { cause: inner });
+  redactArg(outer);
+  assert.ok(!outer.cause.message.includes("bob"));
+  const frozen = Object.freeze(new Error("y http://h/movie/bob/pw/1.mkv"));
+  const out = redactArg(frozen);
+  assert.ok(!out.message.includes("bob"));
+  assert.ok(frozen.message.includes("bob")); // original untouched
+});

@@ -489,7 +489,7 @@ async function probePanel(host, user, pass) {
     if (Number(data.user_info.auth) !== 1) return { ok: false, reason: "auth=0" };
     return { ok: true, account: data };
   } catch (e) {
-    return { ok: false, reason: e.message };
+    return { ok: false, reason: redactAllUrls(e.message) };
   }
 }
 
@@ -834,10 +834,9 @@ const PROBE_ALIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // inside the probe before marking dead, so a confirmed-dead verdict
 // is already "3 consecutive fails", which justifies caching it for
 // a few minutes rather than re-probing every refresh.
-const PROBE_DEAD_TTL_MS  = 5 * 60 * 1000;
 function isProbeFresh(entry) {
   if (!entry || typeof entry.ts !== "number") return false;
-  const ttl = entry.dead ? PROBE_DEAD_TTL_MS : PROBE_ALIVE_TTL_MS;
+  const ttl = entry.dead ? deadTtlMs(entry.dead_reason) : PROBE_ALIVE_TTL_MS;
   return Date.now() - entry.ts < ttl;
 }
 const audioProbeInflight = new Map();
@@ -885,40 +884,35 @@ async function probeManifestLiveness(direct) {
   }
   return { alive: false, reason: lastReason };
 }
-// Liveness-only refresh of a cached verdict: ONE manifest GET (2.5 s), coalesced
-// per channel. Returns the verdict to route on (a dead entry, an alive entry with
-// live_ts bumped, or undefined when a previously-dead channel recovered and the
-// codec must be re-probed).
+// Liveness-only refresh of a cached verdict, coalesced per channel. One GET
+// (2.5 s); only a PERSISTENT failure (empty-playlist / 404 / 410) is confirmed
+// with a second GET before it counts as dead. Timeouts, fetch errors, 403, 429,
+// 5xx and blank bodies are inconclusive: nothing is cached and the caller plays.
+// Resolves { kind: "dead"|"recovered"|"alive"|"inconclusive", entry }.
 const LIVE_CHECK_TIMEOUT_MS = 2500;
 const liveCheckInflight = new Map();
 function refreshLiveLiveness(key, direct, entry) {
   if (liveCheckInflight.has(key)) return liveCheckInflight.get(key);
   const p = (async () => {
-    const v = await _probeManifestOnce(direct, LIVE_CHECK_TIMEOUT_MS);
-    const now = Date.now();
-    if (!v.alive) {
-      const dead = { ...(entry || {}), audio_codec: entry?.audio_codec ?? null, browser_safe: !!entry?.browser_safe,
-        dead: true, dead_reason: v.reason, ts: now, live_ts: now };
-      audioCodecCache[key] = dead;
-      scheduleAudioCodecCacheSave();
-      return dead;
+    let v = await _probeManifestOnce(direct, LIVE_CHECK_TIMEOUT_MS);
+    if (!v.alive && isPersistentDeadReason(v.reason)) {
+      await new Promise((r) => setTimeout(r, 600));
+      const v2 = await _probeManifestOnce(direct, LIVE_CHECK_TIMEOUT_MS);
+      v = v2.alive ? v2 : (isPersistentDeadReason(v2.reason) ? v2 : { alive: null, reason: v2.reason });
+    } else if (!v.alive) {
+      v = { alive: null, reason: v.reason };
     }
-    if (entry && entry.dead) {
-      // Recovered: the codec is unknown, drop the entry so the normal path re-probes.
-      delete audioCodecCache[key];
-      scheduleAudioCodecCacheSave();
-      return undefined;
-    }
-    if (entry) {
-      entry.live_ts = now;
-      scheduleAudioCodecCacheSave();
-    }
-    return entry;
+    const out = applyLiveCheck(entry, v);
+    if (out.kind === "dead") audioCodecCache[key] = out.entry;
+    else if (out.kind === "recovered") delete audioCodecCache[key];
+    else if (out.kind === "alive" && out.entry) audioCodecCache[key] = out.entry;
+    if (out.kind !== "inconclusive") scheduleAudioCodecCacheSave();
+    return out;
   })().finally(() => liveCheckInflight.delete(key));
   liveCheckInflight.set(key, p);
   return p;
 }
-function probeChannelAudioCodec(mode, id, actx = currentAccount()) {
+function probeChannelAudioCodec(mode, id, actx = currentAccount(), { skipLiveness = false } = {}) {
   const key = `${mode}:${id}`;
   if (audioProbeInflight.has(key)) return audioProbeInflight.get(key);
   const direct = streamUrl(mode, id, "m3u8", actx);
@@ -927,7 +921,12 @@ function probeChannelAudioCodec(mode, id, actx = currentAccount()) {
     // means ffprobe would just block until our 6s timeout — wasteful
     // and starves the parallel-probe queue. Cheap manifest fetch
     // first; ffprobe only runs on confirmed-alive channels.
-    const live = await probeManifestLiveness(direct);
+    const live = skipLiveness ? { alive: true } : await probeManifestLiveness(direct);
+    if (!live.alive && !isPersistentDeadReason(live.reason)) {
+      // Inconclusive (timeout / 403 / 5xx / blank): don't cache, don't call it dead.
+      audioProbeInflight.delete(key);
+      return null;
+    }
     if (!live.alive) {
       const entry = {
         audio_codec: null,
@@ -2500,7 +2499,7 @@ const { altCertFromTmdb, familyHeuristicCert } = require("./lib/alt-cert");
 const { createPrewarmQueue, buildDetailEntries } = require("./lib/prewarm-queue");
 const { xtreamKey: xtreamKeyFor } = require("./lib/xtream-key");
 const { isLowQuality, lowQualityLast } = require("./lib/low-quality");
-const { decideLiveAudio, withDeadline, decideLiveHealth, manifestHasContent, LIVE_UNAVAILABLE } = require("./lib/live-audio-verdict");
+const { decideLiveAudio, withDeadline, decideLiveHealth, applyLiveCheck, isPersistentDeadReason, deadTtlMs, manifestHasContent, LIVE_UNAVAILABLE } = require("./lib/live-audio-verdict");
 const LIVE_AUDIO_PROBE_WAIT_MS = (() => { const n = parseInt(process.env.LIVE_AUDIO_PROBE_WAIT_MS ?? "", 10); return Number.isFinite(n) && n >= 0 ? n : 3500; })();
 const { segmentQuery } = require("./lib/segment-query");
 const { liveHlsListSize, panelReconnectArgs, liveTolerantArgs } = require("./lib/live-hls");
@@ -4913,7 +4912,7 @@ async function runDownloadJob(job) {
     const startedAt = Date.now();
     let lastUs = -1;
     ff.stdout.on("data", (c) => { const m = /out_time_us=(\d+)/.exec(String(c)); if (m && Number(m[1]) > lastUs) { lastUs = Number(m[1]); lastAdvance = Date.now(); } });
-    ff.on("error", (e) => { clearInterval(wd); resolve({ code: -1, err: e.message }); });
+    ff.on("error", (e) => { clearInterval(wd); resolve({ code: -1, err: redactAllUrls(e.message) }); });
     ff.on("close", (code) => { clearInterval(wd); resolve({ code, err }); });
   });
   const useHw0 = HW_ENCODE && !hwDecodeFailed.has(`${mode}:${id}`);
@@ -12944,17 +12943,26 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   if (req.params.mode === "live" && req.params.ext === "m3u8") {
     const key = `${req.params.mode}:${req.params.id}`;
     let verdict = audioCodecCache[key];
-    // Fail fast on dead/empty channels (see decideLiveHealth): a recently-dead
-    // verdict answers 503 immediately; stale (>24h alive / >10min dead)
-    // verdicts get ONE bounded manifest GET first, unless a viewer is active.
-    const health = decideLiveHealth({ entry: verdict, now: Date.now(), viewerActive: streamingRecently(currentAccount()) });
+    // Fail fast on dead/empty channels (see decideLiveHealth). A persistent-dead
+    // verdict inside its TTL answers 503 with no network call; `?retry=1` (the
+    // clients' Retry) bypasses it once. Any network check/probe is skipped while
+    // ANY viewer is streaming (cap=1 account) -- then we just play, as before.
+    const viewerActive = streamingNow(null);
+    const health = decideLiveHealth({ entry: verdict, now: Date.now(), viewerActive, retry: req.query.retry === "1" });
     if (health.action === "unavailable") {
       return res.status(503).json(LIVE_UNAVAILABLE);
     }
-    if (health.action === "check") {
-      verdict = await refreshLiveLiveness(key, direct, verdict);
-      if (verdict && verdict.dead) return res.status(503).json(LIVE_UNAVAILABLE);
+    let skipProbe = viewerActive;
+    let livenessVerified = false;
+    if (health.action === "check" && !audioProbeInflight.has(key)) {
+      const out = await refreshLiveLiveness(key, direct, verdict);
+      if (out.kind === "dead") return res.status(503).json(LIVE_UNAVAILABLE);
+      verdict = out.entry;
+      if (out.kind === "recovered") livenessVerified = true;
+      if (out.kind === "inconclusive") skipProbe = true; // don't hammer a flapping panel; play
     }
+    // An unrechecked dead verdict never blocks playback or routes audio.
+    if (verdict && verdict.dead) verdict = undefined;
     // Stale-while-revalidate: a known codec verdict (even past its TTL) routes
     // immediately; only an unknown channel waits, and only up to
     // LIVE_AUDIO_PROBE_WAIT_MS (default 3500; the probe keeps running and
@@ -12966,9 +12974,9 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
       sameKeyInflight: audioProbeInflight.has(key),
       anyInflight: anyProbeInflight(),
     });
-    if (plan.wait) {
+    if (plan.wait && !skipProbe) {
       try {
-        const probed = await withDeadline(probeChannelAudioCodec(req.params.mode, req.params.id), LIVE_AUDIO_PROBE_WAIT_MS);
+        const probed = await withDeadline(probeChannelAudioCodec(req.params.mode, req.params.id, undefined, { skipLiveness: livenessVerified }), LIVE_AUDIO_PROBE_WAIT_MS);
         if (probed) verdict = probed;
       } catch {}
       if (verdict && verdict.dead) return res.status(503).json(LIVE_UNAVAILABLE);
@@ -13292,7 +13300,7 @@ app.get(/^\/(live|movie|series|disk|hindi)(\/.*)?$/, (_req, res) => {
 
 app.use((err, _req, res, _next) => {
   console.error(err);
-  res.status(500).json({ error: err.message });
+  res.status(500).json({ error: redactAllUrls(err && err.message) });
 });
 
 app.listen(PORT, async () => {
