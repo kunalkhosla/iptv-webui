@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { pickLogo, logoUrl, logoBackfillCandidates, applyLogo } = require("../lib/title-logos");
+const { createLazyGate, pickLogo, logoUrl, logoBackfillCandidates, applyLogo } = require("../lib/title-logos");
 
 const L = (file_path, iso_639_1, vote_average, width) => ({ file_path, iso_639_1, vote_average, width, height: 100 });
 
@@ -61,4 +61,16 @@ test("kind comes from tmdb_kind, not the key prefix (movie key holding a TV id)"
 test("candidates sorted by popularity", () => {
   const entries = [["movie:1", { source: "tmdb", tmdb_id: 1, popularity: 5 }], ["movie:2", { source: "tmdb", tmdb_id: 2, popularity: 50 }]];
   assert.deepEqual(logoBackfillCandidates({ entries }).map((x) => x.tmdbId), [2, 1]);
+});
+
+test("lazy gate: global gap, one in flight per id, failure cooldown", () => {
+  const g = createLazyGate({ gapMs: 300, cooldownMs: 1000 });
+  assert.ok(g.tryStart("a", 1000));
+  assert.ok(!g.tryStart("b", 1100), "global gap");
+  assert.ok(!g.tryStart("a", 2000), "in flight");
+  g.done("a");
+  assert.ok(g.tryStart("a", 2000));
+  g.fail("a", 2000);
+  assert.ok(!g.tryStart("a", 2500), "cooldown");
+  assert.ok(g.tryStart("a", 3001), "cooldown over");
 });

@@ -597,7 +597,7 @@ const inflight = new Map();
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const { entryKind } = require("./lib/new-trailers");
-const { pickLogo, logoUrl, logoBackfillCandidates, applyLogo } = require("./lib/title-logos");
+const { createLazyGate, pickLogo, logoUrl, logoBackfillCandidates, applyLogo } = require("./lib/title-logos");
 const { pickTrailerKey, selectNewTrailers, backfillCandidates, applyReleaseInfo, buildTrailerKeyIndex, trailerKeyAllowed } = require("./lib/new-trailers");
 // Last good get_vod_info / get_series_info per title, for stale-if-error
 // on the detail endpoint (survives restarts, unlike `cache`).
@@ -6621,7 +6621,7 @@ async function backfillLogos({ reason = "cron", gapMs = 300, max = 300 } = {}) {
         nulls = 0;
         for (const key of c.keys) {
           const e = tmdbCache[key];
-          if (e && e.source === "tmdb" && e.tmdb_id === c.tmdbId) { applyLogo(e, { images: res }); updated++; tmdbCacheVersion++; }
+          if (e && e.source === "tmdb" && e.tmdb_id === c.tmdbId) { applyLogo(e, { images: res }); updated++; }
         }
       }
       await new Promise((r) => setTimeout(r, gapMs));
@@ -9665,24 +9665,26 @@ app.get("/api/subtitles/:mode(movie|series)/:id(\\d{1,12})/:lang(en|hi).vtt", as
 // Fill a missing `logo` on demand (one images call per tmdb_id, never more
 // than one in flight per id and at most one lazy call per 300 ms globally),
 // so a title someone is looking at doesn't wait for the cron backfill.
-const logoLazy = { last: 0, inflight: new Set() };
+const logoGate = createLazyGate();
+let logoSaveTimer = null;
 async function lazyFillLogo(key, entry) {
   if (!entry || entry.source !== "tmdb" || !entry.tmdb_id || "logo" in entry) return;
-  const now = Date.now();
-  if (now - logoLazy.last < 300) return;
+  // disk: entries are movie-shaped unless stamped tmdb_kind "series" (entryKind).
   const kind = entryKind(key, entry) || (key.startsWith("disk:") ? "movie" : null);
   if (!kind) return;
   const fid = `${kind}:${entry.tmdb_id}`;
-  if (logoLazy.inflight.has(fid)) return;
-  logoLazy.last = now; logoLazy.inflight.add(fid);
-  try {
-    const res = await tmdbRaw(`/${kind === "series" ? "tv" : "movie"}/${entry.tmdb_id}/images?include_image_language=en,null`);
-    if (res === null) return;
-    applyLogo(entry, { images: res });
-    const raw = tmdbCache[key];
-    if (raw && raw !== entry && raw.source === "tmdb" && raw.tmdb_id === entry.tmdb_id) applyLogo(raw, { images: res });
-    tmdbCacheVersion++; scheduleTmdbCacheSave();
-  } finally { logoLazy.inflight.delete(fid); }
+  if (!logoGate.tryStart(fid)) return;
+  const res = await tmdbRaw(`/${kind === "series" ? "tv" : "movie"}/${entry.tmdb_id}/images?include_image_language=en,null`);
+  if (res === null) { logoGate.fail(fid); return; }
+  logoGate.done(fid);
+  applyLogo(entry, { images: res });
+  const raw = tmdbCache[key];
+  if (raw && raw !== entry && raw.source === "tmdb" && raw.tmdb_id === entry.tmdb_id) applyLogo(raw, { images: res });
+  // Coalesced persist: the store is huge, so never save per fill.
+  if (!logoSaveTimer) {
+    logoSaveTimer = setTimeout(() => { logoSaveTimer = null; scheduleTmdbCacheSave(); }, 45_000);
+    logoSaveTimer.unref?.();
+  }
 }
 app.get("/api/poster/:mode(movie|series|disk)/:id", async (req, res, next) => {
   try {
@@ -9696,7 +9698,8 @@ app.get("/api/poster/:mode(movie|series|disk)/:id", async (req, res, next) => {
     // OkHttp disk cache picks this up to avoid network round-trips
     // when the user re-opens the same title.
     res.set("Cache-Control", "private, max-age=600");
-    await lazyFillLogo(`${mode}:${id}`, entry);
+    // Fire-and-forget: the logo shows up on the next poster fetch.
+    lazyFillLogo(`${mode}:${id}`, entry).catch(() => {});
     res.json(tmdbToResponse(entry));
   } catch (e) { next(e); }
 });

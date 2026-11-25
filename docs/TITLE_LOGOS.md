@@ -22,3 +22,13 @@ instead of the plain-text title on hero/detail screens.
 
 Logos are often white or black lettering with transparency; clients should show
 them on a scrim/dark area and fall back to the text title when `logo` is null.
+
+## Lazy fill
+
+`/api/poster` also fills a missing `logo` on demand, fire-and-forget (the
+response never waits; the logo appears on the next poster fetch). Gate: one
+TMDB call per 300 ms globally, one in flight per tmdb_id, 5 min cooldown per id
+after a failure. A burst of poster hits therefore resolves a few titles per
+second; the rest wait for the cron backfill. Persistence is coalesced (one
+cache save per 45 s), never per fill. `disk:` entries are treated as movies
+unless stamped `tmdb_kind: "series"`.
