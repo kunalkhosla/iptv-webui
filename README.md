@@ -125,6 +125,10 @@ MCP_PUBLIC_URL=https://iptv.example.com
   the server skips the audio-codec ffprobe.
 - Each call logs one `[zap]` line with total, check and probe timings.
 
+## Title logos
+
+TMDB title-logo art is cached per title and exposed as `logo` (full w500 PNG URL or `null`) on `/api/poster/:mode/:id` and on home `hero[]` items. See [docs/TITLE_LOGOS.md](docs/TITLE_LOGOS.md).
+
 ## Native trailers (`/api/trailer/:key.mp4`)
 
 Trailers play inside the apps instead of opening YouTube. Details and the

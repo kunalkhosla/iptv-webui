@@ -596,6 +596,7 @@ const inflight = new Map();
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 fs.mkdirSync(DATA_DIR, { recursive: true });
+const { pickLogo, logoUrl, logoBackfillCandidates, applyLogo } = require("./lib/title-logos");
 const { pickTrailerKey, selectNewTrailers, backfillCandidates, applyReleaseInfo, buildTrailerKeyIndex, trailerKeyAllowed } = require("./lib/new-trailers");
 // Last good get_vod_info / get_series_info per title, for stale-if-error
 // on the detail endpoint (survives restarts, unlike `cache`).
@@ -1506,6 +1507,7 @@ function projectTmdbDetail(mode, detail, baseTitle) {
     directors,
     keywords,
     trailer_key:   trailerKey,
+    logo:          pickLogo(detail.images),
     reviews,
     recommendations: recIds,
     similar:       similarIds,
@@ -1545,6 +1547,7 @@ function tmdbToResponse(entry) {
     directors:   entry.directors || [],
     keywords:    entry.keywords || [],
     trailer_key: entry.trailer_key || null,
+    logo:        logoUrl(entry.logo),
     release_date: entry.release_date || null,
     reviews:     entry.reviews || [],
     recommendations: entry.recommendations || [],
@@ -1788,7 +1791,7 @@ async function findTmdbMatch(mode, name, hintYear, langHint, forcedKind) {
     // reviews + keywords + recommendations + similar + external_ids
     // into one call (TMDB allows up to 20 appends).
     const detailAction = effMode !== "series" ? `/movie/${pick.id}` : `/tv/${pick.id}`;
-    const detail = await tmdb(detailAction, { append_to_response: TMDB_DETAIL_APPENDS(effMode) });
+    const detail = await tmdb(detailAction, { append_to_response: TMDB_DETAIL_APPENDS(effMode), include_image_language: "en,null" });
     const projected = projectTmdbDetail(effMode, detail || pick, cleaned);
     // Stamped so a later refetchTmdbDetail (cert backfill, cache-schema
     // upgrade) knows this entry is TV-shaped even though its cache key is
@@ -1810,6 +1813,7 @@ const TMDB_DETAIL_APPENDS = (mode) => {
     cert,
     "credits",
     "videos",
+    "images",
     "reviews",
     "keywords",
     "recommendations",
@@ -1830,7 +1834,7 @@ const TMDB_DETAIL_APPENDS = (mode) => {
 async function refetchTmdbDetail(mode, tmdbId, kindOverride) {
   const effMode = kindOverride || mode;
   const detailAction = effMode !== "series" ? `/movie/${tmdbId}` : `/tv/${tmdbId}`;
-  const detail = await tmdb(detailAction, { append_to_response: TMDB_DETAIL_APPENDS(effMode) });
+  const detail = await tmdb(detailAction, { append_to_response: TMDB_DETAIL_APPENDS(effMode), include_image_language: "en,null" });
   if (!detail) return null;
   const projected = projectTmdbDetail(effMode, detail, detail.title || detail.name || "");
   if (projected && kindOverride) projected.tmdb_kind = kindOverride;
@@ -6536,6 +6540,8 @@ function scheduleTrailers() {
   setTimeout(evict, 60_000).unref?.();
   const t2 = setInterval(evict, 6 * 3600_000); t2.unref?.();
   setTimeout(() => backfillReleaseDates({ reason: "boot" }).catch((e) => console.warn(`[trailer] backfill: ${e.message}`)), 5 * 60_000).unref?.();
+  setTimeout(() => backfillLogos({ reason: "boot" }).catch((e) => console.warn(`[logo] backfill: ${e.message}`)), 8 * 60_000).unref?.();
+  const t4 = setInterval(() => backfillLogos().catch((e) => console.warn(`[logo] backfill: ${e.message}`)), 3 * 3600_000); t4.unref?.();
   const t3 = setInterval(() => backfillReleaseDates().catch((e) => console.warn(`[trailer] backfill: ${e.message}`)), 6 * 3600_000); t3.unref?.();
 }
 
@@ -6585,6 +6591,48 @@ async function backfillReleaseDates({ reason = "cron", gapMs = 250 } = {}) {
   }
 }
 
+// Lazy backfill of title-logo art (`logo`) for TMDB cache entries written
+// before it existed. Library titles only, one TMDB call per tmdb_id with a
+// gap, capped per run (the rest on later runs) so TMDB is never hammered.
+const logoBackfill = { running: false, done: 0, total: 0 };
+async function backfillLogos({ reason = "cron", gapMs = 300, max = 300 } = {}) {
+  if (!TMDB_API_KEY) return { ok: false, error: "no TMDB_API_KEY" };
+  if (logoBackfill.running) return { ok: false, error: "already running" };
+  logoBackfill.running = true;
+  try {
+    const entries = [];
+    for (const m of ["movie", "series"]) {
+      const ix = indexes[m];
+      if (!ix?.byId) continue;
+      for (const s of ix.byId.values()) { const key = `${m}:${s.id}`; entries.push([key, tmdbCache[key]]); }
+    }
+    const todo = logoBackfillCandidates({ entries, max });
+    logoBackfill.done = 0; logoBackfill.total = todo.length;
+    if (!todo.length) return { ok: true, checked: 0 };
+    console.log(`[logo] backfill: ${todo.length} titles (${reason})`);
+    let updated = 0, nulls = 0;
+    for (const c of todo) {
+      const res = await tmdbRaw(`/${c.kind === "series" ? "tv" : "movie"}/${c.tmdbId}/images?include_image_language=en,null`);
+      logoBackfill.done++;
+      if (res === null) {
+        if (++nulls >= 20) { console.warn("[logo] TMDB failing repeatedly — stopping backfill"); break; }
+      } else {
+        nulls = 0;
+        for (const key of c.keys) {
+          const e = tmdbCache[key];
+          if (e && e.source === "tmdb" && e.tmdb_id === c.tmdbId) { applyLogo(e, { images: res }); updated++; tmdbCacheVersion++; }
+        }
+      }
+      await new Promise((r) => setTimeout(r, gapMs));
+    }
+    if (updated) { scheduleTmdbCacheSave(); catalogGen++; }
+    console.log(`[logo] backfill done: ${logoBackfill.done} fetched, ${updated} entries updated`);
+    return { ok: true, checked: logoBackfill.done, updated };
+  } finally {
+    logoBackfill.running = false;
+  }
+}
+
 // Only keys that are the TMDB trailer of a cached title are served (no
 // arbitrary YouTube downloads); kid profiles additionally need one such
 // title rated within their allowed certs. Index rebuilt lazily when the TMDB
@@ -6625,6 +6673,12 @@ app.get("/api/trailer/:key.mp4", trailerRouteHandler({
 app.get("/api/admin/trailers", (req, res) => {
   if (!requireOwner(req, res)) return;
   res.json({ ytdlp: { bin: ytdlp.bin, version: ytdlp.version }, cache: trailerCache.stats(), prefetch: { ...trailerPrefetch.stats, queued: trailerPrefetch.size }, backfill: releaseBackfill });
+});
+app.post("/api/admin/backfill-logos", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  if (logoBackfill.running) return res.json({ ok: false, error: "already running", progress: logoBackfill });
+  backfillLogos({ reason: "admin" }).catch((e) => console.warn(`[logo] backfill: ${e.message}`));
+  res.json({ ok: true, started: true });
 });
 app.post("/api/admin/backfill-release-dates", (req, res) => {
   if (!requireOwner(req, res)) return;
@@ -6739,6 +6793,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       rating: t?.rating || null,
       runtime: t?.runtime || null,
       us_cert: effCert(t) || null,
+      logo: logoUrl(t?.logo),
       isSeriesGroup: s.isSeriesGroup || undefined,
     };
   };
