@@ -5105,6 +5105,7 @@ const dlq = createDownloadQueue({ maxActive: 12, maxPerProfile: 5, maxPending: 5
 const dlJobs = dlq.jobs;    // "mode_id" -> job
 const dlQueue = dlq.queue;
 let dlRunning = false;
+let dlCurrent = null; // the job runDownloadJob is working on (for the queued-behind-a-waiting-job view)
 const DL_ID_RE = /^\d{1,12}$/;
 const dlKey = (mode, id) => {
   if (!/^(movie|series)$/.test(mode) || !DL_ID_RE.test(String(id))) throw new Error("bad download id");
@@ -5113,7 +5114,8 @@ const dlKey = (mode, id) => {
 const dlFile = (k) => path.join(DL_DIR, `${k}.mp4`);
 const dlSrcPath = (k) => path.join(DL_DIR, `${k}.src.part`);
 const dlOutPath = (k) => path.join(DL_DIR, `${k}.out.part.mp4`);
-const DL_MAX_JOB_AGE_MS = 24 * 3600 * 1000;
+const DL_MAX_JOB_AGE_MS = 24 * 3600 * 1000;       // measured from when the job STARTS running
+const DL_MAX_QUEUE_AGE_MS = 3 * 24 * 3600 * 1000; // measured from when it was queued
 const DL_BATCH_MAX = 10;
 // Batch items beyond the active caps wait here (insertion-ordered = FIFO) and
 // are promoted from dlPump's finally / cancel. key -> {mode,id,actx,profileId}.
@@ -5140,9 +5142,12 @@ function dlView(mode, id) {
   if (!j && dlPending.has(k)) return { state: "queued", pct: 0, stage: "queued", bytes: 0, error: null, queue_position: dlq.position(k) };
   if (!j) return { state: "none" };
   if (j.state === "ready") { dlJobs.delete(k); return { state: "none" }; } // file vanished
+  // Machine-readable reason a job is not progressing: it (or the job it is queued behind) yields to a live viewer.
+  const waitingFor = j.stage === "waiting-for-viewer" || (j.state === "queued" && dlCurrent && dlCurrent !== j && dlCurrent.stage === "waiting-for-viewer") ? "viewer" : null;
   return {
     state: j.state, pct: Math.max(0, Math.min(99, Math.round(j.pct || 0))), stage: j.stage || null,
     bytes: j.bytes || 0, error: j.error || null, queue_position: dlq.position(k),
+    ...(waitingFor ? { waiting_for: waitingFor } : {}),
   };
 }
 // Start (or report) a job. `deferWhenCapped`: instead of failing when the caps
@@ -5166,7 +5171,7 @@ function dlPump() {
   if (dlRunning) return;
   const job = dlQueue.shift();
   if (!job) return;
-  dlRunning = true;
+  dlRunning = true; dlCurrent = job;
   runDownloadJob(job)
     .catch((e) => { job.state = "failed"; job.error = redactAllUrls(e.message); console.warn(`[download] ${job.key} crashed: ${redactUrl(e.message)}`); })
     .finally(() => {
@@ -5175,7 +5180,7 @@ function dlPump() {
       if (job.state !== "ready") { try { fs.rmSync(dlOutPath(job.key), { force: true }); } catch {} }
       if (job.state === "failed" || job.cancelled) { try { fs.rmSync(dlSrcPath(job.key), { force: true }); } catch {} }
       if (job.cancelled) dlq.dropJob(job);
-      dlRunning = false; pruneDownloadCache(); dlPromotePending(); dlPump(); });
+      dlRunning = false; dlCurrent = null; pruneDownloadCache(); dlPromotePending(); dlPump(); });
 }
 function pruneDownloadCache() {
   try {
@@ -5200,6 +5205,7 @@ const redactUrls = redactAllUrls;
 
 async function runDownloadJob(job) {
   const { mode, id, actx, key } = job;
+  job.startedAt = Date.now();
   const freeBytes = diskDownloadFreeBytes(DL_DIR);
   if (freeBytes == null || freeBytes < DL_MIN_FREE_BYTES) {
     job.state = "failed"; job.error = "server disk almost full"; return;
@@ -5213,19 +5219,26 @@ async function runDownloadJob(job) {
   let sourceUrl = null;
   let fetchNo = 0;
   const mb = (n) => (n / 1048576).toFixed(1);
+  const waitForViewer = async () => {
+    if (job.stage !== "waiting-for-viewer") console.log(`[download] ${mode} ${id} waiting for viewer`);
+    job.state = "waiting"; job.stage = "waiting-for-viewer";
+    await sleep(DISK_DOWNLOAD_DISPLACED_RETRY_MS);
+  };
   const fetchT0 = Date.now();
   for (let attempt = 0; attempt <= DL_MAX_FETCH_RETRIES && !fetched;) {
     if (job.cancelled) return;
-    if (Date.now() - job.createdAt > DL_MAX_JOB_AGE_MS) { job.state = "failed"; job.error = "timed out waiting for the provider connection"; return; }
-    job.stage = "fetching";
+    if (Date.now() - job.createdAt > DL_MAX_QUEUE_AGE_MS) { job.state = "failed"; job.error = "timed out: download sat in the queue for over 3 days"; return; }
+    if (Date.now() - job.startedAt > DL_MAX_JOB_AGE_MS) { job.state = "failed"; job.error = "timed out waiting for the provider connection"; return; }
     // Never touch the provider while someone else holds the slot (newest-wins would evict the viewer).
     const slotHeld = [...streams.entries()].some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced);
-    if (slotHeld) { job.state = "waiting"; job.stage = "waiting-for-viewer"; await sleep(DISK_DOWNLOAD_DISPLACED_RETRY_MS); continue; }
+    if (slotHeld) { await waitForViewer(); continue; }
     const ac = new AbortController();
     const killer = () => ac.abort();
     const admission = admitStream(owner, mode, id, killer, accountKey);
-    if (!admission.ok) { job.state = "waiting"; job.stage = "waiting-for-viewer"; await sleep(DISK_DOWNLOAD_DISPLACED_RETRY_MS); continue; }
+    if (!admission.ok) { await waitForViewer(); continue; }
     job.abort = () => ac.abort();
+    if (job.stage === "waiting-for-viewer") console.log(`[download] ${mode} ${id} resumed after viewer`);
+    job.stage = "fetching";
     job.state = "running";
     let startByte = 0;
     try { startByte = fs.statSync(srcPath).size; } catch {}
@@ -5275,7 +5288,7 @@ async function runDownloadJob(job) {
       streams.delete(owner);
       if (job.cancelled) return;
       if (e.fatal) { job.state = "failed"; job.error = redactUrls(e.message); return; }
-      if (ac.signal.aborted) { job.state = "waiting"; job.stage = "waiting-for-viewer"; await sleep(DISK_DOWNLOAD_DISPLACED_RETRY_MS); continue; } // a viewer arrived: resume later
+      if (ac.signal.aborted) { await waitForViewer(); continue; } // a viewer arrived: resume later
       let grew = false;
       try { grew = fs.statSync(srcPath).size > before; } catch {}
       if (grew) attempt = 0; else attempt++;

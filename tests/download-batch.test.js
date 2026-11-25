@@ -85,3 +85,15 @@ test("server wiring: batch route validates ids, caps are 5/12, one runner", () =
   assert.match(S, /if \(dlRunning\) return;/);
   assert.doesNotMatch(S, /state: "pending"/);
 });
+
+test("download status: waiting_for viewer field, startedAt-based age cap, log lines", () => {
+  assert.match(S, /waiting_for: waitingFor/);
+  assert.match(S, /dlCurrent = job;/);
+  assert.match(S, /dlCurrent = null;/);
+  assert.match(S, /job\.startedAt = Date\.now\(\);/);
+  assert.match(S, /Date\.now\(\) - job\.startedAt > DL_MAX_JOB_AGE_MS/);
+  assert.doesNotMatch(S, /Date\.now\(\) - job\.createdAt > DL_MAX_JOB_AGE_MS/);
+  assert.match(S, /DL_MAX_QUEUE_AGE_MS = 3 \* 24/);
+  assert.match(S, /\[download\] \$\{mode\} \$\{id\} waiting for viewer/);
+  assert.match(S, /\[download\] \$\{mode\} \$\{id\} resumed after viewer/);
+});

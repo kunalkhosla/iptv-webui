@@ -233,3 +233,14 @@ Chromecast directly.
   off. This is panel-side, not us.
 - This project assumes you have a legitimate subscription to whatever panel
   you point it at. It is just a UI; it does not bypass any DRM or auth.
+
+## Phone downloads (status fields)
+
+`POST /api/download/prepare/:mode/:id`, then poll `GET /api/download/status/:mode/:id`.
+Fields: `state` (`none|queued|waiting|running|ready|failed`), `pct`, `stage`
+(`queued|fetching|waiting-for-viewer|encoding`), `bytes`, `error`, `queue_position`,
+and `waiting_for: "viewer"` (additive; present when the job, or the running job it is
+queued behind, is paused because someone is watching on the same provider account).
+The 24h cap runs from when a job starts; a job queued for over 3 days fails with a
+clear error. Jobs are in memory: after a server restart `state` is `none` and the
+phone re-prepares.
