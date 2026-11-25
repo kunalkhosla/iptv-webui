@@ -602,6 +602,7 @@ const { pickTrailerKey, selectNewTrailers, backfillCandidates, applyReleaseInfo,
 // Last good get_vod_info / get_series_info per title, for stale-if-error
 // on the detail endpoint (survives restarts, unlike `cache`).
 const { createInfoStore, getInfoStaleIfError, isUsableInfo } = require("./lib/info-cache");
+const audioTracksLib = require("./lib/audio-tracks");
 const infoStore = createInfoStore({ dir: path.join(DATA_DIR, "info-cache") });
 const indexFilePath =(mode) => path.join(DATA_DIR, `index-${mode}.json`);
 const categoriesFilePath = (mode) => path.join(DATA_DIR, `categories-${mode}.json`);
@@ -1127,7 +1128,9 @@ function runPanelTracksProbe(mode, id, ext, actx) {
     const args = [
       "-v", "error", "-print_format", "json",
       "-user_agent", "Mozilla/5.0 (Linux; Android 12; Smart TV) AppleWebKit/537.36",
-      "-show_entries", "stream=index,codec_type,codec_name,channels,disposition:stream_tags=language,title",
+      // stream_disposition (not "disposition" inside stream=): the latter
+      // silently returns no disposition, so `default` was always false.
+      "-show_entries", "stream=index,codec_type,codec_name,channels:stream_disposition=default:stream_tags=language,title",
       direct,
     ];
     const proc = spawn("ffprobe", args);
@@ -1174,6 +1177,53 @@ function runPanelTracksProbe(mode, id, ext, actx) {
   });
   panelTracksProbeInflight.set(key, p);
   return p;
+}
+
+// Learned track lists: the transcoder's ffmpeg prints the input's stream
+// list on stderr as it opens the file, so a title that's being transcoded
+// gets its Audio menu with ZERO extra provider connections (the ffprobe
+// above is a second connection and is refused while anyone streams).
+// Same entry shape as runPanelTracksProbe. Waiters are /api/tracks calls
+// parked until the running transcoder's dump lands.
+const panelTracksLearner = audioTracksLib.createTrackLearner({ cache: panelTracksCache, onSave: schedulePanelTracksCacheSave });
+const learnPanelTracks = (mode, id, tracks) => panelTracksLearner.learn(mode, id, tracks);
+const waitForLearnedTracks = (mode, id, ms) => panelTracksLearner.waitFor(mode, id, ms);
+// A transcoder for this title is running or starting (its ffmpeg will
+// report the track list soon).
+function transcoderActiveFor(mode, id) {
+  const prefix = `${mode}-${id}-`;
+  for (const k of transcoders.keys()) if (k.startsWith(prefix)) return true;
+  for (const k of transcoderInflight.keys()) if (k.startsWith(prefix)) return true;
+  return false;
+}
+
+// Per-title audio-pick context from the last /api/stream call (the
+// transcode routes are pre-auth and have no profile): the title's
+// original language and the requesting profile's audioLangPrefs.
+const audioPickHints = new Map(); // `${mode}:${id}` -> { originalLang, prefs, at }
+function setAudioPickHint(mode, id, hint) {
+  const key = `${mode}:${id}`;
+  audioPickHints.delete(key);
+  audioPickHints.set(key, { ...hint, at: Date.now() });
+  while (audioPickHints.size > 500) audioPickHints.delete(audioPickHints.keys().next().value);
+}
+function getAudioPickHint(mode, id) {
+  const h = audioPickHints.get(`${mode}:${id}`);
+  return h && Date.now() - h.at < 12 * 3600 * 1000 ? h : null;
+}
+// The title's ORIGINAL language (ISO 639-1 or a language word), or null:
+// TMDB original_language first, else the stream name's language tag
+// ("... (Hindi)") / the item's language-group tag.
+function titleOriginalLang(mode, id, seriesId = null) {
+  const tkey = mode === "movie" ? `movie:${id}` : (mode === "series" && seriesId ? `series:${seriesId}` : null);
+  const t = tkey ? tmdbCache[tkey] : null;
+  if (t && t.source !== "no-match" && t.original_language) return t.original_language;
+  const itemId = mode === "movie" ? id : seriesId;
+  const item = itemId ? indexes[mode]?.byId?.get(parseInt(itemId, 10)) : null;
+  if (!item) return null;
+  const fromName = streamAudioLang(item, null);
+  if (fromName && fromName !== "multi") return fromName;
+  return isoLangForItem(item);
 }
 
 function classifyAs4k(width, height) {
@@ -2498,6 +2548,10 @@ function emptyUserState() {
     // 1h backward lookback is fixed (programmes already in progress
     // need their block when a row first renders).
     epgWindowHoursForward: 3,
+    // Audio languages to prefer (ISO 639-2, e.g. ["hin","eng"]) when a
+    // panel VOD title's ORIGINAL language has no matching track. null =
+    // unset → DEFAULT_AUDIO_LANG_PREFS (hin, eng). See chooseAudioTrack.
+    audioLangPrefs: null,
   };
 }
 // Normalize the on-disk shape into the canonical structure (so old
@@ -2523,6 +2577,7 @@ function normalizeUserState(d) {
     } : e.filter,
     remoteEnabled: typeof d?.remoteEnabled === "boolean" ? d.remoteEnabled : e.remoteEnabled,
     epgWindowHoursForward: Math.min(Math.max(parseInt(d?.epgWindowHoursForward, 10) || e.epgWindowHoursForward, 1), 24),
+    audioLangPrefs: audioTracksLib.normalizeAudioLangPrefs(d?.audioLangPrefs) || e.audioLangPrefs,
   };
 }
 
@@ -4742,7 +4797,9 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/index.m3u8", async (re
   const ad = admitStream(owner, req.params.mode, req.params.id, killer, currentAccountKey());
   if (!ad.ok) return sendDisplaced(res);
   try {
-    const t = await startOrTouchTranscoder(req.params.mode, req.params.id, quality, offsetSecs, audio, diskSel, audioTrack);
+    // No ?at= at all = the server may choose the track (see spawnTranscoder).
+    const autoPick = req.query.at === undefined && (req.params.mode === "movie" || req.params.mode === "series");
+    const t = await startOrTouchTranscoder(req.params.mode, req.params.id, quality, offsetSecs, audio, diskSel, audioTrack, autoPick);
     noteOwner(t, owner);
     const playlistPath = path.join(t.dir, "index.m3u8");
     // 30 s startup window. Heavy MKVs (4K HEVC with TrueHD audio) can
@@ -6105,32 +6162,6 @@ function isoLangForItem(item) {
   const tags = item && Array.isArray(item.tags) ? item.tags : [];
   for (const t of tags) {
     if (LANG_TAG_TO_ISO[t]) return LANG_TAG_TO_ISO[t];
-  }
-  return null;
-}
-
-// Language group tag → the language codes an embedded audio track's
-// `stream_tags:language` might actually carry. Container/mux tooling
-// almost always writes ISO 639-2 (3-letter: "hin", "eng"), not the
-// 639-1 2-letter form LANG_TAG_TO_ISO uses for TMDB — accept both since
-// a handful of files do use the 2-letter form.
-const LANG_TAG_TO_AUDIO_CODES = {
-  english: ["eng", "en"], hindi: ["hin", "hi"], tamil: ["tam", "ta"], telugu: ["tel", "te"],
-  malayalam: ["mal", "ml"], kannada: ["kan", "kn"], marathi: ["mar", "mr"], gujarati: ["guj", "gu"],
-  bengali: ["ben", "bn"], urdu: ["urd", "ur"], punjabi: ["pan", "pa"], arabic: ["ara", "ar"], turkish: ["tur", "tr"],
-};
-// Pick the audio track index (the transcoder's 0:a:N ordinal) matching the
-// profile's onboarded language(s), preferring the earlier language when a
-// profile onboarded more than one. Null when nothing matches (or no track
-// carries a language tag at all) — caller falls back to the existing
-// track-0 default.
-function preferredAudioTrackIndex(langKeys, audioTracks) {
-  if (!Array.isArray(audioTracks) || !audioTracks.length) return null;
-  for (const key of langKeys) {
-    const codes = LANG_TAG_TO_AUDIO_CODES[key];
-    if (!codes) continue;
-    const hit = audioTracks.find(t => t.lang && codes.includes(String(t.lang).toLowerCase()));
-    if (hit) return hit.index;
   }
   return null;
 }
@@ -8425,6 +8456,11 @@ app.put("/api/user-state", express.json({ limit: "256kb" }), (req, res) => {
   }
   if (Number.isFinite(b.epgWindowHoursForward)) {
     userState.epgWindowHoursForward = Math.min(Math.max(Math.round(b.epgWindowHoursForward), 1), 24);
+  }
+  // [] or null clears back to the default (hin, eng).
+  if (b.audioLangPrefs === null || Array.isArray(b.audioLangPrefs)) {
+    const n = audioTracksLib.normalizeAudioLangPrefs(b.audioLangPrefs);
+    userState.audioLangPrefs = n && n.length ? n : null;
   }
   scheduleUserStateSave();
   res.json({ ok: true });
@@ -12910,7 +12946,7 @@ function normalizeAudioTrack(a) {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-async function startOrTouchTranscoder(mode, id, quality, offsetSecs = 0, audio = "stereo", diskSel = null, audioTrack = 0) {
+async function startOrTouchTranscoder(mode, id, quality, offsetSecs = 0, audio = "stereo", diskSel = null, audioTrack = 0, autoPick = false) {
   quality = normalizeQuality(quality);
   offsetSecs = normalizeOffsetSecs(offsetSecs);
   audio = normalizeAudio(audio);
@@ -12942,7 +12978,7 @@ async function startOrTouchTranscoder(mode, id, quality, offsetSecs = 0, audio =
     err.code = "SOURCE_UNAVAILABLE";
     throw err;
   }
-  const startPromise = spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel, null, audioTrack);
+  const startPromise = spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel, null, audioTrack, false, { autoPick: autoPick && audioTrack === 0 });
   transcoderInflight.set(key, startPromise);
   startPromise.finally(() => transcoderInflight.delete(key));
   return startPromise;
@@ -12954,6 +12990,10 @@ async function startOrTouchTranscoder(mode, id, quality, offsetSecs = 0, audio =
 // file), play another copy of the same title (see assignVariants) under the
 // same transcode key, so the viewer's manifest requests just start working.
 const sourceOverride = new Map(); // transcode key -> alternate stream id
+// A fresh play's audio auto-pick may restart ffmpeg only this soon after
+// spawn (and only before any segment exists) — later, it's left to the
+// learned cache for the next play and the Audio menu.
+const AUDIO_AUTOPICK_RESTART_MAX_MS = 8000;
 const failoverTried = new Map();  // transcode key -> { tried:Set<id>, at }
 function nextAltVariant(mode, id, tried) {
   if (mode !== "movie") return null;
@@ -12972,7 +13012,7 @@ function nextAltVariant(mode, id, tried) {
   if (me.audioLang) return ok.find((c) => c.audioLang === me.audioLang || c.audioLang === "multi") || null;
   return ok[0] || null;
 }
-async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel = null, respawn = null, audioTrack = 0, swFallback = false) {
+async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel = null, respawn = null, audioTrack = 0, swFallback = false, opts = {}) {
   audioTrack = normalizeAudioTrack(audioTrack);
   // Hardware encode for this run: the global VAAPI capability, unless this is
   // a software fallback retry (a prior VAAPI run was rejected by this source).
@@ -13030,7 +13070,12 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     ? ["-c:a", "eac3", "-b:a", "384k"]
     : ["-c:a", "aac", "-b:a", preset.copy ? "192k" : preset.aBitrate, "-ac", "2"];
   const args = [
-    "-hide_banner", "-loglevel", "error",
+    // level+info (not "error"): the input's stream dump is info-level and is
+    // how panel audio tracks are learned (learnPanelTracks). Each line carries
+    // its level; only error-level lines reach stderrBuf, so exit-tail
+    // diagnostics are exactly what "-loglevel error" used to print.
+    // -nostats drops the per-0.5s progress line info would otherwise add.
+    "-hide_banner", "-nostats", "-loglevel", "level+info",
     // Tolerate corrupt/truncated source. Panels ship damaged files (a few
     // bad H264 NAL units mid-title, or a corrupt live segment). Without
     // this ffmpeg aborts on the bad frames (exit 255) and the WHOLE title
@@ -13202,7 +13247,7 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     args.push(
       "-hls_list_size", "0",
       "-start_number", String(startNumber),
-      "-hls_flags", "independent_segments" + (respawn ? "+append_list" : ""),
+      "-hls_flags", "independent_segments" + (respawn && !respawn.fresh ? "+append_list" : ""),
     );
   }
   args.push(path.join(dir, "index.m3u8"));
@@ -13211,7 +13256,17 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
   // container (it does not limit other containers — the GPU path is the real fix).
   try { require("os").setPriority(ffmpeg.pid, 10); } catch {}
   let stderrBuf = "";
-  ffmpeg.stderr.on("data", (b) => { stderrBuf = (stderrBuf + b.toString()).slice(-4000); });
+  // Panel VOD: learn the audio track list from this ffmpeg's own input dump.
+  const learnTracks = mode === "movie" || mode === "series";
+  const trackParser = learnTracks ? audioTracksLib.createInputStreamParser({ labelFor: langLabel }) : null;
+  ffmpeg.stderr.on("data", audioTracksLib.lineSplitter((line) => {
+    const { level, msg } = audioTracksLib.splitLevel(line);
+    if (audioTracksLib.isErrorLevel(level)) stderrBuf = (stderrBuf + msg + "\n").slice(-4000);
+    if (trackParser && !trackParser.done) {
+      const tracks = trackParser.feed(msg);
+      if (tracks) onInputTracks(tracks);
+    }
+  }));
   // Reuse the entry across respawns so lastAccess, restart history, and the
   // transcoders-map slot survive an ffmpeg replacement.
   const entry = respawn ? respawn.entry : {
@@ -13228,6 +13283,7 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
   entry.segAtSpawn = startNumber; // baseline: this run "produced" only if it exceeds this
   entry.respawning = false;
   entry.usedHardware = hw;        // whether THIS run used the VAAPI encoder
+  entry.audioTrack = audioTrack;  // the 0:a:N this run maps
   if (swFallback) entry.swTried = true; // don't loop back to hardware after a fallback
   if (respawn && startNumber > 0) {
     // Mark the boundary so the manifest route emits #EXT-X-DISCONTINUITY before
@@ -13235,7 +13291,59 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     entry.discontinuities.add(startNumber);
     for (const d of entry.discontinuities) if (d < startNumber - liveHlsListSize() - 2) entry.discontinuities.delete(d);
   }
+  // Input stream dump parsed: cache the track list (keyed by the stream id
+  // actually read — a failed-over alternate has its own layout), then, on a
+  // fresh play where the server may choose (no ?at=), restart this ffmpeg
+  // ONCE on the right track if the one it maps isn't the pick — only while
+  // nothing has been written yet (dump lands ~1-3s in; segments are 4s).
+  function onInputTracks(tracks) {
+    learnPanelTracks(mode, srcId, tracks);
+    if (!opts.autoPick || respawn || entry.audioAutoDone || entry.stopping || srcId !== id) return;
+    entry.audioAutoDone = true;
+    const hint = getAudioPickHint(mode, id);
+    const pick = audioTracksLib.chooseAudioTrack(tracks, {
+      originalLang: hint ? hint.originalLang : titleOriginalLang(mode, id),
+      prefs: hint ? hint.prefs : null,
+    });
+    if (pick.index === audioTrack || !tracks.some((t) => t.index === pick.index)) return;
+    const age = Date.now() - entry.startedAt;
+    const written = liveSegStats(dir).nextNumber > 0 || fs.existsSync(path.join(dir, "index.m3u8"));
+    if (age > AUDIO_AUTOPICK_RESTART_MAX_MS || written) {
+      console.log(`[transcode ${key}] audio pick ${pick.index} (${pick.reason}) not applied — already producing (${age}ms); next play / Audio menu`);
+      return;
+    }
+    console.log(`[transcode ${key}] audio auto-pick: track ${pick.index} (${pick.reason}) instead of ${audioTrack} — restarting before first segment (${age}ms)`);
+    entry.audioRestartTo = pick.index;
+    // Live-entry marker for startOrTouchTranscoder until the new ffmpeg is up
+    // (a manifest request in between must not spawn a second one).
+    entry.respawning = true;
+    // The input opened and was read: a reconnect that hits the cap=1 slot
+    // still held by this connection is "slot-held", not "source dead".
+    entry.everConnected = true;
+    try { ffmpeg.kill("SIGKILL"); } catch {}
+  }
   ffmpeg.on("exit", (code) => {
+    // Deliberate audio-track restart (onInputTracks): same key/entry/dir,
+    // fresh playlist, now mapping the chosen track.
+    if (entry.audioRestartTo != null && entry.proc === ffmpeg) {
+      const to = entry.audioRestartTo;
+      entry.audioRestartTo = null;
+      if (entry.stopping || transcoders.get(key) !== entry) {
+        if (transcoders.get(key) === entry) transcoders.delete(key);
+        fs.rmSync(dir, { recursive: true, force: true });
+        return;
+      }
+      entry.respawning = true;
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.mkdirSync(dir, { recursive: true });
+      spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key, diskSel, { startNumber: 0, entry, fresh: true }, to, !!entry.swTried)
+        .catch((e) => {
+          console.log(`[transcode ${key}] audio restart failed: ${redactUrl(e?.message || e)}`);
+          transcoders.delete(key);
+          fs.rmSync(dir, { recursive: true, force: true });
+        });
+      return;
+    }
     const tail = redactUrl(stderrBuf.split("\n").filter(Boolean).slice(-3).join(" | "));
     const now = Date.now();
     entry.restarts = (entry.restarts || []).filter((ts) => now - ts < RESTART_WINDOW_MS);
@@ -13616,35 +13724,26 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   // Android TVs can request E-AC3 multi-channel instead of the
   // default AAC stereo. Like ?q= (quality), not part of the HMAC.
   const audio = normalizeAudio(req.query.a);
-  // Default a fresh play (no client-chosen ?at=) to the profile's onboarded
-  // language track when the file has one, instead of always track 0. Many
-  // panel dual-audio rips list English as track 0 even for Hindi (etc.)
-  // content — a Hindi-onboarded profile playing one used to silently get
-  // English audio with no indication anything was wrong. Cache-only lookup
-  // — NEVER triggers a fresh probe here. /api/tracks (fire-and-forget from
-  // the client, after play already starts, purely to populate the audio
-  // picker) is what's allowed to pay ffprobe's cost; this route stays on
-  // the play-start critical path and a title nobody's probed yet is
-  // exactly the first-play case this feature targets, so blocking here
-  // would stall Play by up to 10s on precisely the plays that matter most.
-  // First play of an unprobed title still falls back to track 0 same as
-  // before; a rewatch/family-shared title (already probed via /api/tracks
-  // or a prior play) gets the preference for free.
+  // Default a fresh play (no client-chosen ?at=) to the right audio track
+  // instead of always track 0: the title's ORIGINAL language first (a Hindi
+  // film plays its Hindi track, not an English dub), then the profile's
+  // audioLangPrefs (default hin, eng), then the file default — see
+  // chooseAudioTrack. Cache-only: NEVER probes here (this is the play-start
+  // critical path). An unknown title's first play learns its track list
+  // from the transcoder's own ffmpeg and, if the default track is wrong,
+  // restarts that transcode once before its first segment (spawnTranscoder).
+  // The hint below carries the original language + prefs to that pre-auth
+  // transcode route.
   let preferredAudioTrack = 0;
-  if ((req.params.mode === "movie" || req.params.mode === "series") && !req.query.at) {
+  if ((req.params.mode === "movie" || req.params.mode === "series") && req.query.at === undefined) {
     const userState = getProfileState(req.profileId);
-    const langKeys = (() => {
-      const own = userState.filter?.groups?.[req.params.mode];
-      if (Array.isArray(own) && own.length) return own;
-      const liveKeys = userState.filter?.groups?.live;
-      return Array.isArray(liveKeys) ? liveKeys : [];
-    })().filter((k) => LANGUAGE_GROUP_KEYS_SET.has(k));
-    if (langKeys.length) {
-      const cached = panelTracksCache[`${req.params.mode}:${req.params.id}`];
-      const fresh = cached && typeof cached.ts === "number" && Date.now() - cached.ts < PROBE_ALIVE_TTL_MS;
-      const idx = fresh ? preferredAudioTrackIndex(langKeys, cached.audioTracks) : null;
-      if (idx != null) preferredAudioTrack = idx;
-    }
+    const seriesId = req.params.mode === "series" && /^\d{1,12}$/.test(String(req.query.series ?? "")) ? String(req.query.series) : null;
+    const originalLang = titleOriginalLang(req.params.mode, req.params.id, seriesId);
+    const prefs = audioTracksLib.effectiveAudioLangPrefs(userState.audioLangPrefs);
+    setAudioPickHint(req.params.mode, req.params.id, { originalLang, prefs });
+    const cached = panelTracksCache[`${req.params.mode}:${req.params.id}`];
+    const fresh = cached && typeof cached.ts === "number" && Date.now() - cached.ts < PROBE_ALIVE_TTL_MS;
+    if (fresh) preferredAudioTrack = audioTracksLib.chooseAudioTrack(cached.audioTracks, { originalLang, prefs }).index;
   }
   const audioTrack = normalizeAudioTrack(req.query.at ?? preferredAudioTrack);
   const transcodeSigInput = offsetSecs > 0
@@ -13757,6 +13856,9 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     // or a check that just passed), so the client can skip its own pre-play
     // manifest GET. false/absent = check it yourself.
     ...(liveChecked !== undefined ? { liveChecked } : {}),
+    // The audio track the transcode URL maps (0 = default). Clients that
+    // track the selected track should start from this, not 0.
+    audioTrack,
     subtitles: streamSubtitles(req),
   });
 });
@@ -13786,8 +13888,32 @@ function streamSubtitles(req) {
 app.get("/api/tracks/:mode(movie|series)/:id.:ext", async (req, res) => {
   res.set("Cache-Control", "no-store");
   try {
+    const { mode, id } = req.params;
+    const cacheKey = `${mode}:${id}`;
+    const cachedFresh = () => {
+      const c = panelTracksCache[cacheKey];
+      return c && typeof c.ts === "number" && Date.now() - c.ts < PROBE_ALIVE_TTL_MS ? c : null;
+    };
+    // This title is (about to be) transcoded — the client asks right after
+    // /api/stream, often before its manifest request has spawned ffmpeg.
+    // That ffmpeg reports the track list within seconds of opening the
+    // file, so wait for it instead of answering busy/empty (clients ask
+    // once: empty = no Audio menu) or racing a 2nd provider connection
+    // (ffprobe) against the transcoder's on a cap=1 account.
+    if (!cachedFresh()) {
+      const hint = getAudioPickHint(mode, id);
+      if (hint && Date.now() - hint.at < 20000) {
+        for (let i = 0; i < 16 && !transcoderActiveFor(mode, id) && !cachedFresh(); i++) {
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      }
+      if (!cachedFresh() && transcoderActiveFor(mode, id)) {
+        const learned = cachedFresh() || await waitForLearnedTracks(mode, id, 10000);
+        return res.json(learned ? { audioTracks: learned.audioTracks } : { audioTracks: [], busy: true });
+      }
+    }
     const probed = await Promise.race([
-      probePanelTracks(req.params.mode, req.params.id, req.params.ext),
+      probePanelTracks(mode, id, req.params.ext),
       new Promise((r) => setTimeout(() => r(null), 10000)),
     ]);
     const out = { audioTracks: (probed && probed.audioTracks) || [] };

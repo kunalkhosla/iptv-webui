@@ -129,6 +129,10 @@ MCP_PUBLIC_URL=https://iptv.example.com
 
 TMDB title-logo art is cached per title and exposed as `logo` (full w500 PNG URL or `null`) on `/api/poster/:mode/:id` and on home `hero[]` items. See [docs/TITLE_LOGOS.md](docs/TITLE_LOGOS.md).
 
+## Audio tracks (`/api/tracks/:mode/:id.:ext`)
+
+Multi-audio panel VOD: the track list is learned from the transcoder's own ffmpeg (no extra provider connection on a cap=1 account) or an idle-time ffprobe, and a fresh play defaults to the title's original language, then the profile's `audioLangPrefs` (default `hin`, `eng`), then the file default; `&at=N` overrides. See [docs/AUDIO_TRACKS.md](docs/AUDIO_TRACKS.md).
+
 ## Native trailers (`/api/trailer/:key.mp4`)
 
 Trailers play inside the apps instead of opening YouTube. Details and the
