@@ -99,6 +99,15 @@ test("contract: search tiles carry variant fields; /api/variants shape", () => {
   const { tileVariantFields, variantsPayload } = require("../lib/variants");
   const tile = tileVariantFields({ variants: [{ id: 1, lang: "hi", langName: "Hindi", langGuess: null, langGuessName: null, quality: "FHD", lowQuality: false, name: "X (Hindi)", isPrimary: true }] });
   for (const k of ["lang", "langName", "langGuess", "langGuessName", "quality", "variantCount", "variants"]) assert.ok(k in tile, k);
+  // Ungrouped shapes stay free of variant fields: /api/search/all without
+  // ?group=1 builds no index (projectTile alone), and /api/search/:mode with
+  // no build yet spreads nothing.
+  const all = handlerFor(/app\.get\("\/api\/search\/all/);
+  assert.match(all, /const vEntry = groupTitles \? variantIndexFor\(mode, ix\) : null;/);
+  assert.match(all, /if \(!vEntry\) return eligible\(s\) \? projectTile\(s\) : null;/);
+  const proj = /const projectTile = \(s\) => \{[\s\S]*?\n    \};/.exec(all)[0];
+  for (const k of ["variants", "variantCount", "langName", "langGuess"]) assert.doesNotMatch(proj, new RegExp(`\\b${k}:`), k);
+  assert.match(handlerFor(/app\.get\("\/api\/search\/:mode/), /\.\.\.\(resolved \? tileVariantFields\(resolved\) : \{\}\)/);
   const h = handlerFor(/app\.get\("\/api\/variants\/:mode/);
   assert.ok(h, "/api/variants handler");
   assert.match(h, /variantsPayload\(/);

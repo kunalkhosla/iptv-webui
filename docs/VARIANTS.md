@@ -24,7 +24,11 @@ Home rails are not changed. They still use `assignVariants` / `makeVariantHider`
 - Movies and series both group by **TMDB id** (series copies in different languages are separate
   series ids. Each copy keeps its own seasons).
 - TMDB matches are checked against the title. Inside one TMDB id:
-  - if some copies' panel title equals the TMDB title, only those stay;
+  - if some copies' panel title equals the TMDB title, only those stay. Subtitle forms also stay
+    when the year is the SAME as TMDB's: the panel title equals the TMDB title's part before `:`
+    ("Stree 2 (2024)" for *Stree 2: Sarkate Ka Aatank*), or the panel's part before `:` equals
+    the TMDB title. "Dhurandhar (2025)" vs *Dhurandhar: The Revenge* (2026) stays split, and so
+    does "Blink" vs *Blink Twice*, which has no colon;
   - otherwise the most common panel title stays (ties break on the title text, so iteration order
     doesn't matter).
   - Everything else splits off and groups by its own title + year. Examples: "Ash (2025)" cached as
@@ -57,24 +61,28 @@ Primary = the copy the tile shows and plays by default:
 1. A language word in the query (`/api/search/all` facet, e.g. "hindi action") comes first.
 2. Next, the original language (TMDB `original_language`). This applies when the profile has no
    language chips or includes that language; otherwise the profile's own languages come first.
-3. Within one language:
+3. Within the top language bucket, a copy this profile already started (saved progress or recents)
+   comes first. Search then reopens the copy with the resume point, e.g. the 4K started from home,
+   even when a definite-language copy exists, and even if the started copy is a CAM copy.
+4. Within one language:
    - copies with a definite language before copies with a guessed one;
    - more episodes first (hook only: series episode counts are not in the index, so this is
      inactive today);
    - the home rails' canonical copy (`assignVariants`) before others, so home and search show the
      same id;
    - best quality: `4K` > `FHD` > `HD` > unknown > `SD`.
-4. CAM / pre-retail copies (`lowQuality`: the `cam` tag or `isLowQuality`, the same test as
+5. CAM / pre-retail copies (`lowQuality`: the `cam` tag or `isLowQuality`, the same test as
    `assignVariants`) are primary only when nothing else is left.
 
 Quality: `4K` only from the stream's `4k` tag, which the resolution probe already demotes
 (`applyQualityDemotion`). A probed resolution (`quality-cache.json`) overrides title/category text.
 
 Home vs search ids: progress is keyed `mode:id` per copy, and Continue Watching shows the exact id
-that was played. Favourites are resolved to the profile's chosen copy on home. So a different
-primary on home and search loses nothing. It does differ when home's canonical has only a guessed
-language. Dhurandhar is the example: home shows 796884 (INDIAN 4K, which `assignVariants` treats
-as Hindi), while search shows 729968, the definite Hindi copy.
+that was played. Favourites are resolved to the profile's chosen copy on home. With nothing started,
+home and search can differ when home's canonical has only a guessed language. Dhurandhar is the
+example: home shows 796884 (INDIAN 4K, which `assignVariants` treats as Hindi), while search shows
+729968, the definite Hindi copy. Once the profile has started 796884, search also shows 796884
+with its resume point.
 
 `variants` order: the primary first, then the original language, then the profile's onboarded
 languages (in their order), then Hindi, then English, then the other languages, then `multi`.

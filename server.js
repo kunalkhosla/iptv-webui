@@ -3123,7 +3123,7 @@ function scheduleStreamingBuzz() {
 // a multi-language bundle. The winner carries `variants`; the rest are
 // flagged `isAlt` with `canonicalId` and hidden from rails/search/taste
 // (variantChoice below can swap the winner per profile language).
-const { LANG_WORDS: AUDIO_LANG_WORDS, buildVariantIndex, resolveGroup, tileVariantFields, variantsPayload } = require("./lib/variants");
+const { LANG_WORDS: AUDIO_LANG_WORDS, buildVariantIndex, resolveGroup, tileVariantFields, variantsPayload, createVariantIndexCache } = require("./lib/variants");
 function streamAudioLang(s, catName) {
   const name = String(s.name || "");
   if (/\[[^\]]*,[^\]]*\]/.test(name)) return "multi";                  // "[Tel,Tam,Hin,Eng]"
@@ -3244,10 +3244,7 @@ function makeVariantHider(ix, passes, profileIso) {
 // request never builds: with no build yet (or an index still filling) callers
 // get null and serve ungrouped results. Streams added since the last build
 // group on their own until the next one.
-const variantIndexCache = new WeakMap(); // ix.byId -> { gen, at, vix, opts }
-const variantRebuildPending = new WeakSet();
 const variantMemo = new WeakMap(); // stream -> regex-derived fields (lib memo)
-const VARIANT_REBUILD_MIN_MS = 2 * 60 * 1000;
 function probedQualityOf(mode, s) {
   if (mode !== "movie") return null;
   const v = qualityCache[`movie:${s.id}`];
@@ -3257,11 +3254,13 @@ function probedQualityOf(mode, s) {
   if (v.h >= 700 || v.w >= 1260) return "HD";
   return "SD";
 }
-function buildVariantEntry(mode, ix, actx) {
+// buildVariantIndex opts for a mode (also describes a lone copy when no
+// build exists yet).
+function variantOptsFor(mode, actx = currentAccount()) {
   const catNames = new Map();
   for (const cat of (loadCategoriesFromDiskSync(mode, actx) || [])) catNames.set(String(cat.category_id), cat.category_name);
   const catOf = (s) => catNames.get(String(s.category_id)) || null;
-  const opts = {
+  return {
     memo: variantMemo,
     tmdbOf: (s) => tmdbCache[`${mode}:${s.id}`] || null,
     catNameOf: catOf,
@@ -3276,31 +3275,21 @@ function buildVariantEntry(mode, ix, actx) {
     // Series episode counts are not in the index (only per-title info calls), so
     // no episodeCountOf: see docs/VARIANTS.md.
   };
-  const t0 = Date.now();
-  const entry = { gen: catalogGen, at: Date.now(), vix: buildVariantIndex(ix.byId.values(), opts), opts };
-  variantIndexCache.set(ix.byId, entry);
-  const ms = Date.now() - t0;
-  if (ms > 250) console.log(`[${mode}] variant index: ${entry.vix.groups.size} groups in ${ms}ms`);
-  return entry;
 }
-function scheduleVariantBuild(mode, ix, actx) {
-  const byId = ix.byId;
-  if (variantRebuildPending.has(byId)) return;
-  variantRebuildPending.add(byId);
-  setImmediate(() => {
-    try { if (ix.byId === byId && ix.ready) buildVariantEntry(mode, ix, actx); }
-    catch (e) { console.warn(`[${mode}] variant index build failed: ${e.message}`); }
-    finally { variantRebuildPending.delete(byId); }
-  });
-}
-function variantIndexFor(mode, ix, actx = currentAccount()) {
-  if ((mode !== "movie" && mode !== "series") || !ix?.byId?.size) return null;
-  const c = variantIndexCache.get(ix.byId);
-  if (!ix.ready) return c || null; // never build on a partially filled index
-  if (!c) { scheduleVariantBuild(mode, ix, actx); return null; }
-  if (c.gen !== catalogGen && Date.now() - c.at >= VARIANT_REBUILD_MIN_MS) scheduleVariantBuild(mode, ix, actx);
-  return c;
-}
+const variantIndexCache = createVariantIndexCache({
+  getGen: () => catalogGen,
+  build: (mode, ix, actx) => {
+    const t0 = Date.now();
+    const opts = variantOptsFor(mode, actx);
+    const vix = buildVariantIndex(ix.byId.values(), opts);
+    const ms = Date.now() - t0;
+    if (ms > 250) console.log(`[${mode}] variant index: ${vix.groups.size} groups in ${ms}ms`);
+    return { vix, opts };
+  },
+  log: (m) => console.warn(m),
+});
+const scheduleVariantBuild = (mode, ix, actx) => variantIndexCache.scheduleBuild(mode, ix, actx);
+const variantIndexFor = (mode, ix, actx = currentAccount()) => variantIndexCache.get(mode, ix, actx);
 function variantGroupOf(entry, s) {
   return entry.vix.groupOf.get(s.id) || buildVariantIndex([s], entry.opts).groupOf.get(s.id);
 }
@@ -3311,6 +3300,16 @@ function variantLangCtx(langKeys, facetIso = null) {
   const iso = (langKeys || []).map((k) => LANG_TAG_TO_ISO[k]).filter(Boolean);
   const preferLangs = [...new Set([...iso, "hi", "en"])];
   return { profileLangs: iso.length ? new Set(iso) : null, preferLangs, firstLang: facetIso || null };
+}
+// Ids this profile already started in `mode` (saved progress + recents):
+// resolveGroup prefers them so search reopens the copy with the resume point.
+function startedIdsFor(userState, mode) {
+  const out = new Set();
+  for (const k of Object.keys(userState.progress || {})) {
+    if (k.startsWith(mode + ":")) out.add(k.slice(mode.length + 1).split(":")[0]);
+  }
+  for (const id of (userState.recents?.[mode] || [])) out.add(String(id));
+  return out;
 }
 // Onboarded keys for a per-mode search / variants request: the mode's own
 // chips, else movie, else live (/api/search/:mode and /api/variants agree).
@@ -9037,6 +9036,7 @@ app.get("/api/search/all", async (req, res, next) => {
     const vctx = vEntry ? {
       passes: (x) => titleLangPasses(x.name) && !isKidBlocked(x) && !(onboarded && suffixOf(x.name) && !langPref.includes(suffixOf(x.name))),
       ...variantLangCtx(langPref, parsed.lang),
+      startedIds: startedIdsFor(userState, mode),
     } : null;
     const seenGroups = new Set();
     // The result tile for `s`, or null when it is gated out / its title is
@@ -9399,6 +9399,7 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
   const vctx = vEntry ? {
     passes: (x) => !isKidBlocked(x) && titleLangPasses(x.name),
     ...variantLangCtx(onboarded ? modeKeys.filter((k) => LANGUAGE_GROUP_KEYS_SET.has(k)) : []),
+    startedIds: startedIdsFor(userState, mode),
   } : null;
   const deduped = [];
   for (const r of ranked) {
@@ -9486,10 +9487,10 @@ app.get("/api/variants/:mode(movie|series)/:id", (req, res) => {
   res.json(variantsPayload({
     mode, s,
     index: vEntry ? vEntry.vix : null,
-    opts: vEntry ? vEntry.opts : { tmdbOf: (x) => tmdbCache[`${mode}:${x.id}`] || null, catNameOf: () => null, titleKeyOf: () => null },
+    opts: vEntry ? vEntry.opts : variantOptsFor(mode),
     isKidBlocked: makeKidsBlocker(activeProfile),
     titleLangPasses: onboarded ? makeTitleLangFilter(new Set(modeKeys)) : () => true,
-    ctx: variantLangCtx(onboarded ? modeKeys.filter((k) => LANGUAGE_GROUP_KEYS_SET.has(k)) : []),
+    ctx: { ...variantLangCtx(onboarded ? modeKeys.filter((k) => LANGUAGE_GROUP_KEYS_SET.has(k)) : []), startedIds: startedIdsFor(userState, mode) },
   }));
 });
 

@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { detectLang, qualityOf, buildVariantIndex, resolveGroup, tileVariantFields, variantsPayload } = require("../lib/variants");
+const { detectLang, qualityOf, buildVariantIndex, resolveGroup, tileVariantFields, variantsPayload, createVariantIndexCache } = require("../lib/variants");
 const { makeKidsBlocker } = require("../lib/kids-filter");
 
 // Real panel rows for "Dhurandhar: The Revenge (2026)" (TMDB 1582770, original
@@ -328,4 +328,79 @@ test("variantsPayload: language chips and the title guard; requested copy always
   // Not built yet: the copy alone.
   const solo = variantsPayload({ mode: "movie", s: byId.get(729973), index: null, opts: o });
   assert.deepEqual(solo.variants.map((v) => v.id), [729973]);
+});
+
+test("title check: subtitle form of the TMDB title stays when the year matches (both orders)", () => {
+  const stree = { tmdb_id: 835113, tmdb_title: "Stree 2: Sarkate Ka Aatank", source: "tmdb", original_language: "hi", year: "2024" };
+  const list = [
+    S(1, "Stree 2 (2024) (Hindi)", 766, []), S(2, "Stree 2 (2024) (4K)", 838, ["4k"]),
+    S(3, "Stree 2 (2024) (Tamil)", 768, []), S(4, "Stree 2: Sarkate Ka Aatank (2024)", 766, []),
+  ];
+  for (const g of groupsBoth(list, stree)) {
+    assert.equal(g.get(4).key, "t:835113");
+    for (const id of [1, 2, 3]) assert.equal(g.get(id), g.get(4), String(id));
+  }
+  // Reverse: TMDB has the short title, one panel copy carries the subtitle.
+  const short = { ...stree, tmdb_title: "Stree 2" };
+  const rev = [S(1, "Stree 2 (2024) (Hindi)", 766, []), S(4, "Stree 2: Sarkate Ka Aatank (2024)", 766, [])];
+  for (const g of groupsBoth(rev, short)) assert.equal(g.get(4), g.get(1));
+  // One year off is NOT the same film: Dhurandhar (2025) vs The Revenge (2026).
+  const revenge = { tmdb_id: 1582770, tmdb_title: "Dhurandhar: The Revenge", source: "tmdb", original_language: "hi", year: "2026" };
+  const d = [S(1, "Dhurandhar (2025) (Hindi)", 599, []), S(4, "Dhurandhar: The Revenge (2026) (Hindi)", 766, [])];
+  for (const g of groupsBoth(d, revenge)) {
+    assert.equal(g.get(4).key, "t:1582770");
+    assert.equal(g.get(1).key, "n:dhurandhar|2025");
+  }
+  // Same year, but "Dhurandhar" is the head of the TMDB title: stays.
+  const d2 = [S(1, "Dhurandhar (2026) (Hindi)", 599, []), S(4, "Dhurandhar: The Revenge (2026) (Hindi)", 766, [])];
+  for (const g of groupsBoth(d2, revenge)) assert.equal(g.get(1), g.get(4));
+});
+
+test("a copy the profile already started wins inside the top language bucket", () => {
+  const { groupOf } = buildVariantIndex(STREAMS, opts());
+  const g = groupOf.get(729968);
+  assert.equal(resolveGroup(g, {}).primary.id, 729968);
+  assert.equal(resolveGroup(g, { startedIds: new Set(["796884"]) }).primary.id, 796884);
+  // ...but not across languages: a started Tamil copy does not beat Hindi.
+  assert.equal(resolveGroup(g, { startedIds: new Set(["787206"]) }).primary.id, 729968);
+  // A started CAM copy is still the primary.
+  const cam = [S(1, "Film (2026) (Hindi) (CAM)", 900, ["cam"]), S(2, "Film (2026) (Hindi)", 766, [])];
+  const o = opts({ 1: TMDB[1582770], 2: TMDB[1582770] });
+  const cg = buildVariantIndex(cam, o).groupOf;
+  assert.equal(resolveGroup(cg.get(1), {}).primary.id, 2);
+  assert.equal(resolveGroup(cg.get(1), { startedIds: new Set(["1"]) }).primary.id, 1);
+});
+
+test("variant index cache: never builds in the request or on a filling index", () => {
+  let builds = 0, gen = 1, t = 0;
+  const queue = [];
+  const cache = createVariantIndexCache({
+    build: () => { builds++; return { vix: { groups: new Map(), groupOf: new Map() }, opts: {} }; },
+    getGen: () => gen, schedule: (fn) => queue.push(fn), now: () => t, minRebuildMs: 1000,
+  });
+  const ix = { ready: false, byId: new Map([[1, { id: 1 }]]) };
+  assert.equal(cache.get("movie", ix), null); // filling: nothing, nothing scheduled
+  assert.equal(queue.length, 0);
+  ix.ready = true;
+  assert.equal(cache.get("movie", ix), null); // cold: null now, build scheduled
+  assert.equal(builds, 0);
+  assert.equal(cache.get("movie", ix), null);
+  assert.equal(queue.length, 1); // deduped
+  queue.shift()();
+  assert.equal(builds, 1);
+  const e = cache.get("movie", ix);
+  assert.ok(e && e.vix);
+  gen = 2; // stale: keeps serving; rebuild only after minRebuildMs
+  assert.equal(cache.get("movie", ix), e);
+  assert.equal(queue.length, 0);
+  t = 1000;
+  assert.equal(cache.get("movie", ix), e);
+  assert.equal(queue.length, 1);
+  ix.ready = false; // index refilling before the scheduled build runs: skipped
+  queue.shift()();
+  assert.equal(builds, 1);
+  assert.equal(cache.get("movie", ix), e); // still the old build while filling
+  assert.equal(cache.get("live", ix), null);
+  const fresh = { ready: true, byId: new Map([[2, { id: 2 }]]) }; // new Map = new index
+  assert.equal(cache.get("series", fresh), null);
 });
