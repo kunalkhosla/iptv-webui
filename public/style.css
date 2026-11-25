@@ -3300,3 +3300,26 @@ body.filter-open #scrim { opacity: 1; pointer-events: auto; }
   .episode .ep-title { font-size: 13.5px; }
   .episode .ep-plot { -webkit-line-clamp: 2; font-size: 12px; }
 }
+
+/* Title-logo art (replaces the text title when present; text is the fallback). */
+.title-logo {
+  display: block;
+  max-height: 80px;
+  max-width: min(100%, 420px);
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  object-position: left center;
+  margin: 0 0 8px;
+}
+.title-logo[hidden] { display: none; }
+.has-logo {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+@media (max-width: 720px) {
+  .title-logo { max-height: 56px; max-width: min(100%, 280px); }
+}

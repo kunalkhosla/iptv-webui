@@ -1406,6 +1406,7 @@ function renderHero() {
     <button type="button" class="hero-nav next" aria-label="Next featured">›</button>
     <div class="hero-body">
       <div class="hero-eyebrow"></div>
+      <img class="title-logo hero-logo" alt="" hidden>
       <h1 class="hero-title"></h1>
       <div class="hero-meta"></div>
       <p class="hero-plot"></p>
@@ -1510,6 +1511,8 @@ function paintHero(pick) {
 
   el.hero.querySelector(".hero-eyebrow").textContent = eyebrow;
   el.hero.querySelector(".hero-title").textContent = pick.name;
+  clearTitleLogo(el.hero.querySelector(".hero-title"));
+  if (pick.logo) setTitleLogo(el.hero.querySelector(".hero-title"), pick.logo, pick.name);
   el.hero.querySelector(".hero-meta").textContent = meta;
   const plotEl = el.hero.querySelector(".hero-plot");
   plotEl.textContent = pick.plot || "";
@@ -1538,6 +1541,7 @@ function paintHero(pick) {
   posterFor(state.mode, pick.id).then((d) => {
     if (!d) return;
     if (_heroItems[_heroIdx] && _heroItems[_heroIdx].id !== pick.id) return; // rotated past
+    if (d.logo && !pick.logo) setTitleLogo(el.hero.querySelector(".hero-title"), d.logo, pick.name);
     if (d.backdrop) setHeroBg(d.backdrop, pick.id);
     else if (d.poster) setHeroBg(d.poster, pick.id);
     const newMetaBits = [
@@ -3583,6 +3587,60 @@ function prewarmKidCerts(mode, items) {
   step();
 }
 
+// Title-logo art (TMDB, transparent PNG). The logo <img> is the sibling right
+// before the title heading; the heading stays in the DOM (visually hidden when
+// a logo shows) so the text title is both the fallback and the a11y label.
+// Logos are white or black lettering: very dark ones are lightened with a CSS
+// filter (luminance sampled on a tiny canvas); if the pixels can't be read the
+// logo is shown as-is, and if it fails to load the text title stays.
+function titleLogoImg(titleEl) {
+  const i = titleEl && titleEl.previousElementSibling;
+  return i && i.classList.contains("title-logo") ? i : null;
+}
+function clearTitleLogo(titleEl) {
+  const img = titleLogoImg(titleEl);
+  if (img) { img.hidden = true; img.removeAttribute("src"); img.style.filter = ""; img.dataset.want = ""; }
+  titleEl && titleEl.classList.remove("has-logo");
+}
+function logoIsDark(img) {
+  try {
+    const c = document.createElement("canvas"); c.width = c.height = 32;
+    const g = c.getContext("2d", { willReadFrequently: true });
+    g.drawImage(img, 0, 0, 32, 32);
+    const px = g.getImageData(0, 0, 32, 32).data;
+    let sum = 0, n = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i + 3] < 128) continue;
+      sum += (0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]) / 255; n++;
+    }
+    return n > 20 && sum / n < 0.3;
+  } catch { return false; }
+}
+function setTitleLogo(titleEl, url, alt) {
+  const img = titleLogoImg(titleEl);
+  if (!img || !url) return;
+  if (img.dataset.want === url) return;
+  img.dataset.want = url;
+  const probe = new Image();
+  probe.crossOrigin = "anonymous";
+  probe.onload = () => {
+    if (img.dataset.want !== url) return; // navigated away
+    img.style.filter = logoIsDark(probe) ? "brightness(0) invert(1)" : "";
+    img.alt = alt || "";
+    img.src = url;
+    img.hidden = false;
+    titleEl.classList.add("has-logo");
+  };
+  probe.onerror = () => {
+    // No CORS on the image host: show it un-analysed rather than not at all.
+    if (img.dataset.want !== url || !probe.crossOrigin) return;
+    const plain = new Image();
+    plain.onload = () => { if (img.dataset.want === url) { img.alt = alt || ""; img.src = url; img.hidden = false; titleEl.classList.add("has-logo"); } };
+    plain.src = url;
+  };
+  probe.src = url;
+}
+
 function posterFor(mode, id) {
   if (mode === "live") return Promise.resolve(null);
   const key = `${mode}:${id}`;
@@ -4555,6 +4613,7 @@ async function openMovie(s, mode = "movie") {
   // hits Play.
 
   el.seriesTitle.textContent = s.name;
+  clearTitleLogo(el.seriesTitle);
   setSeriesHeroBackdrop(s.icon, s.icon);
   renderMovieMeta(s, null);
   el.seriesPlot.textContent = s.plot || "";
@@ -4739,6 +4798,7 @@ async function openSeries(s) {
   // already have on the projected stream object; episode list shows a
   // placeholder until the panel info arrives.
   el.seriesTitle.textContent = s.name;
+  clearTitleLogo(el.seriesTitle);
   setSeriesHeroBackdrop(s.icon, s.icon);
   renderSeriesMeta(s, null);
   el.seriesPlot.textContent = s.plot || "";
@@ -4847,6 +4907,7 @@ async function openDiskSeriesGroup(s) {
   for (const key of DISK_SERIES_ONLY_HIDE) { if (el[key]) el[key].hidden = true; }
 
   el.seriesTitle.textContent = s.name;
+  clearTitleLogo(el.seriesTitle);
   setSeriesHeroBackdrop(s.icon, s.icon);
   renderSeriesMeta(s, null);
   el.seriesPlot.textContent = s.plot || "";
@@ -4982,6 +5043,7 @@ async function applyTmdbToDetail(mode, item) {
   // ("Bajirao Mastani (2015)(4k)(Hindi)" → "Bajirao Mastani"). Falls
   // back to the panel name when there's no TMDB match.
   if (d.tmdb_title) el.seriesTitle.textContent = d.tmdb_title;
+  setTitleLogo(el.seriesTitle, d.logo, d.tmdb_title || item.name);
   // Artwork: TMDB poster + TMDB backdrop are nearly always nicer than
   // the panel's. Falls back to the panel image if TMDB has only one.
   const tmdbBackdrop = d.backdrop || d.poster || null;
