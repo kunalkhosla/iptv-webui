@@ -3,7 +3,8 @@ const assert = require("node:assert/strict");
 const {
   parseFfmpegInputStreams, createInputStreamParser, splitLevel, isErrorLevel, lineSplitter,
   chooseAudioTrack, canonLang, normalizeAudioLangPrefs, effectiveAudioLangPrefs, isCommentaryTrack,
-  DEFAULT_AUDIO_LANG_PREFS,
+  DEFAULT_AUDIO_LANG_PREFS, publicTrack, resolveAudioTrackParam, effectiveAudioTrack,
+  rekeyTranscoder, nameLangTag, copyAudioLang,
 } = require("../lib/audio-tracks");
 
 // Real ffmpeg 8.1 `-loglevel level+info` stderr (synthetic local MKV, same
@@ -47,14 +48,17 @@ const label = (c) => (c ? { tam: "Tamil", tel: "Telugu", hin: "Hindi", eng: "Eng
 
 test("parses multi-audio MKV input dump into the ffprobe track shape", () => {
   const tracks = parseFfmpegInputStreams(MKV_STDERR, { labelFor: label });
+  const f = { comment: false, visualImpaired: false };
   assert.deepEqual(tracks, [
-    { index: 0, codec: "eac3", channels: 6, lang: "tam", label: "Tamil DD+ 5.1", default: true },
-    { index: 1, codec: "aac", channels: 2, lang: "tel", label: "Telugu", default: false },
-    { index: 2, codec: "eac3", channels: 6, lang: "hin", label: "Hindi (Original) DD+ 5.1", default: false },
-    { index: 3, codec: "aac", channels: 2, lang: "eng", label: "English Commentary", default: false },
-    { index: 4, codec: "truehd", channels: 8, lang: null, label: "Audio 5", default: false },
-    { index: 5, codec: "dts", channels: 6, lang: "und", label: "UND", default: false },
+    { index: 0, codec: "eac3", channels: 6, lang: "tam", label: "Tamil DD+ 5.1", default: true, ...f },
+    { index: 1, codec: "aac", channels: 2, lang: "tel", label: "Telugu", default: false, ...f },
+    { index: 2, codec: "eac3", channels: 6, lang: "hin", label: "Hindi (Original) DD+ 5.1", default: false, ...f },
+    { index: 3, codec: "aac", channels: 2, lang: "eng", label: "English Commentary", default: false, ...f, comment: true },
+    { index: 4, codec: "truehd", channels: 8, lang: null, label: "Audio 5", default: false, ...f },
+    { index: 5, codec: "dts", channels: 6, lang: "und", label: "UND", default: false, ...f },
   ]);
+  // The public /api/tracks shape drops the disposition-only fields.
+  assert.deepEqual(Object.keys(publicTrack(tracks[3])), ["index", "codec", "channels", "lang", "label", "default"]);
 });
 
 test("index is the audio-only ordinal (= -map 0:a:N), ignoring video/subtitle streams", () => {
@@ -86,7 +90,7 @@ test("MPEG-TS style stream ids and HLS/mp4 without languages", () => {
 [info]         handler_name    : SoundHandler
 [info] Stream mapping:`;
   assert.deepEqual(parseFfmpegInputStreams(mp4), [
-    { index: 0, codec: "aac", channels: 2, lang: "und", label: "UND", default: true },
+    { index: 0, codec: "aac", channels: 2, lang: "und", label: "UND", default: true, comment: false, visualImpaired: false },
   ]);
 });
 
@@ -212,7 +216,7 @@ test("learned tracks populate the cache in the probe's shape and wake waiters", 
   assert.deepEqual((await waiting).audioTracks, tracks);
   assert.equal(L.pendingWaiters("movie", "796884"), 0);
   for (const t of cache["movie:796884"].audioTracks) {
-    assert.deepEqual(Object.keys(t), ["index", "codec", "channels", "lang", "label", "default"]);
+    assert.deepEqual(Object.keys(t), ["index", "codec", "channels", "lang", "label", "default", "comment", "visualImpaired"]);
   }
 });
 
@@ -230,4 +234,106 @@ test("a learned list feeds the pick: Dhurandhar-like dump with Hindi original ->
   assert.equal(chooseAudioTrack(tracks, { originalLang: "hi" }).index, 2);
   // Unknown original, Kunal-style default prefs: still Hindi, not the Tamil default.
   assert.equal(chooseAudioTrack(tracks, {}).index, 2);
+});
+
+// ---- review fixes --------------------------------------------------------
+test("disposition-flagged commentary / visually-impaired tracks are skipped even with plain titles", () => {
+  const tracks = [T(0, "hin"), T(1, "hin"), T(2, "eng")];
+  tracks[0].comment = true;
+  assert.equal(chooseAudioTrack(tracks, { originalLang: "hi" }).index, 1);
+  tracks[1].visualImpaired = true;
+  // both Hindi tracks flagged: no usable original, no untagged -> prefs: eng
+  assert.equal(chooseAudioTrack(tracks, { originalLang: "hi" }).index, 2);
+});
+
+test("splitLevel classifies stacked ffmpeg 7/8 parent-context lines", () => {
+  assert.deepEqual(splitLevel("[vist#0:1/hevc @ 0x1] [dec:hevc @ 0x2] [error] Error while decoding"),
+    { level: "error", msg: "[vist#0:1/hevc @ 0x1] [dec:hevc @ 0x2] Error while decoding" });
+  assert.equal(splitLevel("[aost#0:1/aac @ 0x3] [enc:aac @ 0x4] [info] x").level, "info");
+});
+
+test("at/ap parsing: repeated at -> last value wins, 0 is a valid explicit choice", () => {
+  assert.deepEqual(resolveAudioTrackParam({ at: ["2", "0"] }), { explicit: 0, serverPick: null });
+  assert.deepEqual(resolveAudioTrackParam({ at: "0" }), { explicit: 0, serverPick: null });
+  assert.deepEqual(resolveAudioTrackParam({ ap: "2", at: "1" }), { explicit: 1, serverPick: 2 });
+  assert.deepEqual(resolveAudioTrackParam({ ap: "2" }), { explicit: null, serverPick: 2 });
+  assert.deepEqual(resolveAudioTrackParam({ at: "", ap: "x" }), { explicit: null, serverPick: null });
+  assert.deepEqual(resolveAudioTrackParam({ at: "-1" }), { explicit: null, serverPick: null });
+  assert.deepEqual(resolveAudioTrackParam({ at: "2,0" }), { explicit: null, serverPick: null });
+  assert.deepEqual(resolveAudioTrackParam({}), { explicit: null, serverPick: null });
+});
+
+test("effective track precedence: at > ap > running auto transcoder > cache > learn", () => {
+  const vod = true;
+  assert.deepEqual(effectiveAudioTrack({ vod, explicit: 0, serverPick: 2, aliasedTrack: 2, cachedPick: 2 }), { audioTrack: 0, autoPick: false, auto: false });
+  assert.deepEqual(effectiveAudioTrack({ vod, serverPick: 2, cachedPick: 1 }), { audioTrack: 2, autoPick: false, auto: false });
+  assert.deepEqual(effectiveAudioTrack({ vod, aliasedTrack: 0, cachedPick: 2 }), { audioTrack: 0, autoPick: false, auto: true });
+  assert.deepEqual(effectiveAudioTrack({ vod, cachedPick: 2 }), { audioTrack: 2, autoPick: false, auto: true });
+  assert.deepEqual(effectiveAudioTrack({ vod }), { audioTrack: 0, autoPick: true, auto: true });
+  assert.deepEqual(effectiveAudioTrack({ vod: false, explicit: 3 }), { audioTrack: 0, autoPick: false, auto: false });
+});
+
+test("re-keying moves the entry to its new track's key (key == mapping)", () => {
+  const map = new Map();
+  const e = { key: "movie-1-med" };
+  map.set("movie-1-med", e);
+  assert.equal(rekeyTranscoder(map, e, "movie-1-med", "movie-1-med-at2"), true);
+  assert.equal(map.has("movie-1-med"), false);   // a later explicit at=0 can't reuse it
+  assert.equal(map.get("movie-1-med-at2"), e);
+  assert.equal(e.key, "movie-1-med-at2");
+  // refuses when the target key is held by another transcoder, or the entry moved
+  const other = {};
+  map.set("movie-1-med-at3", other);
+  assert.equal(rekeyTranscoder(map, e, "movie-1-med-at2", "movie-1-med-at3"), false);
+  assert.equal(map.get("movie-1-med-at2"), e);
+  assert.equal(rekeyTranscoder(map, e, "movie-1-med", "movie-1-med-at4"), false);
+});
+
+test("copy language: a '(Hindi)' stream name beats TMDB original_language", () => {
+  const W = { hindi: "hi", english: "en", tamil: "ta" };
+  assert.equal(nameLangTag("Oppenheimer (2023) (Hindi)", W), "hi");
+  assert.equal(nameLangTag("Dhurandhar: The Revenge (2026)(4K)", W), null);
+  assert.equal(nameLangTag("Some Film [Tel,Tam,Hin]", W), null);
+  const lang = copyAudioLang({ nameLang: nameLangTag("Oppenheimer (2023) (Hindi)", W), originalLang: "en" });
+  assert.equal(lang, "hi");
+  // dual hin+eng Hindi copy of an English film plays Hindi
+  assert.equal(chooseAudioTrack([T(0, "eng", { default: true }), T(1, "hin")], { originalLang: lang }).index, 1);
+  // untagged copy: original language
+  assert.equal(copyAudioLang({ nameLang: null, originalLang: "en", tagLang: "hi" }), "en");
+  assert.equal(copyAudioLang({ tagLang: "hi" }), "hi");
+  assert.equal(copyAudioLang({}), null);
+});
+
+test("unset prefs default to the profile's onboarded languages, then hin, eng", () => {
+  assert.deepEqual(effectiveAudioLangPrefs(null, ["punjabi", "english"]), ["pan", "eng", "hin"]);
+  assert.deepEqual(effectiveAudioLangPrefs(null, ["tamil"]), ["tam", "hin", "eng"]);
+  assert.deepEqual(effectiveAudioLangPrefs(null, []), ["hin", "eng"]);
+  assert.deepEqual(effectiveAudioLangPrefs(["eng"], ["punjabi"]), ["eng"]); // explicit wins
+  // A Punjabi-onboarded profile, title of unknown language, [hin, pan] -> pan
+  assert.equal(chooseAudioTrack([T(0, "hin"), T(1, "pan")], { prefs: effectiveAudioLangPrefs(null, ["punjabi"]) }).index, 1);
+});
+
+// ---- server/web wiring (source-level, like api-contract.test.js) ----------
+const fs = require("node:fs");
+const path = require("node:path");
+const SERVER = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+const APP = fs.readFileSync(path.join(__dirname, "..", "public", "app.js"), "utf8");
+
+test("/api/stream puts the server pick in &ap= (never &at=) and returns audioTrack", () => {
+  assert.match(SERVER, /serverPick != null \? `&ap=\$\{serverPick\}`/);
+  assert.match(SERVER, /explicitAt != null \? `&at=\$\{explicitAt\}`/);
+  assert.match(SERVER, /\n {4}audioTrack,\n/);
+});
+
+test("transcode route resolves at/ap via the lib and keys by the effective track", () => {
+  assert.match(SERVER, /audioTracksLib\.resolveAudioTrackParam\(req\.query\)/);
+  assert.match(SERVER, /audioTracksLib\.effectiveAudioTrack\(/);
+  assert.match(SERVER, /const sameTrack = \(existing\?\.audioTrack \|\| 0\) === audioTrack/);
+  assert.match(SERVER, /audioTracksLib\.rekeyTranscoder\(transcoders, entry, key, newKey\)/);
+});
+
+test("web client sends an explicit &at= (0 included) and adopts the server pick", () => {
+  assert.match(APP, /p\.audioExplicit && Number\.isFinite\(p\.audioTrack\) \? `&at=\$\{p\.audioTrack\}`/);
+  assert.match(APP, /state\.playing\.audioTrack = resolved\.audioTrack;/);
+  assert.match(APP, /audioTrack >= 0;/);
 });

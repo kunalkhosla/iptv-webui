@@ -2678,7 +2678,10 @@ async function fetchAudioTracks(mode, id, ext) {
     const r = await fetch(`/api/tracks/${mode}/${id}.${ext}`);
     if (!r.ok) return null;
     const data = await r.json();
-    return Array.isArray(data?.audioTracks) ? data.audioTracks : null;
+    if (!Array.isArray(data?.audioTracks)) return null;
+    // currentTrack: the track the running transcode maps (server pick).
+    if (Number.isFinite(data.currentTrack)) data.audioTracks.currentTrack = data.currentTrack;
+    return data.audioTracks;
   } catch { return null; }
 }
 // Build a menu/button label for one audio track: "English · 5.1".
@@ -2700,9 +2703,12 @@ function refreshAudioButton() {
   el.playerAudio.hidden = tracks.length <= 1;
   el.playerAudio.classList.toggle("on", !!(p && p.audioTrack));
 }
-// Apply an audio-track choice mid-playback: re-play through the
-// transcoder with &at=<index> appended (force transcode, keep &q).
-// Track 0 / default returns to normal playback.
+// Apply an audio-track choice mid-playback: re-play with an explicit
+// &at=<index> (0 included — it must override the server's default pick,
+// which rides on the transcode URL as &ap=). >0 forces the transcoder.
+// The comparison is against the track actually mapped (the server's pick
+// when the viewer hasn't chosen), so picking track 0 after a server pick
+// of 2 does switch.
 function setAudioTrack(idx) {
   const p = state.playing;
   if (!p) return;
@@ -3873,6 +3879,11 @@ function relativeTime(ts) {
   return `${Math.floor(mo / 12)}y ago`;
 }
 
+// Explicit audio choice for a transcode URL: &at=<index>, 0 included (the
+// server's own default pick is already on the URL as &ap=). Last &at wins.
+function audioTrackSuffix(p) {
+  return p && p.audioExplicit && Number.isFinite(p.audioTrack) ? `&at=${p.audioTrack}` : "";
+}
 async function resolveStreamUrl(mode, id, ext, anchorSecs, diskSel) {
   // anchorSecs > 0 asks the server to spawn ffmpeg with -ss <secs>
   // so the returned transcode playlist begins at that source offset.
@@ -3974,7 +3985,8 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
   // channels (no resume anyway).
   // A non-default audio track (panel movie/series) forces the transcoder,
   // which remaps 0:a:<at> — same shape as a forced quality preset.
-  const forceAudio = Number.isFinite(audioTrack) && audioTrack > 0;
+  const explicitAudio = (mode === "movie" || mode === "series") && Number.isFinite(audioTrack) && audioTrack >= 0;
+  const forceAudio = explicitAudio && audioTrack > 0;
   const willTranscode = !!useTranscode || forceQuality || forceAudio || (mode !== "live" && ext === "mkv");
   const resumeKey = mode === "live" ? null : `${mode}:${item.id}`;
   const resumeSaved = resumeKey ? state.progress[resumeKey] : null;
@@ -3989,7 +4001,10 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
     // Selected panel audio-track index (movie/series only). 0/absent =
     // panel default; >0 forces transcode with &at=<index>. Reset on each
     // play() unless the caller (audio picker re-play) threads it back in.
-    audioTrack: forceAudio ? audioTrack : 0,
+    // audioExplicit = the viewer chose it (sent as &at=, 0 included);
+    // otherwise audioTrack is adopted from /api/stream's server pick.
+    audioTrack: explicitAudio ? audioTrack : 0,
+    audioExplicit: explicitAudio,
     // Probed panel audio tracks for the player's Audio picker. Filled
     // fire-and-forget below from /api/tracks (movie/series only).
     audioTracks: [],
@@ -4034,6 +4049,9 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
     fetchAudioTracks(mode, item.id, ext).then(tracks => {
       if (tracks && state.playing && state.playing.item === item) {
         state.playing.audioTracks = tracks;
+        if (!state.playing.audioExplicit && state.playing.transcode && Number.isFinite(tracks.currentTrack)) {
+          state.playing.audioTrack = tracks.currentTrack;
+        }
         refreshAudioButton();
       }
     });
@@ -4095,6 +4113,13 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
   }
   if (state.playing !== myPlaying) return; // superseded by a newer play() call meanwhile — let it own the player
   recordAsPlayed();
+  // Start the Audio menu's selection from the track the server's transcode
+  // URL maps (its default pick), not 0 — only when we will play that
+  // transcode (direct play is whatever the browser decodes: track 0).
+  if ((mode === "movie" || mode === "series") && !state.playing.audioExplicit
+      && (state.playing.transcode || ext === "mkv") && Number.isFinite(resolved.audioTrack)) {
+    state.playing.audioTrack = resolved.audioTrack;
+  }
   // Disk: stash the probed track list + the signed VTT subtitle URLs so
   // the player's Audio/Subtitles menu can render them.
   if (mode === "disk") {
@@ -4124,7 +4149,7 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
     // ?q= is missing — matches today's auto-fallback behavior.
     url = resolved.transcode
       + (state.playing.quality ? `&q=${state.playing.quality}` : "")
-      + (state.playing.audioTrack ? `&at=${state.playing.audioTrack}` : "");
+      + audioTrackSuffix(state.playing);
     isHls = true;
     toast(state.playing.quality
       ? `Transcoding at ${qualityLabel(state.playing.quality)}…`
@@ -4135,7 +4160,7 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
     // movies on the panel are). Going through the proxy directly
     // would just sit on a black screen until the user gave up.
     // Skip the native attempt and go straight to transcode.
-    url = resolved.transcode;
+    url = resolved.transcode + audioTrackSuffix(state.playing);
     isHls = true;
     state.playing.transcode = true;
     toast("MKV not browser-playable, transcoding to H.264…", 4000);
@@ -6698,7 +6723,7 @@ async function reanchorTo(targetSecs) {
   }
   let url = resolved.transcode
     + (p.quality ? `&q=${p.quality}` : "")
-    + (p.audioTrack ? `&at=${p.audioTrack}` : "");
+    + audioTrackSuffix(p);
   p.transcodeAnchorSecs = targetSecs;
   if (state.hls) { state.hls.destroy(); state.hls = null; }
   el.video.removeAttribute("src");
