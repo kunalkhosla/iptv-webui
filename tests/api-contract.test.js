@@ -86,6 +86,21 @@ test("contract: /api/search/all returns { q, movie, series, live }", () => {
   ]);
 });
 
+// --- Title variants (docs/VARIANTS.md) — search tiles carry the group's
+// variant fields (spread from lib/variants tileVariantFields) and the detail
+// screens' "Watch in" picker reads GET /api/variants/:mode/:id.
+test("contract: search tiles carry variant fields; /api/variants shape", () => {
+  for (const re of [/app\.get\("\/api\/search\/:mode/, /app\.get\("\/api\/search\/all/]) {
+    const h = handlerFor(re);
+    assert.match(h, /\.\.\.tileVariantFields\(resolved\)/, `${re}: tiles must spread tileVariantFields`);
+  }
+  const { tileVariantFields } = require("../lib/variants");
+  const tile = tileVariantFields({ variants: [{ id: 1, lang: "hi", langName: "Hindi", langGuess: null, langGuessName: null, quality: "FHD", lowQuality: false, name: "X (Hindi)", isPrimary: true }] });
+  for (const k of ["lang", "langName", "langGuess", "langGuessName", "quality", "variantCount", "variants"]) assert.ok(k in tile, k);
+  const h = handlerFor(/app\.get\("\/api\/variants\/:mode/);
+  expectFields("/api/variants/:mode/:id", h, ["mode", "id", "tmdb_id", "originalLanguage", "primaryId", "variantCount", "variants"]);
+});
+
 // --- /api/stream/:mode/:id.:ext — consumed by HA, web, Android.
 // HA reads `transcode` (live) or `proxy` (vod) to feed the Cast
 // media_content_id. Without these the cast fails silently.

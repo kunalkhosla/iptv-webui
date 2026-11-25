@@ -125,6 +125,10 @@ MCP_PUBLIC_URL=https://iptv.example.com
   the server skips the audio-codec ffprobe.
 - Each call logs one `[zap]` line with total, check and probe timings.
 
+## Title variants (language / quality copies)
+
+Movie/series search (`/api/search/:mode`, `/api/search/all`) returns one tile per title. The tile is the original-language, best-quality copy and adds `langName`, `langGuess`, `quality`, `variantCount` and `variants[]` (every copy the profile may see). `GET /api/variants/:mode/:id` returns the same list for any copy, for a detail-screen "Watch in" picker. Kid-safe. See [docs/VARIANTS.md](docs/VARIANTS.md).
+
 ## Title logos
 
 TMDB title-logo art is cached per title and exposed as `logo` (full w500 PNG URL or `null`) on `/api/poster/:mode/:id` and on home `hero[]` items. See [docs/TITLE_LOGOS.md](docs/TITLE_LOGOS.md).
