@@ -6541,8 +6541,8 @@ function scheduleTrailers() {
   setTimeout(evict, 60_000).unref?.();
   const t2 = setInterval(evict, 6 * 3600_000); t2.unref?.();
   setTimeout(() => backfillReleaseDates({ reason: "boot" }).catch((e) => console.warn(`[trailer] backfill: ${e.message}`)), 5 * 60_000).unref?.();
-  setTimeout(() => backfillLogos({ reason: "boot" }).catch((e) => console.warn(`[logo] backfill: ${e.message}`)), 8 * 60_000).unref?.();
-  const t4 = setInterval(() => backfillLogos().catch((e) => console.warn(`[logo] backfill: ${e.message}`)), 3 * 3600_000); t4.unref?.();
+  // Title logos are filled on demand only (lazyFillLogo, when a title is opened); the bulk
+  // backfill is manual: POST /api/admin/backfill-logos.
   const t3 = setInterval(() => backfillReleaseDates().catch((e) => console.warn(`[trailer] backfill: ${e.message}`)), 6 * 3600_000); t3.unref?.();
 }
 
@@ -9698,8 +9698,9 @@ app.get("/api/poster/:mode(movie|series|disk)/:id", async (req, res, next) => {
     // OkHttp disk cache picks this up to avoid network round-trips
     // when the user re-opens the same title.
     res.set("Cache-Control", "private, max-age=600");
-    // Fire-and-forget: the logo shows up on the next poster fetch.
-    lazyFillLogo(`${mode}:${id}`, entry).catch(() => {});
+    // On demand: wait briefly (<=1 s) so a title being opened shows its logo the first time;
+    // a slower TMDB call finishes in the background and shows on the next fetch.
+    await Promise.race([lazyFillLogo(`${mode}:${id}`, entry).catch(() => {}), new Promise((r) => setTimeout(r, 1000))]);
     res.json(tmdbToResponse(entry));
   } catch (e) { next(e); }
 });

@@ -12,7 +12,7 @@ instead of the plain-text title on hero/detail screens.
   `"/abc123.png"`; `null` = checked, none available; key absent = not yet looked up).
 - Backfill: `backfillLogos` fetches `/{movie|tv}/{id}/images` for library titles
   whose entry has no `logo` key, 300 ms apart, max 300 titles per run, 8 min after
-  boot then every 3 h. Owner can trigger `POST /api/admin/backfill-logos`.
+  is no longer scheduled: logos are filled on demand when a title is opened (waits <=1 s so the first view shows it). Owner can trigger `POST /api/admin/backfill-logos`.
 
 ## API (additive; clients ignore unknown fields)
 
