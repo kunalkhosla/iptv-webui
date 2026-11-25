@@ -404,3 +404,58 @@ test("variant index cache: never builds in the request or on a filling index", (
   const fresh = { ready: true, byId: new Map([[2, { id: 2 }]]) }; // new Map = new index
   assert.equal(cache.get("series", fresh), null);
 });
+
+// Dil Se (TMDB 21210, 1998): the bare "Dil Se" in a HINDI DUBBED category was
+// matched by title only and is a different film.
+const DILSE_CATS = { 33: "INDIAN | GENERAL", 151: "HINDI | OLD MOVIES", 223: "MYANMAR | MOVIES", 93: "SOUTH INDIAN | HINDI DUBBED" };
+function dilSe(list, extra = {}) {
+  const tm = { tmdb_id: 21210, tmdb_title: "Dil Se..", source: "tmdb", original_language: "hi", year: "1998", ...extra };
+  const o = opts(Object.fromEntries(list.map((x) => [x.id, tm])));
+  // Like dedupTitleKey: language/quality parens stripped, year kept.
+  o.titleKeyOf = (s) => plainKey({ name: s.name.replace(/\((?!\d{4}\))[^)]*\)/g, " ") });
+  o.normTitle = plainNorm; o.mode = "movie";
+  o.catNameOf = (s) => DILSE_CATS[s.category_id] || CATS[s.category_id] || null;
+  return buildVariantIndex(list, o).groupOf;
+}
+test("Dil Se: the undated dubbed copy splits off; the dated copies stay (both orders)", () => {
+  const list = [
+    S(72547, "Dil Se.. (1998)", 33, ["india", "hindi"]), S(24805, "Dil Se.. (1998)", 151, ["hindi"]),
+    S(42441, "Dil Se.. (1998)", 223, []), S(54241, "Dil Se", 93, ["hindi"]),
+  ];
+  for (const order of [list, list.slice().reverse()]) {
+    const g = dilSe(order);
+    assert.equal(g.get(72547).key, "t:21210");
+    assert.equal(g.get(24805), g.get(72547));
+    assert.equal(g.get(42441), g.get(72547));
+    assert.notEqual(g.get(54241), g.get(72547));
+    assert.equal(g.get(54241).members.length, 1);
+    const r = resolveGroup(g.get(72547), {});
+    assert.deepEqual(r.variants.map((v) => v.id).sort(), [24805, 42441, 72547]);
+    assert.equal(r.variants.find((v) => v.id === 42441).langName, "Burmese");
+  }
+});
+test("year rules: exact year stays, one off needs the same title, undated needs the narrow exception", () => {
+  // One year off, same title text as an exact-year copy: stays.
+  let g = dilSe([S(1, "Dil Se.. (1998)", 151, []), S(2, "Dil Se.. (1999) (Tamil)", 151, [])]);
+  assert.equal(g.get(2), g.get(1));
+  // One year off with a different title: splits.
+  g = dilSe([S(1, "Dil Se.. (1998)", 151, []), S(2, "Dil Se Dil Tak (1999)", 151, [])], {});
+  assert.notEqual(g.get(2), g.get(1));
+  // Undated, exact TMDB title, "(Hindi)" tag, not dubbed, one dated copy: joins.
+  g = dilSe([S(1, "Dil Se.. (1998)", 151, []), S(2, "Dil Se.. (Hindi)", 151, [])]);
+  assert.equal(g.get(2), g.get(1));
+  // Same but in a dubbed category, or with two dated copies: stays alone.
+  g = dilSe([S(1, "Dil Se.. (1998)", 151, []), S(2, "Dil Se.. (Hindi)", 93, [])]);
+  assert.notEqual(g.get(2), g.get(1));
+  g = dilSe([S(1, "Dil Se.. (1998)", 151, []), S(3, "Dil Se.. (1998)", 33, []), S(2, "Dil Se.. (Hindi)", 151, [])]);
+  assert.notEqual(g.get(2), g.get(1));
+  // No language tag: alone.
+  g = dilSe([S(1, "Dil Se.. (1998)", 151, []), S(2, "Dil Se..", 151, [])]);
+  assert.notEqual(g.get(2), g.get(1));
+  // Series-style: no copy carries a year -> all group as before.
+  const tm = { tmdb_id: 9, tmdb_title: "Citadel", source: "tmdb", original_language: "en", year: "2023" };
+  const ser = [S(1, "Citadel", 108, []), S(2, "Citadel (Hindi)", 108, []), S(3, "Citadel (Tamil)", 108, [])];
+  const o = opts(Object.fromEntries(ser.map((x) => [x.id, tm]))); o.titleKeyOf = (s) => plainKey({ name: s.name.replace(/\([^)]*\)/g, " ") }); o.normTitle = plainNorm; o.mode = "series";
+  const sg = buildVariantIndex(ser, o).groupOf;
+  assert.equal(sg.get(2), sg.get(1)); assert.equal(sg.get(3), sg.get(1));
+});

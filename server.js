@@ -3261,6 +3261,7 @@ function variantOptsFor(mode, actx = currentAccount()) {
   for (const cat of (loadCategoriesFromDiskSync(mode, actx) || [])) catNames.set(String(cat.category_id), cat.category_name);
   const catOf = (s) => catNames.get(String(s.category_id)) || null;
   return {
+    mode,
     memo: variantMemo,
     tmdbOf: (s) => tmdbCache[`${mode}:${s.id}`] || null,
     catNameOf: catOf,

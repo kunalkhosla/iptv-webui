@@ -34,7 +34,19 @@ Home rails are not changed. They still use `assignVariants` / `makeVariantHider`
   - Everything else splits off and groups by its own title + year. Examples: "Ash (2025)" cached as
     *Avatar: Fire and Ash*, "Dhurandhar (2025)" cached as its 2026 sequel, "Blink (2024)" cached
     as *Blink Twice*.
-  - A panel year more than one year off TMDB's also splits off.
+  - Year check, using the release year written as `(YYYY)` in the panel name. A bare
+    "Reply 1988" is part of the name, not a year.
+    - A copy with TMDB's year stays. When no copy has TMDB's year, the copies' most common year is
+      the reference instead.
+    - One year off stays only when the title text is the TMDB title or a title already present
+      with the reference year. More than one year off never joins.
+    - A copy with **no** year never joins a group that has dated copies. The one exception is when
+      exactly one dated copy stays, the bare copy's title equals the TMDB title, it names its
+      language ("Dil Se.. (Hindi)") and its category is not a dubbed one. Example: "Dil Se" (no
+      year, SOUTH INDIAN | HINDI DUBBED) was matched to *Dil Se..* (1998) by title alone, but it is
+      a different film and now stays a separate tile.
+    - Movies: an undated copy in a `*DUBBED*` category always stays alone.
+    - Groups where no copy has a year (most series) are not affected.
 - Copies without a usable TMDB match group by normalized title + year (`dedupTitleKey`). When the
   key has a year and exactly one TMDB group has that title + year, they join it.
 - Builds never happen in a request:
@@ -50,7 +62,7 @@ Home rails are not changed. They still use `assignVariants` / `makeVariantHider`
 | Source | Example | Result |
 |---|---|---|
 | Title says so | `(Hindi)`, `(Teugu)`, or 2+ languages in one bracket: `[Tel,Tam,Hin]`, `(Hindi, English)`, `(Multi Languages)` | `lang` = `hi` / `te` / `multi` (definite) |
-| Category name names one language | `TAMIL \| 2026 4K`, `HINDI DUBBED`, multi-audio category. Subtitle categories (`SUB`, `SUBS`, `SUBTITLED`) never count | `lang` definite |
+| Category name names one language (or `MYANMAR`/`BURMA` -> Burmese `my`) | `TAMIL \| 2026 4K`, `HINDI DUBBED`, multi-audio category. Subtitle categories (`SUB`, `SUBS`, `SUBTITLED`) never count | `lang` definite |
 | Otherwise | `INDIAN 2026 4K` | `lang: null`, `langName: null`, `langGuess` = TMDB `original_language`, else the stream's region-default tag (INDIAN -> hi). Clients must show this as "likely Hindi", never as Hindi. |
 
 `multi` = a multi-audio bundle (`langName` "Multi-audio").
