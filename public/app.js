@@ -3618,7 +3618,8 @@ function logoIsDark(img) {
 }
 function setTitleLogo(titleEl, url, alt) {
   const img = titleLogoImg(titleEl);
-  if (!img || !url) return;
+  if (!img) return;
+  if (!url) { clearTitleLogo(titleEl); return; }
   if (img.dataset.want === url) return;
   img.dataset.want = url;
   const probe = new Image();
@@ -3627,6 +3628,7 @@ function setTitleLogo(titleEl, url, alt) {
     if (img.dataset.want !== url) return; // navigated away
     img.style.filter = logoIsDark(probe) ? "brightness(0) invert(1)" : "";
     img.alt = alt || "";
+    img.crossOrigin = "anonymous";
     img.src = url;
     img.hidden = false;
     titleEl.classList.add("has-logo");
@@ -5034,6 +5036,7 @@ async function applyTmdbToDetail(mode, item) {
   // Always update the override menu line (even on no-match it should
   // say "No TMDB match").
   if (typeof renderPosterMenu === "function") renderPosterMenu(mode, item, d);
+  setTitleLogo(el.seriesTitle, d && d.logo, d && (d.tmdb_title || item.name));
   // Render the TMDB extras even on no-match — that just hides every
   // optional block — so the previous item's data doesn't leak into
   // the next item's detail page.
@@ -5043,7 +5046,6 @@ async function applyTmdbToDetail(mode, item) {
   // ("Bajirao Mastani (2015)(4k)(Hindi)" → "Bajirao Mastani"). Falls
   // back to the panel name when there's no TMDB match.
   if (d.tmdb_title) el.seriesTitle.textContent = d.tmdb_title;
-  setTitleLogo(el.seriesTitle, d.logo, d.tmdb_title || item.name);
   // Artwork: TMDB poster + TMDB backdrop are nearly always nicer than
   // the panel's. Falls back to the panel image if TMDB has only one.
   const tmdbBackdrop = d.backdrop || d.poster || null;

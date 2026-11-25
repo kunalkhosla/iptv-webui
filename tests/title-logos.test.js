@@ -46,3 +46,19 @@ test("applyLogo stores only the path string (null when none)", () => {
   assert.equal(e.logo, null);
   assert.ok(!("logos" in e));
 });
+
+test("kind comes from tmdb_kind, not the key prefix (movie key holding a TV id)", () => {
+  const entries = [
+    ["movie:1", { source: "tmdb", tmdb_id: 7, tmdb_kind: "series" }],
+    ["movie:2", { source: "tmdb", tmdb_id: 8 }],
+  ];
+  const c = logoBackfillCandidates({ entries });
+  assert.deepEqual(c.map((x) => `${x.kind}:${x.tmdbId}`).sort(), ["movie:8", "series:7"]);
+  const { backfillCandidates } = require("../lib/new-trailers");
+  const t = backfillCandidates({ entries });
+  assert.deepEqual(t.map((x) => `${x.kind}:${x.tmdbId}`).sort(), ["movie:8", "series:7"]);
+});
+test("candidates sorted by popularity", () => {
+  const entries = [["movie:1", { source: "tmdb", tmdb_id: 1, popularity: 5 }], ["movie:2", { source: "tmdb", tmdb_id: 2, popularity: 50 }]];
+  assert.deepEqual(logoBackfillCandidates({ entries }).map((x) => x.tmdbId), [2, 1]);
+});
