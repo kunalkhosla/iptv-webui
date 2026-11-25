@@ -4831,11 +4831,16 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/index.m3u8", async (re
   const baseKey = transcoderKey(req.params.mode, req.params.id, quality, offsetSecs, audio, diskSel, 0);
   const autoMode = vod && atExplicit == null && atServer == null;
   const aliased = autoMode ? transcoders.get(autoTrackAlias.get(baseKey)) : null;
-  const { audioTrack, autoPick } = audioTracksLib.effectiveAudioTrack({
+  let { audioTrack, autoPick } = audioTracksLib.effectiveAudioTrack({
     vod, explicit: atExplicit, serverPick: atServer,
-    aliasedTrack: aliased && !aliased.stopping ? (aliased.audioTrack || 0) : null,
+    aliasedTrack: aliased && !aliased.stopping ? (aliased.keyTrack || 0) : null,
     cachedPick: autoMode && !aliased ? cachedAudioPick(req.params.mode, req.params.id) : null,
   });
+  // An explicit/server index past the cached track count would map no audio.
+  if (!aliased && audioTrack > 0) {
+    const c = panelTracksCache[`${req.params.mode}:${req.params.id}`];
+    audioTrack = audioTracksLib.clampTrack(audioTrack, c?.audioTracks?.length || null);
+  }
   // Admission control. The killer here SIGTERMs the ffmpeg so the
   // upstream panel slot is freed when this owner gets displaced.
   const owner = ownerKeyOf(req);
@@ -4864,7 +4869,8 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/index.m3u8", async (re
         // Segment URLs carry the same quality tag AND offset so the
         // segment route can route to the right ffmpeg dir even when
         // the user has flipped quality or re-anchored mid-stream.
-        const qq = segmentQuery({ quality, offsetSecs, audio, diskSel, audioTrack: t.audioTrack || 0 });
+        // The KEY's track (not the mapped one: a failover maps 0 under "-atN").
+        const qq = segmentQuery({ quality, offsetSecs, audio, diskSel, audioTrack: t.keyTrack || 0 });
         // Pass 1: before a respawn-boundary segment, inject #EXT-X-DISCONTINUITY
         // *ahead of* its #EXTINF (HLS requires it precede the segment's EXTINF,
         // not sit between EXTINF and the URI) so the player resets its decoder
@@ -13338,6 +13344,7 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
   };
   entry.proc = ffmpeg;
   entry.key = key;
+  entry.keyTrack = audioTracksLib.keyTrackOf(key); // track the KEY encodes (segment URLs, alias)
   entry.dir = dir;
   entry.sourceUrl = sourceUrl;
   entry.startedAt = Date.now();

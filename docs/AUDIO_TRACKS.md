@@ -53,7 +53,11 @@ URL maps (explicit `at` passed to `/api/stream`, else the server pick, else 0).
 Clients start their Audio selection from it and send `&at=k` only for an
 explicit choice different from the current one. Transcoders are keyed by the
 EFFECTIVE track (`-atN`), so key == what ffmpeg maps: an explicit `at=0` never
-reuses a transcoder that auto-picked track 2.
+reuses a transcoder that auto-picked track 2. Segment URLs and the auto alias use the
+track the KEY encodes (`entry.keyTrack`), not the mapped one (`audioTrack`):
+a failed-over alternate maps 0 under the original `-atN` key. An explicit/`ap`
+index past the cached track count falls back to 0 (`-map 0:a:N?` would
+otherwise drop audio silently).
 
 ### Default pick (`chooseAudioTrack`)
 

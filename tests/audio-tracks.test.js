@@ -337,3 +337,43 @@ test("web client sends an explicit &at= (0 included) and adopts the server pick"
   assert.match(APP, /state\.playing\.audioTrack = resolved\.audioTrack;/);
   assert.match(APP, /audioTrack >= 0;/);
 });
+
+// ---- key track vs mapped track (failover) ---------------------------------
+const { keyTrackOf, clampTrack } = require("../lib/audio-tracks");
+const { segmentQuery } = require("../lib/segment-query");
+
+test("failover with ap=2: segment URLs carry the KEY's track and resolve to the same key", () => {
+  // ap=2 play -> key ...-at2; its source dies and fails over to an alternate
+  // that maps track 0 (audioTrack 0, trackReset) under the SAME key.
+  const key = "movie-123-med-at2";
+  const entry = { key, keyTrack: keyTrackOf(key), audioTrack: 0, trackReset: true };
+  const qq = segmentQuery({ quality: "med", audioTrack: entry.keyTrack });
+  assert.equal(qq, "q=med&at=2");
+  const q = Object.fromEntries(new URLSearchParams(qq));
+  assert.equal(resolveAudioTrackParam(q).explicit, 2);          // segment route -> ...-at2
+  assert.equal(keyTrackOf("movie-123-med"), 0);
+  assert.equal(keyTrackOf("movie-123-med-surround-t300-at11"), 11);
+  // the mapped track (0) would have produced a key without -at2: the 404 bug
+  assert.equal(segmentQuery({ quality: "med", audioTrack: entry.audioTrack }), "q=med");
+});
+
+test("re-keying updates keyTrack with the key", () => {
+  const map = new Map();
+  const e = { key: "series-9-low", keyTrack: 0 };
+  map.set(e.key, e);
+  rekeyTranscoder(map, e, "series-9-low", "series-9-low-at3");
+  assert.equal(e.keyTrack, 3);
+});
+
+test("server wires keyTrack into segment URLs and the auto alias", () => {
+  assert.match(SERVER, /segmentQuery\(\{ quality, offsetSecs, audio, diskSel, audioTrack: t\.keyTrack \|\| 0 \}\)/);
+  assert.match(SERVER, /aliasedTrack: aliased && !aliased\.stopping \? \(aliased\.keyTrack \|\| 0\)/);
+  assert.match(SERVER, /entry\.keyTrack = audioTracksLib\.keyTrackOf\(key\)/);
+});
+
+test("clampTrack: out-of-range explicit/server index falls back to 0", () => {
+  assert.equal(clampTrack(5, 3), 0);
+  assert.equal(clampTrack(2, 3), 2);
+  assert.equal(clampTrack(2, null), 2);
+  assert.equal(clampTrack(-1, 3), 0);
+});

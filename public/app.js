@@ -2701,7 +2701,7 @@ function refreshAudioButton() {
   const p = state.playing;
   const tracks = (p && (p.mode === "movie" || p.mode === "series")) ? (p.audioTracks || []) : [];
   el.playerAudio.hidden = tracks.length <= 1;
-  el.playerAudio.classList.toggle("on", !!(p && p.audioTrack));
+  el.playerAudio.classList.toggle("on", !!(p && p.audioExplicit && p.audioTrack));
 }
 // Apply an audio-track choice mid-playback: re-play with an explicit
 // &at=<index> (0 included — it must override the server's default pick,
