@@ -87,18 +87,25 @@ test("contract: /api/search/all returns { q, movie, series, live }", () => {
 });
 
 // --- Title variants (docs/VARIANTS.md) — search tiles carry the group's
-// variant fields (spread from lib/variants tileVariantFields) and the detail
-// screens' "Watch in" picker reads GET /api/variants/:mode/:id.
+// variant fields (spread from lib/variants tileVariantFields; TV route by
+// default, /api/search/all only with ?group=1) and the detail screens'
+// "Watch in" picker reads GET /api/variants/:mode/:id (lib variantsPayload).
 test("contract: search tiles carry variant fields; /api/variants shape", () => {
   for (const re of [/app\.get\("\/api\/search\/:mode/, /app\.get\("\/api\/search\/all/]) {
     const h = handlerFor(re);
-    assert.match(h, /\.\.\.tileVariantFields\(resolved\)/, `${re}: tiles must spread tileVariantFields`);
+    assert.match(h, /tileVariantFields\(resolved\)/, `${re}: tiles must spread tileVariantFields`);
   }
-  const { tileVariantFields } = require("../lib/variants");
+  assert.match(handlerFor(/app\.get\("\/api\/search\/all/), /req\.query\.group === "1"/, "/api/search/all grouping is opt-in");
+  const { tileVariantFields, variantsPayload } = require("../lib/variants");
   const tile = tileVariantFields({ variants: [{ id: 1, lang: "hi", langName: "Hindi", langGuess: null, langGuessName: null, quality: "FHD", lowQuality: false, name: "X (Hindi)", isPrimary: true }] });
   for (const k of ["lang", "langName", "langGuess", "langGuessName", "quality", "variantCount", "variants"]) assert.ok(k in tile, k);
   const h = handlerFor(/app\.get\("\/api\/variants\/:mode/);
-  expectFields("/api/variants/:mode/:id", h, ["mode", "id", "tmdb_id", "originalLanguage", "primaryId", "variantCount", "variants"]);
+  assert.ok(h, "/api/variants handler");
+  assert.match(h, /variantsPayload\(/);
+  assert.match(h, /isKidBlocked: makeKidsBlocker\(activeProfile\)/, "/api/variants must apply the kid gate");
+  const s = { id: 7, name: "Solo (2020)", category_id: "1", tags: [] };
+  const p = variantsPayload({ mode: "movie", s, index: null, opts: { tmdbOf: () => null, catNameOf: () => null, titleKeyOf: () => null } });
+  for (const k of ["mode", "id", "tmdb_id", "originalLanguage", "primaryId", "variantCount", "variants"]) assert.ok(k in p, k);
 });
 
 // --- /api/stream/:mode/:id.:ext — consumed by HA, web, Android.

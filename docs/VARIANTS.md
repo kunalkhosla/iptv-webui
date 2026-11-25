@@ -3,8 +3,17 @@
 The panel lists one film or show once per audio language and quality, for example
 "Dhurandhar: The Revenge (2026) (Hindi)", "... (Tamil)", "... (Telugu)", and several "(4K)"
 copies filed under per-language 4K categories. The server groups those copies into one
-**title** and returns one search result per title. Each result lists its copies in
+**title**. Grouped search returns one result per title, and each result lists its copies in
 `variants`, so a client can offer a "Watch in" picker.
+
+| Route | Grouped? | Client |
+|---|---|---|
+| `GET /api/search/:mode` | yes, always (movie/series) | Android TV (picker being built) |
+| `GET /api/search/all` | only with `?group=1` | Phone sends `group=1` once its picker ships. Web stays ungrouped |
+| `GET /api/variants/:mode/:id` | n/a | detail-screen picker |
+
+Without `group=1`, `/api/search/all` is unchanged: an onboarded language's dub keeps its own
+tile next to the bare title (decision 2026-08-09), and there are no variant fields.
 
 Code: `lib/variants.js` (pure, tested in `tests/variants.test.js`), wired in `server.js`
 (`variantIndexFor`, `/api/search/:mode`, `/api/search/all`, `/api/variants/:mode/:id`).
@@ -14,34 +23,58 @@ Home rails are not changed. They still use `assignVariants` / `makeVariantHider`
 
 - Movies and series both group by **TMDB id** (series copies in different languages are separate
   series ids. Each copy keeps its own seasons).
-- TMDB matches are checked against the title. Inside one TMDB id, a copy stays only when its panel
-  title equals the TMDB title or the group's most common panel title. A wrong match such as
-  "Ash (2025)" cached as *Avatar: Fire and Ash* splits off. A panel year more than one year off
-  TMDB's also splits off.
-- Copies without a usable TMDB match group by normalized title + year (`dedupTitleKey`). When
-  exactly one TMDB group has that title + year, they join it.
-- The index is precomputed per catalog index and `catalogGen` (about 0.5 s for 66k movies, and it
-  runs off the request path after a reindex). A stale build keeps serving for up to 60 s while
-  `catalogGen` changes, then rebuilds in the background.
+- TMDB matches are checked against the title. Inside one TMDB id:
+  - if some copies' panel title equals the TMDB title, only those stay;
+  - otherwise the most common panel title stays (ties break on the title text, so iteration order
+    doesn't matter).
+  - Everything else splits off and groups by its own title + year. Examples: "Ash (2025)" cached as
+    *Avatar: Fire and Ash*, "Dhurandhar (2025)" cached as its 2026 sequel, "Blink (2024)" cached
+    as *Blink Twice*.
+  - A panel year more than one year off TMDB's also splits off.
+- Copies without a usable TMDB match group by normalized title + year (`dedupTitleKey`). When the
+  key has a year and exactly one TMDB group has that title + year, they join it.
+- Builds never happen in a request:
+  - The index is built in the background after each index load (`assignVariants`), only once
+    `ix.ready`. A build takes about 1 s cold or 0.25 s warm (memoized) for 66k movies.
+  - While `catalogGen` changes (TMDB backfill), the previous build keeps serving and a rebuild runs
+    at most every 2 minutes.
+  - With no build yet, search serves ungrouped results and `/api/variants` returns the copy alone.
+  - Streams added since the last build group on their own until the next one.
 
 ## Language of a copy
 
 | Source | Example | Result |
 |---|---|---|
-| Title says so | `(Hindi)`, `(Teugu)`, `[Tel,Tam,Hin]` | `lang` = `hi` / `te` / `multi` (definite) |
-| Category name names one language | `TAMIL \| 2026 4K`, `HINDI DUBBED`, multi-audio category | `lang` definite |
-| Otherwise | `INDIAN 2026 4K` | `lang: null`, `langName: null`, `langGuess` = the stream's language tag (region default, e.g. INDIAN -> hi), else TMDB `original_language`. Clients must show this as "likely Hindi", never as Hindi. |
+| Title says so | `(Hindi)`, `(Teugu)`, or 2+ languages in one bracket: `[Tel,Tam,Hin]`, `(Hindi, English)`, `(Multi Languages)` | `lang` = `hi` / `te` / `multi` (definite) |
+| Category name names one language | `TAMIL \| 2026 4K`, `HINDI DUBBED`, multi-audio category. Subtitle categories (`SUB`, `SUBS`, `SUBTITLED`) never count | `lang` definite |
+| Otherwise | `INDIAN 2026 4K` | `lang: null`, `langName: null`, `langGuess` = TMDB `original_language`, else the stream's region-default tag (INDIAN -> hi). Clients must show this as "likely Hindi", never as Hindi. |
 
 `multi` = a multi-audio bundle (`langName` "Multi-audio").
 
 ## Primary and order
 
 Primary = the copy the tile shows and plays by default:
-1. Original language (TMDB `original_language`). This applies when the profile has no language
-   chips or includes that language; otherwise the profile's own languages come first.
-2. Copies with a definite language before copies with a guessed one.
-3. Best quality: `4K` > `FHD` > `HD` > unknown > `SD`.
-4. CAM / pre-retail copies (`lowQuality`) are primary only when nothing else is left.
+1. A language word in the query (`/api/search/all` facet, e.g. "hindi action") comes first.
+2. Next, the original language (TMDB `original_language`). This applies when the profile has no
+   language chips or includes that language; otherwise the profile's own languages come first.
+3. Within one language:
+   - copies with a definite language before copies with a guessed one;
+   - more episodes first (hook only: series episode counts are not in the index, so this is
+     inactive today);
+   - the home rails' canonical copy (`assignVariants`) before others, so home and search show the
+     same id;
+   - best quality: `4K` > `FHD` > `HD` > unknown > `SD`.
+4. CAM / pre-retail copies (`lowQuality`: the `cam` tag or `isLowQuality`, the same test as
+   `assignVariants`) are primary only when nothing else is left.
+
+Quality: `4K` only from the stream's `4k` tag, which the resolution probe already demotes
+(`applyQualityDemotion`). A probed resolution (`quality-cache.json`) overrides title/category text.
+
+Home vs search ids: progress is keyed `mode:id` per copy, and Continue Watching shows the exact id
+that was played. Favourites are resolved to the profile's chosen copy on home. So a different
+primary on home and search loses nothing. It does differ when home's canonical has only a guessed
+language. Dhurandhar is the example: home shows 796884 (INDIAN 4K, which `assignVariants` treats
+as Hindi), while search shows 729968, the definite Hindi copy.
 
 `variants` order: the primary first, then the original language, then the profile's onboarded
 languages (in their order), then Hindi, then English, then the other languages, then `multi`.
@@ -57,7 +90,7 @@ Within one language: non-CAM, definite, then best quality first.
 - Profile language chips: copies whose language is **known** and not in the profile's onboarded
   languages are dropped, unless that would drop the whole title. Unknown and `multi` copies stay.
 
-## Search tiles: `/api/search/:mode` (TV) and `/api/search/all` (web, phone)
+## Search tiles: `/api/search/:mode` (TV) and `/api/search/all?group=1`
 
 Movie/series results: **one tile per title**. Every existing field is unchanged and describes the
 primary copy (`id`, `name`, `poster`, `dubLang`, ...). These fields are added:
@@ -74,9 +107,8 @@ primary copy (`id`, `name`, `poster`, `dubLang`, ...). These fields are added:
 
 Live and disk results are unchanged (no variant fields).
 
-Behaviour change: `/api/search/all` used to return an onboarded language's dub as its own tile
-next to the bare title ("Kohrra" + "Kohrra (Hindi)"). It now returns one tile, and the dub is in
-`variants`.
+Language keys: `/api/search/:mode` and `/api/variants` use the mode's chips, else movie, else
+live (`profileModeKeys`). `/api/search/all` uses the movie chips, else live.
 
 ## `variants[]` entry
 
@@ -113,8 +145,9 @@ mode: play it, open its detail page, and so on. When `lang` is set, `langGuess` 
 }
 ```
 
-- Same grouping, filters and order as search. The requested copy is always listed, even when the
-  profile's language filters would hide it.
+- Same grouping, filters, language keys and order as `/api/search/:mode`. The requested copy is
+  always listed, even when the profile's language filters would hide it.
+- Before the first background build, the response lists only the requested copy.
 - `404 {"error":"not_found"}` when the id is not in the catalog.
 - Kid profile + requested copy not kid-safe: `200` with `variants: []`, `variantCount: 0` and null
   `tmdb_id` / `originalLanguage` / `primaryId`. Show no picker.

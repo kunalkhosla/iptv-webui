@@ -3123,7 +3123,7 @@ function scheduleStreamingBuzz() {
 // a multi-language bundle. The winner carries `variants`; the rest are
 // flagged `isAlt` with `canonicalId` and hidden from rails/search/taste
 // (variantChoice below can swap the winner per profile language).
-const { LANG_WORDS: AUDIO_LANG_WORDS, buildVariantIndex, resolveGroup, tileVariantFields } = require("./lib/variants");
+const { LANG_WORDS: AUDIO_LANG_WORDS, buildVariantIndex, resolveGroup, tileVariantFields, variantsPayload } = require("./lib/variants");
 function streamAudioLang(s, catName) {
   const name = String(s.name || "");
   if (/\[[^\]]*,[^\]]*\]/.test(name)) return "multi";                  // "[Tel,Tam,Hin,Eng]"
@@ -3196,7 +3196,7 @@ function assignVariants(mode, actx = currentAccount()) {
   catalogGen++;
   console.log(`[${mode}] variants: ${grouped} multi-version titles, ${hidden} alternates folded`);
   // Warm the search/detail title groups off the request path.
-  setImmediate(() => { try { variantIndexFor(mode, ix, actx); } catch (e) { console.warn(`[${mode}] variant index: ${e.message}`); } });
+  scheduleVariantBuild(mode, ix, actx);
 }
 // Per-request: should stream `s` be hidden because another variant of the same
 // title is the one this profile should see? `passes(stream)` = the profile's
@@ -3238,55 +3238,87 @@ function makeVariantHider(ix, passes, profileIso) {
 
 // ── Search/detail title groups (lib/variants.js, docs/VARIANTS.md) ──
 // Every movie/series stream mapped to its title group (TMDB id, else
-// title+year). Built once per index Map and catalog generation (~0.5s for 66k
-// movies). catalogGen churns during TMDB backfill, so a stale build keeps
-// serving while a rebuild runs off the request path (at most once a minute);
-// streams added since then group on their own until it lands.
+// title+year). Built off the request path: after each index load
+// (assignVariants) and, while catalogGen churns (TMDB backfill), at most every
+// 2 minutes in the background while the previous build keeps serving. A
+// request never builds: with no build yet (or an index still filling) callers
+// get null and serve ungrouped results. Streams added since the last build
+// group on their own until the next one.
 const variantIndexCache = new WeakMap(); // ix.byId -> { gen, at, vix, opts }
 const variantRebuildPending = new WeakSet();
+const variantMemo = new WeakMap(); // stream -> regex-derived fields (lib memo)
+const VARIANT_REBUILD_MIN_MS = 2 * 60 * 1000;
+function probedQualityOf(mode, s) {
+  if (mode !== "movie") return null;
+  const v = qualityCache[`movie:${s.id}`];
+  if (!v || !(v.w || v.h)) return null;
+  if (v.is4k) return "4K";
+  if (v.h >= 1000 || v.w >= 1900) return "FHD";
+  if (v.h >= 700 || v.w >= 1260) return "HD";
+  return "SD";
+}
 function buildVariantEntry(mode, ix, actx) {
   const catNames = new Map();
   for (const cat of (loadCategoriesFromDiskSync(mode, actx) || [])) catNames.set(String(cat.category_id), cat.category_name);
+  const catOf = (s) => catNames.get(String(s.category_id)) || null;
   const opts = {
+    memo: variantMemo,
     tmdbOf: (s) => tmdbCache[`${mode}:${s.id}`] || null,
-    catNameOf: (s) => catNames.get(String(s.category_id)) || null,
+    catNameOf: catOf,
     titleKeyOf: (s) => dedupKeyOf(s),
     normTitle: (x) => { const k = dedupTitleKey(x); return k ? k.slice(0, k.lastIndexOf("|")) : null; },
-    isLowQuality: (s) => isLowQuality(s, catNames.get(String(s.category_id))),
+    // Same CAM test as assignVariants (synthetic "cam" tag + title/category text).
+    isLowQuality: (s) => (s.tags || []).includes("cam") || isLowQuality(s, catOf(s)),
     tagLangOf: (s) => isoLangForItem(s),
+    probedQuality: (s) => probedQualityOf(mode, s),
+    // The copy home rails show (assignVariants canonical): same id on home and search.
+    isCanonical: (s) => !s.isAlt && Array.isArray(s.variants),
+    // Series episode counts are not in the index (only per-title info calls), so
+    // no episodeCountOf: see docs/VARIANTS.md.
   };
   const t0 = Date.now();
-  const gen = catalogGen;
-  const entry = { gen, at: Date.now(), vix: buildVariantIndex(ix.byId.values(), opts), opts };
+  const entry = { gen: catalogGen, at: Date.now(), vix: buildVariantIndex(ix.byId.values(), opts), opts };
   variantIndexCache.set(ix.byId, entry);
   const ms = Date.now() - t0;
   if (ms > 250) console.log(`[${mode}] variant index: ${entry.vix.groups.size} groups in ${ms}ms`);
   return entry;
 }
+function scheduleVariantBuild(mode, ix, actx) {
+  const byId = ix.byId;
+  if (variantRebuildPending.has(byId)) return;
+  variantRebuildPending.add(byId);
+  setImmediate(() => {
+    try { if (ix.byId === byId && ix.ready) buildVariantEntry(mode, ix, actx); }
+    catch (e) { console.warn(`[${mode}] variant index build failed: ${e.message}`); }
+    finally { variantRebuildPending.delete(byId); }
+  });
+}
 function variantIndexFor(mode, ix, actx = currentAccount()) {
   if ((mode !== "movie" && mode !== "series") || !ix?.byId?.size) return null;
   const c = variantIndexCache.get(ix.byId);
-  if (!c) return buildVariantEntry(mode, ix, actx);
-  if (c.gen !== catalogGen && Date.now() - c.at >= 60 * 1000 && !variantRebuildPending.has(ix.byId)) {
-    const byId = ix.byId;
-    variantRebuildPending.add(byId);
-    setImmediate(() => {
-      try { if (ix.byId === byId) buildVariantEntry(mode, ix, actx); }
-      catch (e) { console.warn(`[${mode}] variant index rebuild failed: ${e.message}`); }
-      finally { variantRebuildPending.delete(byId); }
-    });
-  }
+  if (!ix.ready) return c || null; // never build on a partially filled index
+  if (!c) { scheduleVariantBuild(mode, ix, actx); return null; }
+  if (c.gen !== catalogGen && Date.now() - c.at >= VARIANT_REBUILD_MIN_MS) scheduleVariantBuild(mode, ix, actx);
   return c;
 }
 function variantGroupOf(entry, s) {
   return entry.vix.groupOf.get(s.id) || buildVariantIndex([s], entry.opts).groupOf.get(s.id);
 }
 // Profile language context for resolveGroup: onboarded language keys -> ISO
-// (null when not onboarded); sort order = onboarded languages, then Hindi, English.
-function variantLangCtx(langKeys) {
+// (null when not onboarded); sort order = onboarded languages, then Hindi,
+// English. `facetIso` (a language word in the query) outranks everything.
+function variantLangCtx(langKeys, facetIso = null) {
   const iso = (langKeys || []).map((k) => LANG_TAG_TO_ISO[k]).filter(Boolean);
   const preferLangs = [...new Set([...iso, "hi", "en"])];
-  return { profileLangs: iso.length ? new Set(iso) : null, preferLangs };
+  return { profileLangs: iso.length ? new Set(iso) : null, preferLangs, firstLang: facetIso || null };
+}
+// Onboarded keys for a per-mode search / variants request: the mode's own
+// chips, else movie, else live (/api/search/:mode and /api/variants agree).
+function profileModeKeys(userState, mode) {
+  const g = userState.filter?.groups || {};
+  if (Array.isArray(g[mode]) && g[mode].length) return g[mode];
+  if (Array.isArray(g.movie) && g.movie.length) return g.movie;
+  return g.live || [];
 }
 
 async function loadIndexFromDisk(mode, actx = currentAccount()) {
@@ -8776,6 +8808,7 @@ app.get("/api/search/all", async (req, res, next) => {
   try {
   const q = String(req.query.q || "").trim().toLowerCase();
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 60);
+  const groupTitles = req.query.group === "1"; // docs/VARIANTS.md
   if (!q) return res.json({ q, disk: [], movie: [], series: [], live: [] });
 
   const userState = getProfileState(req.profileId);
@@ -8995,13 +9028,15 @@ app.get("/api/search/all", async (req, res, next) => {
       (x) => titleLangPasses(x.name) && !isKidBlocked(x) && !(onboarded && suffixOf(x.name) && !langPref.includes(suffixOf(x.name))),
       onboarded ? new Set(modeKeys.map((k) => LANG_TAG_TO_ISO[k]).filter(Boolean)) : null,
     );
-    // Movies/series: one result per TITLE group (lib/variants.js). A member
-    // that passes the profile gates claims its group's slot; the tile shows
-    // the group's primary copy plus the `variants` picker list.
-    const vEntry = variantIndexFor(mode, ix);
+    // `?group=1` (opt-in; the phone sends it once its picker ships): one
+    // result per TITLE group (lib/variants.js). A member that passes the
+    // profile gates claims its group's slot; the tile shows the group's
+    // primary copy plus the `variants` picker list. Default (web, current
+    // phone): the separate onboarded-language dub tiles below, unchanged.
+    const vEntry = groupTitles ? variantIndexFor(mode, ix) : null;
     const vctx = vEntry ? {
       passes: (x) => titleLangPasses(x.name) && !isKidBlocked(x) && !(onboarded && suffixOf(x.name) && !langPref.includes(suffixOf(x.name))),
-      ...variantLangCtx(langPref),
+      ...variantLangCtx(langPref, parsed.lang),
     } : null;
     const seenGroups = new Set();
     // The result tile for `s`, or null when it is gated out / its title is
@@ -9012,9 +9047,8 @@ app.get("/api/search/all", async (req, res, next) => {
       const g = variantGroupOf(vEntry, s);
       if (seenGroups.has(g.key)) return null;
       seenGroups.add(g.key);
-      const resolved = resolveGroup(g, vctx);
+      const resolved = resolveGroup(g, vctx); // non-null: `s` itself passes
       seenIds.add(s.id);
-      if (!resolved) return projectTile(s);
       for (const v of resolved.variants) seenIds.add(v.id);
       return { ...projectTile(resolved.primary.s), ...tileVariantFields(resolved) };
     };
@@ -9328,12 +9362,7 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
   // language keys are per-mode with the usual fallback (mode → movie →
   // live); disk (owner-only local library) is never language-gated.
   const userState = getProfileState(req.profileId);
-  const modeKeys = (() => {
-    const g = userState.filter?.groups || {};
-    if (Array.isArray(g[mode]) && g[mode].length) return g[mode];
-    if (Array.isArray(g.movie) && g.movie.length) return g.movie;
-    return g.live || [];
-  })();
+  const modeKeys = profileModeKeys(userState, mode);
   const onboarded = mode !== "disk" && !!userState.filter?.onboarded && modeKeys.length > 0;
   const titleLangPasses = onboarded ? makeTitleLangFilter(new Set(modeKeys)) : () => true;
 
@@ -9378,8 +9407,8 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
       const g = variantGroupOf(vEntry, r.s);
       if (seenDedup.has(g.key)) continue;
       seenDedup.add(g.key);
-      const resolved = resolveGroup(g, vctx);
-      deduped.push(resolved ? { s: resolved.primary.s, resolved } : { s: r.s });
+      const resolved = resolveGroup(g, vctx); // non-null: r.s itself passes
+      deduped.push({ s: resolved.primary.s, resolved });
       continue;
     }
     const key = `${dedupTitleKey(r.s.name)}::${suffixOf(r.s.name) || "_"}`;
@@ -9413,7 +9442,7 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
       // side by side with identical posters, so the client badge needs
       // this to tell them apart.
       dubLang: mode !== "live" ? (suffixOf(s.name) || null) : null,
-      ...tileVariantFields(resolved),
+      ...(resolved ? tileVariantFields(resolved) : {}),
     };
   });
   // EPG programme-title pass for live — same rationale as the
@@ -9450,42 +9479,18 @@ app.get("/api/variants/:mode(movie|series)/:id", (req, res) => {
   const s = ix.byId.get(parseInt(raw, 10)) ?? ix.byId.get(raw);
   if (!s) return res.status(404).json({ error: "not_found" });
   const activeProfile = profiles.profiles.find((p) => p.id === req.profileId) || null;
-  const isKidBlocked = makeKidsBlocker(activeProfile);
-  const empty = { mode, id: s.id, tmdb_id: null, originalLanguage: null, primaryId: null, variantCount: 0, variants: [] };
-  if (isKidBlocked(s)) return res.json(empty);
   const userState = getProfileState(req.profileId);
-  const modeKeys = (() => {
-    const g = userState.filter?.groups || {};
-    if (Array.isArray(g[mode]) && g[mode].length) return g[mode];
-    if (Array.isArray(g.movie) && g.movie.length) return g.movie;
-    return g.live || [];
-  })();
+  const modeKeys = profileModeKeys(userState, mode); // same keys as /api/search/:mode
   const onboarded = !!userState.filter?.onboarded && modeKeys.length > 0;
-  const titleLangPasses = onboarded ? makeTitleLangFilter(new Set(modeKeys)) : () => true;
   const vEntry = variantIndexFor(mode, ix);
-  // The requested copy is always listed (the viewer is already on it); its
-  // siblings go through the profile's kid + title-language gates.
-  const resolved = vEntry ? resolveGroup(variantGroupOf(vEntry, s), {
-    passes: (x) => !isKidBlocked(x) && (x === s || titleLangPasses(x.name)),
-    ...variantLangCtx(onboarded ? modeKeys.filter((k) => LANGUAGE_GROUP_KEYS_SET.has(k)) : []),
-  }) : null;
-  if (!resolved) return res.json(empty);
-  // Profile language chips may have dropped the requested copy; keep it listed.
-  let variants = resolved.variants;
-  if (!variants.some((v) => v.id === s.id)) {
-    const solo = resolveGroup(buildVariantIndex([s], vEntry.opts).groupOf.get(s.id), {});
-    variants = [...variants, { ...solo.variants[0], isPrimary: false }];
-  }
-  const t = tmdbCache[`${mode}:${s.id}`];
-  res.json({
-    mode,
-    id: s.id,
-    tmdb_id: resolved.tmdbId || (t && t.source !== "no-match" ? t.tmdb_id : null) || null,
-    originalLanguage: resolved.origLang,
-    primaryId: resolved.primary.id,
-    variantCount: variants.length,
-    variants,
-  });
+  res.json(variantsPayload({
+    mode, s,
+    index: vEntry ? vEntry.vix : null,
+    opts: vEntry ? vEntry.opts : { tmdbOf: (x) => tmdbCache[`${mode}:${x.id}`] || null, catNameOf: () => null, titleKeyOf: () => null },
+    isKidBlocked: makeKidsBlocker(activeProfile),
+    titleLangPasses: onboarded ? makeTitleLangFilter(new Set(modeKeys)) : () => true,
+    ctx: variantLangCtx(onboarded ? modeKeys.filter((k) => LANGUAGE_GROUP_KEYS_SET.has(k)) : []),
+  }));
 });
 
 // EPG: programs for a live channel in a time window. Used by the

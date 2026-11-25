@@ -127,7 +127,7 @@ MCP_PUBLIC_URL=https://iptv.example.com
 
 ## Title variants (language / quality copies)
 
-Movie/series search (`/api/search/:mode`, `/api/search/all`) returns one tile per title. The tile is the original-language, best-quality copy and adds `langName`, `langGuess`, `quality`, `variantCount` and `variants[]` (every copy the profile may see). `GET /api/variants/:mode/:id` returns the same list for any copy, for a detail-screen "Watch in" picker. Kid-safe. See [docs/VARIANTS.md](docs/VARIANTS.md).
+Movie/series search (`/api/search/:mode`; `/api/search/all` only with `?group=1`) returns one tile per title. The tile is the original-language, best-quality copy and adds `langName`, `langGuess`, `quality`, `variantCount` and `variants[]` (every copy the profile may see). `GET /api/variants/:mode/:id` returns the same list for any copy, for a detail-screen "Watch in" picker. Kid-safe. See [docs/VARIANTS.md](docs/VARIANTS.md).
 
 ## Title logos
 

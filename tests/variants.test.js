@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { detectLang, qualityOf, buildVariantIndex, resolveGroup, tileVariantFields } = require("../lib/variants");
+const { detectLang, qualityOf, buildVariantIndex, resolveGroup, tileVariantFields, variantsPayload } = require("../lib/variants");
+const { makeKidsBlocker } = require("../lib/kids-filter");
 
 // Real panel rows for "Dhurandhar: The Revenge (2026)" (TMDB 1582770, original
 // language Hindi), plus the 2025 film and an unmatched spin-off.
@@ -55,12 +56,15 @@ test("detectLang: title suffix, category name, and unknown", () => {
   assert.deepEqual(detectLang("X (2026)", "TAMIL TELUGU MIX"), { lang: null, source: null });
 });
 
-test("qualityOf", () => {
-  assert.equal(qualityOf("X (4K)", "TAMIL", []), "4K");
+test("qualityOf: 4K only from the (probe-demoted) tag; probe wins", () => {
   assert.equal(qualityOf("X", "TAMIL", ["4k"]), "4K");
+  assert.equal(qualityOf("X (4K)", "TAMIL 4K", []), null); // tag demoted by the resolution probe
   assert.equal(qualityOf("X (Hindi)", "INDIAN | FHD 2026", []), "FHD");
   assert.equal(qualityOf("X 720p", "", []), "HD");
   assert.equal(qualityOf("X", "TAMIL | 2026", []), null);
+  assert.equal(qualityOf("X (4K)", "", ["4k"], "FHD"), "FHD");
+  const { groupOf } = buildVariantIndex([S(1, "F (2026) (4K)", 838, ["4k"])], { ...opts(), probedQuality: () => "HD" });
+  assert.equal(resolveGroup(groupOf.get(1), {}).variants[0].quality, "HD");
 });
 
 test("Dhurandhar: one group, Hindi primary, 4K Hindi guess labelled likely", () => {
@@ -153,30 +157,62 @@ test("unmatched twin joins its title's TMDB group; year mismatch does not", () =
   assert.notEqual(groupOf.get(12), groupOf.get(10));
 });
 
-test("wrong TMDB matches with a different panel title split off", () => {
-  const avatar = { tmdb_id: 83533, tmdb_title: "Avatar: Fire and Ash", source: "tmdb", original_language: "en", year: "2025" };
-  const streams = [
-    S(30, "Avatar: Fire and Ash (2025)(English)(4K)", 838, ["4k"]),
-    S(31, "Avatar: Fire and Ash (2025) (Hindi)", 766, ["hindi"]),
-    S(32, "Ash (2025)", 766, ["hindi"]),
-    S(33, "Ash (2025) (Hindi)", 766, ["hindi"]),
-    S(34, "Fire (2025) (Tamil)", 768, ["tamil"]),
+// Title check inside one TMDB id: probe cases from the live catalog, in both
+// iteration orders.
+const plainKey = (s) => s.name.replace(/\((\d{4})\).*$/, "").replace(/[^a-z0-9 ]/gi, " ").replace(/\s+/g, " ").trim().toLowerCase()
+  + "|" + ((/\((\d{4})\)/.exec(s.name) || [])[1] || "");
+const plainNorm = (x) => x.replace(/[^a-z0-9 ]/gi, " ").replace(/\s+/g, " ").trim().toLowerCase();
+function groupsBoth(streams, tm) {
+  const out = [];
+  for (const list of [streams, streams.slice().reverse()]) {
+    const o = opts(Object.fromEntries(list.map((x) => [x.id, tm])));
+    o.titleKeyOf = plainKey; o.normTitle = plainNorm;
+    out.push(buildVariantIndex(list, o).groupOf);
+  }
+  return out;
+}
+test("title check: TMDB title present -> only it stays (both orders)", () => {
+  const revenge = { tmdb_id: 1582770, tmdb_title: "Dhurandhar: The Revenge", source: "tmdb", original_language: "hi", year: "2026" };
+  const d = [
+    S(1, "Dhurandhar (2025) (Hindi)", 599, ["hindi"]), S(2, "Dhurandhar (2025) (Tamil)", 768, ["tamil"]),
+    S(3, "Dhurandhar (2025) (Telugu)", 770, ["telugu"]),
+    S(4, "Dhurandhar: The Revenge (2026) (Hindi)", 766, ["hindi"]), S(5, "Dhurandhar: The Revenge (2026)(4K)", 838, ["4k"]),
   ];
-  const o = opts(Object.fromEntries(streams.map((x) => [x.id, avatar])));
-  o.titleKeyOf = (s) => s.name.replace(/\((?:\d{4})\).*$/, "").replace(/[^a-z0-9 ]/gi, " ").replace(/\s+/g, " ").trim().toLowerCase() + "|2025";
-  o.normTitle = (x) => x.replace(/[^a-z0-9 ]/gi, " ").replace(/\s+/g, " ").trim().toLowerCase();
-  const { groupOf } = buildVariantIndex(streams, o);
-  assert.equal(groupOf.get(30), groupOf.get(31));
-  assert.equal(groupOf.get(30).key, "t:83533");
-  assert.equal(groupOf.get(32), groupOf.get(33));
-  assert.equal(groupOf.get(32).key, "n:ash|2025");
-  assert.notEqual(groupOf.get(34), groupOf.get(30));
-  // Most common panel title wins when it is not the TMDB title.
-  const o2 = opts(Object.fromEntries(streams.map((x) => [x.id, { ...avatar, tmdb_title: "Something Else" }])));
-  o2.titleKeyOf = o.titleKeyOf; o2.normTitle = o.normTitle;
-  const r2 = buildVariantIndex(streams, o2);
-  assert.equal(r2.groupOf.get(30), r2.groupOf.get(31));
-  assert.equal(r2.groupOf.get(30).key, "t:83533");
+  for (const g of groupsBoth(d, revenge)) {
+    assert.equal(g.get(4).key, "t:1582770");
+    assert.equal(g.get(5), g.get(4));
+    assert.equal(g.get(1).key, "n:dhurandhar|2025");
+    assert.equal(g.get(2), g.get(1));
+    assert.equal(g.get(3), g.get(1));
+  }
+  const blinkTm = { tmdb_id: 840705, tmdb_title: "Blink Twice", source: "tmdb", original_language: "en", year: "2024" };
+  const blink = [S(10, "Blink (2024)", 766, []), S(11, "Blink (2024) (Hindi)", 766, []), S(12, "Blink Twice (2024)", 766, [])];
+  for (const g of groupsBoth(blink, blinkTm)) {
+    assert.equal(g.get(12).key, "t:840705");
+    assert.equal(g.get(12).members.length, 1);
+    assert.equal(g.get(10).key, "n:blink|2024");
+    assert.equal(g.get(11), g.get(10));
+  }
+  const avatar = { tmdb_id: 83533, tmdb_title: "Avatar: Fire and Ash", source: "tmdb", original_language: "en", year: "2025" };
+  const av = [S(20, "Ash (2025)", 766, []), S(21, "Avatar: Fire and Ash (2025) (Hindi)", 766, [])];
+  for (const g of groupsBoth(av, avatar)) {
+    assert.equal(g.get(21).key, "t:83533");
+    assert.equal(g.get(20).key, "n:ash|2025");
+  }
+});
+
+test("title check: no TMDB title among them -> majority, ties stable (both orders)", () => {
+  const tm = { tmdb_id: 9, tmdb_title: "Something Else", source: "tmdb", original_language: "en", year: "2025" };
+  const maj = [S(1, "Ash (2025)", 766, []), S(2, "Avatar: Fire and Ash (2025)", 766, []), S(3, "Avatar: Fire and Ash (2025) (Hindi)", 766, [])];
+  for (const g of groupsBoth(maj, tm)) {
+    assert.equal(g.get(2).key, "t:9");
+    assert.equal(g.get(3), g.get(2));
+    assert.equal(g.get(1).key, "n:ash|2025");
+  }
+  const tie = [S(1, "Ash (2025)", 766, []), S(2, "Avatar: Fire and Ash (2025)", 766, [])];
+  const [a, b] = groupsBoth(tie, tm);
+  assert.equal(a.get(1).key, b.get(1).key);
+  assert.equal(a.get(2).key, b.get(2).key);
 });
 
 test("no TMDB original language: unknown copies get no guess", () => {
@@ -200,4 +236,96 @@ test("build is fast on a catalog-sized index", () => {
   const ms = Date.now() - t0;
   assert.ok(groups.size > 0);
   assert.ok(ms < 2000, `build took ${ms}ms`);
+});
+
+test("detectLang: subtitle categories, bracket lists, non-language brackets", () => {
+  assert.deepEqual(detectLang("X (2024)", "ENGLISH SUBTITLED"), { lang: null, source: null });
+  assert.deepEqual(detectLang("X (2024)", "KOREAN SUBS"), { lang: null, source: null });
+  assert.deepEqual(detectLang("X [2024, Remastered]", "MOVIES"), { lang: null, source: null });
+  assert.deepEqual(detectLang("Fast X (2023)(Hindi, English)", null), { lang: "multi", source: "title" });
+  assert.deepEqual(detectLang("Fast X (2023)[Tam, Tel, Hin, Eng)", null), { lang: "multi", source: "title" });
+  assert.deepEqual(detectLang("Furiosa (2024) (Multi Languages)", null), { lang: "multi", source: "title" });
+  assert.deepEqual(detectLang("Kingdom (2024) ( Tamil )", null), { lang: "ta", source: "title" });
+  assert.deepEqual(detectLang("Spanish Affair (Ocho Apellidos)", null), { lang: null, source: null });
+});
+
+test("unmatched copy joins a TMDB group only when its title key has a year", () => {
+  const tm = { tmdb_id: 77, source: "tmdb", original_language: "hi", year: "2020" };
+  const streams = [S(1, "Show (Hindi)", 766, []), S(2, "Show (Tamil)", 768, [])];
+  const o = opts({ 1: tm, 2: { source: "no-match" } });
+  o.titleKeyOf = () => "show|";
+  const { groupOf } = buildVariantIndex(streams, o);
+  assert.equal(groupOf.get(1).key, "t:77");
+  assert.equal(groupOf.get(2).key, "n:show|");
+});
+
+test("unknown copy: TMDB original language beats a region-default tag", () => {
+  const telugu = { tmdb_id: 88, source: "tmdb", original_language: "te", year: "2026" };
+  const streams = [S(1, "Pushpa 3 (2026)(4K)", 838, ["india", "hindi", "4k"])];
+  const { groupOf } = buildVariantIndex(streams, opts({ 1: telugu }));
+  const v = resolveGroup(groupOf.get(1), {}).variants[0];
+  assert.equal(v.lang, null);
+  assert.equal(v.langGuess, "te");
+  // No TMDB language: fall back to the tag.
+  const g2 = buildVariantIndex(streams, opts({ 1: { source: "no-match" } })).groupOf;
+  assert.equal(resolveGroup(g2.get(1), {}).variants[0].langGuess, "hi");
+});
+
+test("same-language ties: more episodes, then the home canonical, then quality", () => {
+  const tm = { tmdb_id: 5, source: "tmdb", original_language: "hi", year: "2023" };
+  const streams = [S(1, "Show (2023) (Hindi) FHD", 766, []), S(2, "Show (2023) (Hindi)", 766, []), S(3, "Show (2023) (Hindi) HD", 766, [])];
+  const base = opts({ 1: tm, 2: tm, 3: tm });
+  base.titleKeyOf = () => "show|2023";
+  assert.equal(resolveGroup(buildVariantIndex(streams, base).groupOf.get(1), {}).primary.id, 1);
+  const canon = { ...base, isCanonical: (s) => s.id === 3 };
+  assert.equal(resolveGroup(buildVariantIndex(streams, canon).groupOf.get(1), {}).primary.id, 3);
+  const eps = { ...canon, episodeCountOf: (s) => (s.id === 2 ? 40 : 8) };
+  assert.equal(resolveGroup(buildVariantIndex(streams, eps).groupOf.get(1), {}).primary.id, 2);
+  // A definite-language copy still beats a canonical guessed one.
+  const g = buildVariantIndex(STREAMS, { ...opts(), isCanonical: (s) => s.id === 796884 }).groupOf;
+  assert.equal(resolveGroup(g.get(729968), {}).primary.id, 729968);
+});
+
+test("query language facet outranks the original language", () => {
+  const { groupOf } = buildVariantIndex(STREAMS, opts());
+  const r = resolveGroup(groupOf.get(729968), { firstLang: "ta" });
+  assert.equal(r.primary.id, 787206);
+});
+
+// Route payload for GET /api/variants/:mode/:id (the handler only wires
+// profile gates into this function).
+test("variantsPayload: kids never see a non-kid-safe copy", () => {
+  const streams = STREAMS.map((s) => (s.id === 729973 || s.id === 729974 ? { ...s, us_cert: "PG" } : s));
+  const o = opts();
+  const index = buildVariantIndex(streams, o);
+  const kid = makeKidsBlocker({ id: "k", kidsBirthYear: new Date().getFullYear() - 9 });
+  const byId = new Map(streams.map((s) => [s.id, s]));
+  const blocked = variantsPayload({ mode: "movie", s: byId.get(729968), index, opts: o, isKidBlocked: kid });
+  assert.deepEqual(blocked.variants, []);
+  assert.equal(blocked.variantCount, 0);
+  assert.equal(blocked.tmdb_id, null);
+  assert.equal(blocked.primaryId, null);
+  const ok = variantsPayload({ mode: "movie", s: byId.get(729973), index, opts: o, isKidBlocked: kid });
+  assert.deepEqual(ok.variants.map((v) => v.id).sort(), [729973, 729974]);
+  assert.equal(ok.tmdb_id, 1582770);
+  const adult = variantsPayload({ mode: "movie", s: byId.get(729973), index, opts: o });
+  assert.equal(adult.variantCount, 9);
+  assert.equal(adult.primaryId, 729968);
+  assert.equal(adult.originalLanguage, "hi");
+});
+
+test("variantsPayload: language chips and the title guard; requested copy always listed", () => {
+  const o = opts();
+  const index = buildVariantIndex(STREAMS, o);
+  const byId = new Map(STREAMS.map((s) => [s.id, s]));
+  const hiEn = { profileLangs: new Set(["hi", "en"]), preferLangs: ["hi", "en"] };
+  const guard = (name) => !/\b(tamil|telugu|malayalam|kannada)\b/i.test(name);
+  const p = variantsPayload({ mode: "movie", s: byId.get(787206), index, opts: o, titleLangPasses: guard, ctx: hiEn });
+  assert.deepEqual(p.variants.map((v) => v.id), [729968, 796884, 787206]);
+  assert.equal(p.variants.filter((v) => v.isPrimary).length, 1);
+  const q = variantsPayload({ mode: "movie", s: byId.get(729973), index, opts: o, titleLangPasses: guard, ctx: hiEn });
+  assert.deepEqual(q.variants.map((v) => v.id), [729968, 796884, 729973]);
+  // Not built yet: the copy alone.
+  const solo = variantsPayload({ mode: "movie", s: byId.get(729973), index: null, opts: o });
+  assert.deepEqual(solo.variants.map((v) => v.id), [729973]);
 });
