@@ -45,7 +45,14 @@ Home rails are not changed. They still use `assignVariants` / `makeVariantHider`
       language ("Dil Se.. (Hindi)") and its category is not a dubbed one. Example: "Dil Se" (no
       year, SOUTH INDIAN | HINDI DUBBED) was matched to *Dil Se..* (1998) by title alone, but it is
       a different film and now stays a separate tile.
-    - Movies: an undated copy in a `*DUBBED*` category always stays alone.
+    - Movies: an undated copy in a `*DUBBED*` category splits off when a non-dubbed sibling
+      exists. A group made only of undated dubbed copies keeps its TMDB link.
+    - Accepted cost: undated copies and dubbed-category copies are never folded into a dated title.
+      Some real dubs therefore show as their own tiles. They stay reachable, and that is safer than
+      offering a different film in the picker.
+    - Tile ids can change: when an undated copy that used to be a group's primary splits off, the
+      group's tile shows another copy's id. Progress and favourites stay keyed by the id that was
+      played or saved.
     - Groups where no copy has a year (most series) are not affected.
 - Copies without a usable TMDB match group by normalized title + year (`dedupTitleKey`). When the
   key has a year and exactly one TMDB group has that title + year, they join it.

@@ -459,3 +459,24 @@ test("year rules: exact year stays, one off needs the same title, undated needs 
   const sg = buildVariantIndex(ser, o).groupOf;
   assert.equal(sg.get(2), sg.get(1)); assert.equal(sg.get(3), sg.get(1));
 });
+
+test("year rules: consistent off-by-one panel year, repeated year, undated-dubbed-only groups", () => {
+  // Every copy says 2024, TMDB says 2025: the copies' own year is the reference.
+  let g = dilSe([S(1, "Trouble (2024)", 151, []), S(2, "Trouble (2024) (Hindi)", 93, []), S(3, "Trouble (2024) (Tamil)", 768, [])],
+    { tmdb_title: "Strul", year: "2025" });
+  assert.equal(g.get(1).key, "t:21210");
+  assert.equal(g.get(2), g.get(1)); assert.equal(g.get(3), g.get(1));
+  // Two dated copies of the same year (datedOk.size 2): a bare "(Hindi)" copy stays alone.
+  g = dilSe([S(1, "Dil Se.. (1998)", 151, []), S(2, "Dil Se.. (1998)", 33, []), S(3, "Dil Se.. (Hindi)", 151, [])]);
+  assert.equal(g.get(2), g.get(1));
+  assert.notEqual(g.get(3), g.get(1));
+  // Only undated copies, all in dubbed categories: keep the TMDB link together.
+  g = dilSe([S(1, "Dil Se", 93, []), S(2, "Dil Se (Tamil)", 93, [])]);
+  assert.equal(g.get(1).key, "t:21210");
+  assert.equal(g.get(2), g.get(1));
+  assert.equal(g.get(1).origLang, "hi");
+  // Undated: a dubbed copy next to a non-dubbed one splits off.
+  g = dilSe([S(1, "Dil Se", 151, []), S(2, "Dil Se", 93, [])]);
+  assert.equal(g.get(1).key, "t:21210");
+  assert.notEqual(g.get(2), g.get(1));
+});
