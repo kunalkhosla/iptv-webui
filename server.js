@@ -2802,7 +2802,7 @@ const { decideLiveAudio, withDeadline, decideLiveHealth, applyLiveCheck, isPersi
 const LIVE_AUDIO_PROBE_WAIT_MS = (() => { const n = parseInt(process.env.LIVE_AUDIO_PROBE_WAIT_MS ?? "", 10); return Number.isFinite(n) && n >= 0 ? n : 3500; })();
 const { segmentQuery } = require("./lib/segment-query");
 const { liveHlsListSize, panelReconnectArgs, liveTolerantArgs } = require("./lib/live-hls");
-const { createDownloadQueue } = require("./lib/download-queue");
+const { createDownloadQueue, waitingFor: dlWaitingFor } = require("./lib/download-queue");
 const { streamingRecently: streamingRecentlyIn } = require("./lib/recent-stream");
 const certBackfill = { running: false, done: 0, total: 0 };
 async function tmdbRaw(pathAndQuery) {
@@ -5143,7 +5143,7 @@ function dlView(mode, id) {
   if (!j) return { state: "none" };
   if (j.state === "ready") { dlJobs.delete(k); return { state: "none" }; } // file vanished
   // Machine-readable reason a job is not progressing: it (or the job it is queued behind) yields to a live viewer.
-  const waitingFor = j.stage === "waiting-for-viewer" || (j.state === "queued" && dlCurrent && dlCurrent !== j && dlCurrent.stage === "waiting-for-viewer") ? "viewer" : null;
+  const waitingFor = dlWaitingFor(j, dlCurrent);
   return {
     state: j.state, pct: Math.max(0, Math.min(99, Math.round(j.pct || 0))), stage: j.stage || null,
     bytes: j.bytes || 0, error: j.error || null, queue_position: dlq.position(k),
@@ -5227,8 +5227,8 @@ async function runDownloadJob(job) {
   const fetchT0 = Date.now();
   for (let attempt = 0; attempt <= DL_MAX_FETCH_RETRIES && !fetched;) {
     if (job.cancelled) return;
-    if (Date.now() - job.createdAt > DL_MAX_QUEUE_AGE_MS) { job.state = "failed"; job.error = "timed out: download sat in the queue for over 3 days"; return; }
-    if (Date.now() - job.startedAt > DL_MAX_JOB_AGE_MS) { job.state = "failed"; job.error = "timed out waiting for the provider connection"; return; }
+    if (Date.now() - job.createdAt > DL_MAX_QUEUE_AGE_MS) { job.state = "failed"; job.stage = "failed"; job.error = "timed out: download pending for over 3 days"; return; }
+    if (Date.now() - job.startedAt > DL_MAX_JOB_AGE_MS) { job.state = "failed"; job.stage = "failed"; job.error = "timed out waiting for the provider connection"; return; }
     // Never touch the provider while someone else holds the slot (newest-wins would evict the viewer).
     const slotHeld = [...streams.entries()].some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced);
     if (slotHeld) { await waitForViewer(); continue; }

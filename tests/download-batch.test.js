@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { createDownloadQueue } = require("../lib/download-queue");
+const { createDownloadQueue, waitingFor } = require("../lib/download-queue");
 const S = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
 
 const mk = (o) => createDownloadQueue({ maxActive: 12, maxPerProfile: 5, maxPending: 50, ...o });
@@ -88,6 +88,7 @@ test("server wiring: batch route validates ids, caps are 5/12, one runner", () =
 
 test("download status: waiting_for viewer field, startedAt-based age cap, log lines", () => {
   assert.match(S, /waiting_for: waitingFor/);
+  assert.match(S, /stage = "failed"; job\.error = "timed out/);
   assert.match(S, /dlCurrent = job;/);
   assert.match(S, /dlCurrent = null;/);
   assert.match(S, /job\.startedAt = Date\.now\(\);/);
@@ -96,4 +97,15 @@ test("download status: waiting_for viewer field, startedAt-based age cap, log li
   assert.match(S, /DL_MAX_QUEUE_AGE_MS = 3 \* 24/);
   assert.match(S, /\[download\] \$\{mode\} \$\{id\} waiting for viewer/);
   assert.match(S, /\[download\] \$\{mode\} \$\{id\} resumed after viewer/);
+});
+
+test("waitingFor: only live waits and jobs queued behind them", () => {
+  const w = { state: "waiting", stage: "waiting-for-viewer" };
+  assert.equal(waitingFor(w, w), "viewer");
+  assert.equal(waitingFor({ state: "failed", stage: "failed" }, null), null);
+  assert.equal(waitingFor({ state: "failed", stage: "waiting-for-viewer" }, null), null);
+  assert.equal(waitingFor({ state: "queued" }, w), "viewer");
+  assert.equal(waitingFor({ state: "queued" }, { ...w, cancelled: true }), null);
+  assert.equal(waitingFor({ state: "queued" }, { state: "running", stage: "fetching" }), null);
+  assert.equal(waitingFor({ state: "queued" }, null), null);
 });
