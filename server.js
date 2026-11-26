@@ -888,6 +888,164 @@ function schedulePanelTracksCacheSave() {
     }
   }, 500);
 }
+
+// ── Surround sound (docs/SURROUND.md) ──────────────────────────────
+// Per-title audio summary from what is already known (never a stream):
+// learned transcode tracks (panelTracksCache) win, then the panel's
+// get_vod_info audio (qualityCache). Series: max over episodes of the
+// series info (seriesAudio, persisted). Badge/format via lib/surround.
+const surroundLib = require("./lib/surround");
+function loadJsonObject(file) {
+  try {
+    const d = JSON.parse(fs.readFileSync(file, "utf8"));
+    return d && typeof d === "object" && !Array.isArray(d) ? d : {};
+  } catch { return {}; }
+}
+function makeJsonSaver(file, obj, label) {
+  let timer = null;
+  let saving = false;
+  const save = () => {
+    if (timer) return;
+    timer = setTimeout(async () => {
+      timer = null;
+      if (saving) { save(); return; }
+      saving = true;
+      try {
+        await fs.promises.writeFile(file + ".tmp", JSON.stringify(obj));
+        await fs.promises.rename(file + ".tmp", file);
+      } catch (e) {
+        console.warn(`save ${label} failed: ${e.message}`);
+      } finally { saving = false; }
+    }, 1000);
+  };
+  return save;
+}
+// "movie:<id>" -> ms timestamp of a get_vod_info that carried no audio
+// info (the panel never probed that file). Retried after AUDIO_MISS_TTL_MS.
+const AUDIO_MISS_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const audioCrawlMissesFile = path.join(DATA_DIR, "audio-crawl-misses.json");
+const audioCrawlMisses = loadJsonObject(audioCrawlMissesFile);
+const scheduleAudioCrawlMissesSave = makeJsonSaver(audioCrawlMissesFile, audioCrawlMisses, "audio-crawl-misses");
+const audioMissFresh = (id) => {
+  const t = audioCrawlMisses[`movie:${id}`];
+  return Number.isFinite(t) && Date.now() - t < AUDIO_MISS_TTL_MS;
+};
+// "<series id>" -> { channels, codec, profile, atmos, known, surround, t }
+const seriesAudioFile = path.join(DATA_DIR, "series-audio.json");
+const seriesAudio = loadJsonObject(seriesAudioFile);
+const scheduleSeriesAudioSave = makeJsonSaver(seriesAudioFile, seriesAudio, "series-audio");
+
+function learnedTrackSummary(mode, id) {
+  const c = panelTracksCache[`${mode}:${id}`];
+  return c && Array.isArray(c.audioTracks) ? surroundLib.summarizeTracks(c.audioTracks) : null;
+}
+function movieAudioSummary(id) {
+  const learned = learnedTrackSummary("movie", id);
+  if (learned) return learned;
+  const q = qualityCache[`movie:${id}`];
+  const ch = Number(q && q.audio_channels) || 0;
+  if (!ch) return null;
+  return { channels: ch, codec: q.audio_codec || null, profile: q.audio_profile || null, atmos: surroundLib.mentionsAtmos(q.audio_profile) };
+}
+// Writes the audio fields onto an index item (movie / series / disk) and
+// keeps the "surround" chip tag in step (>= 6 channels). `summary` null =
+// unknown: leaves the item untouched.
+function applyAudioToItem(s, summary) {
+  if (!s || !summary) return;
+  const f = surroundLib.audioFields(summary);
+  if (!f.audio_channels) return;
+  s.audio_channels = f.audio_channels;
+  s.audio_codec = f.audio_codec;
+  if (f.audio_format) s.audio_format = f.audio_format; else delete s.audio_format;
+  if (f.audio_badge) s.audio_badge = f.audio_badge; else delete s.audio_badge;
+  const tags = Array.isArray(s.tags) ? s.tags : [];
+  const has = tags.includes("surround");
+  if (f.audio_badge && !has) s.tags = [...tags, "surround"];
+  else if (!f.audio_badge && has) s.tags = tags.filter((t) => t !== "surround");
+}
+// Additive tile fields (spread into every VOD tile builder).
+function audioTileFields(s) {
+  if (!s || !s.audio_channels) return { audio_channels: null, audio_codec: null };
+  return {
+    audio_channels: s.audio_channels,
+    audio_codec: s.audio_codec || null,
+    audio_format: s.audio_format || undefined,
+    audio_badge: s.audio_badge || undefined,
+  };
+}
+// Detail-page fields: always present (null = unknown). Series fall back to
+// the persisted summary when the index item has none yet.
+function detailAudioFields(mode, item) {
+  if (item && item.audio_channels) {
+    return {
+      audio_channels: item.audio_channels,
+      audio_codec: item.audio_codec || null,
+      audio_format: item.audio_format || null,
+      audio_badge: item.audio_badge || null,
+    };
+  }
+  if (mode === "series" && item) return surroundLib.audioFields(seriesAudioSummary(item.id));
+  return { audio_channels: null, audio_codec: null, audio_format: null, audio_badge: null };
+}
+// Series: summarize a get_series_info answer, persist, patch the index item.
+function noteSeriesAudio(seriesId, info, actx = currentAccount()) {
+  if (!isOwnerAccount(actx) || !info || !info.episodes) return null;
+  const sum = surroundLib.summarizeSeries(info.episodes, (epId) => learnedTrackSummary("series", epId));
+  if (!sum) return null;
+  const key = String(seriesId);
+  const prev = seriesAudio[key];
+  if (!prev || prev.channels !== sum.channels || prev.codec !== sum.codec || prev.atmos !== sum.atmos
+      || prev.known !== sum.known || prev.surround !== sum.surround) {
+    seriesAudio[key] = { ...sum, t: Date.now() };
+    scheduleSeriesAudioSave();
+  }
+  applyAudioToItem(getIndexesFor(actx).series?.byId?.get(parseInt(key, 10)), sum);
+  return sum;
+}
+// Per-episode fields in /api/episodes: only when known (omitted otherwise).
+function episodeAudioFields(sum) {
+  const f = surroundLib.audioFields(sum);
+  if (!f.audio_channels) return {};
+  return { audio_channels: f.audio_channels, audio_codec: f.audio_codec, audio_format: f.audio_format, audio_badge: f.audio_badge };
+}
+function seriesAudioSummary(seriesId) {
+  const s = seriesAudio[String(seriesId)];
+  return s && s.channels ? s : null;
+}
+// Records a get_vod_info answer: video verdict + audio into qualityCache.
+// Video dims unknown (panel probed nothing but audio) -> is4k null (never
+// demotes). Returns the entry, or null when the answer had neither.
+function recordPanelVodInfo(movieId, info) {
+  const video = (info && info.video && typeof info.video === "object" && !Array.isArray(info.video)) ? info.video : {};
+  const audio = surroundLib.fromPanelAudio(info && info.audio);
+  const w = Number(video.width) || 0;
+  const h = Number(video.height) || 0;
+  if (!w && !h && !audio) return null;
+  const entry = {
+    w, h,
+    codec: video.codec_name || null,
+    bitrate: Number(info && info.bitrate) || null,
+    is4k: (w || h) ? classifyAs4k(w, h) : null,
+    // Audio: codec_name (aac, ac3, eac3, dts, truehd...), channels
+    // (2, 6, 8...), layout and profile when the panel's ffprobe sent them.
+    audio_codec: audio ? audio.codec : null,
+    audio_channels: audio ? audio.channels : 0,
+    audio_layout: (info && info.audio && info.audio.channel_layout) || null,
+    audio_profile: audio ? audio.profile : null,
+    checked_at: Date.now(),
+  };
+  qualityCache[`movie:${movieId}`] = entry;
+  scheduleQualityCacheSave();
+  if (audio && audioCrawlMisses[`movie:${movieId}`]) {
+    delete audioCrawlMisses[`movie:${movieId}`];
+    scheduleAudioCrawlMissesSave();
+  }
+  // Patch the in-memory owner index so tiles carry it without a rebuild.
+  const numId = parseInt(movieId, 10);
+  applyAudioToItem(indexes.movie?.byId?.get(numId), movieAudioSummary(numId));
+  return entry;
+}
+
 // Codecs MSE cannot decode (or hls.js silently mis-routes through an
 // incompatible decoder). Anything in this set forces a transcode.
 const BROWSER_UNSAFE_AUDIO = new Set([
@@ -1275,7 +1433,7 @@ function applyQualityDemotion(mode, id, tags) {
   if (mode !== "movie") return tags;
   if (!Array.isArray(tags) || !tags.includes("4k")) return tags;
   const v = qualityCache[`movie:${id}`];
-  if (v && v.is4k === false) return tags.filter(t => t !== "4k");
+  if (v && v.is4k === false && (v.w || v.h)) return tags.filter(t => t !== "4k");
   return tags;
 }
 
@@ -1294,81 +1452,54 @@ async function verifyQuality4k(movieId, actx = currentAccount()) {
   } catch {
     return null;
   }
-  const video = (info && info.info && info.info.video) || {};
-  const audio = (info && info.info && info.info.audio) || {};
-  const w = Number(video.width) || 0;
-  const h = Number(video.height) || 0;
-  // Reject zero-dimension entries — they're "panel didn't ffprobe"
-  // states that'd otherwise demote a possibly-real-4K title because
-  // we can't see the resolution. Re-check on the next prewarm.
-  if (!w && !h) return null;
-  const audio_channels = Number(audio.channels) || 0;
-  const entry = {
-    w, h,
-    codec: video.codec_name || null,
-    bitrate: Number(info?.info?.bitrate) || null,
-    is4k: classifyAs4k(w, h),
-    // Audio metadata: codec name (aac, ac3, eac3, dts, truehd…),
-    // channel count (2, 6, 8…), and channel_layout when ffprobe
-    // emitted one ("5.1", "7.1", "stereo"). Lets the client tag tiles
-    // with a "5.1" / "7.1" badge so users can pick titles that'll
-    // actually exercise their home-theater setup.
-    audio_codec: audio.codec_name || null,
-    audio_channels,
-    audio_layout: audio.channel_layout || null,
-    checked_at: Date.now(),
-  };
-  qualityCache[key] = entry;
-  scheduleQualityCacheSave();
+  // Neither video dims nor audio = the panel never probed the file: not
+  // cached (retried by the next 4K pass), noted for the surround crawler.
+  const entry = recordPanelVodInfo(movieId, info && info.info);
+  if (!entry) { noteAudioMiss(movieId); return null; }
   return entry;
 }
 
-// Background pass that probes EVERY movie's vod_info to cache video
-// + audio metadata. Same panel hit that 4K verification already pays,
-// just broader. Output: tiles on home rails carry "5.1" / "7.1"
-// audio badges as soon as the cache fills, instead of waiting for
-// the user to drill into each detail screen.
-//
-// Conservative concurrency (2) + cap per run (PREWARM_AUDIO_BATCH).
-// Cache entries persist on disk so each batch picks up where the
-// previous left off — full catalog coverage spans multiple boots.
-const AUDIO_PREWARM_CONCURRENCY = 2;
-const AUDIO_PREWARM_BATCH = 1500;
-async function prewarmAudioInfoCache(actx = currentAccount()) {
-  const ix = getIndexesFor(actx).movie;
-  if (!ix?.ready) return;
-  // Only probe movies whose qualityCache entry is missing audio data —
-  // either no entry at all, or an old entry from before the audio
-  // fields existed.
-  const candidates = [...ix.byId.values()].filter(s => {
-    const c = qualityCache[`movie:${s.id}`];
-    return !c || (!("audio_channels" in c));
-  }).slice(0, AUDIO_PREWARM_BATCH);
-  if (!candidates.length) return;
-  const startedAt = Date.now();
-  console.log(`[audio] probing ${candidates.length} movies for audio metadata`);
-  let i = 0, probed = 0, surround = 0, failed = 0;
-  await Promise.all(Array.from({ length: AUDIO_PREWARM_CONCURRENCY }, async () => {
-    while (i < candidates.length) {
-      const s = candidates[i++];
-      await yieldToViewers("audio prewarm", actx);
-      const v = await verifyQuality4k(s.id, actx).catch(() => null);
-      if (!v) { failed++; continue; }
-      probed++;
-      // Patch the in-memory index entry so /api/home / /api/index pick
-      // up the audio fields immediately without a full rebuild.
-      if (v.audio_channels) {
-        s.audio_channels = v.audio_channels;
-        s.audio_codec = v.audio_codec;
-        if (v.audio_channels >= 3) {
-          if (!Array.isArray(s.tags)) s.tags = [];
-          if (!s.tags.includes("surround")) s.tags.push("surround");
-          if (v.audio_channels >= 6) surround++;
-        }
-      }
-    }
-  }));
-  console.log(`[audio] probed ${probed} (surround=${surround}, failed=${failed}) in ${((Date.now()-startedAt)/1000).toFixed(1)}s`);
+function noteAudioMiss(movieId) {
+  audioCrawlMisses[`movie:${movieId}`] = Date.now();
+  scheduleAudioCrawlMissesSave();
+}
+
+// Surround crawler (lib/surround createAudioCrawler): fills panel movie audio
+// info one get_vod_info at a time (a metadata call, never a stream), every
+// SURROUND_CRAWL_INTERVAL_MS (default 4 s). Order: titles a client was just
+// shown without audio data (home rails incl. For You, search), then 4K-tagged,
+// then newest additions. Owner panel only (qualityCache is keyed by the owner's
+// ids). Results persist in quality-cache.json / audio-crawl-misses.json, so a
+// restart resumes. SURROUND_CRAWL=0 turns it off.
+const SURROUND_CRAWL_INTERVAL_MS = Math.max(1000, parseInt(process.env.SURROUND_CRAWL_INTERVAL_MS, 10) || 4000);
+const audioKnown = (id) => {
+  const q = qualityCache[`movie:${id}`];
+  return (!!q && ("audio_channels" in q)) || audioMissFresh(id);
+};
+const surroundCrawler = surroundLib.createAudioCrawler({
+  intervalMs: SURROUND_CRAWL_INTERVAL_MS,
+  isKnown: (id) => audioKnown(id) || !indexes.movie?.byId?.has(id),
+  candidates: () => (indexes.movie?.ready ? surroundLib.sweepOrder(indexes.movie.byId.values()) : []),
+  probe: async (id) => {
+    // noCache: a crawl must not pin ~10k info answers in the 24 h memory cache.
+    const info = await xtream(MODES.movie.info, { vod_id: id }, { timeout: 20_000, noCache: true });
+    const entry = recordPanelVodInfo(id, info && info.info);
+    if (!entry || !entry.audio_channels) { if (!entry) noteAudioMiss(id); return "none"; }
+    return "found";
+  },
+  log: (m) => console.log(m),
+});
+function startSurroundCrawler() {
+  if (process.env.SURROUND_CRAWL === "0") return;
+  surroundCrawler.start();
+}
+// Called with the ids a client is being shown (rail/search tiles) whose
+// audio is unknown: they jump the crawl queue.
+function boostSurroundCrawl(items) {
+  if (process.env.SURROUND_CRAWL === "0" || !isOwnerAccount(currentAccount())) return;
+  const ids = [];
+  for (const t of items) if (t && t.id != null && !t.audio_channels) ids.push(t.id);
+  if (ids.length) surroundCrawler.boost(ids.slice(0, 400));
 }
 
 // Background pass that walks every in-memory movie tagged "4k" and
@@ -1382,8 +1513,10 @@ const QUALITY_PREWARM_CONCURRENCY = 3;
 async function prewarmQualityCache(actx = currentAccount()) {
   const ix = getIndexesFor(actx).movie;
   if (!ix?.ready) return;
+  // Skips titles whose info recently carried nothing (panel never probed
+  // the file): re-asking every index build only loads the panel.
   const candidates = [...ix.byId.values()].filter(s =>
-    Array.isArray(s.tags) && s.tags.includes("4k")
+    Array.isArray(s.tags) && s.tags.includes("4k") && !audioMissFresh(s.id)
   );
   if (!candidates.length) return;
   const startedAt = Date.now();
@@ -3380,20 +3513,12 @@ async function loadIndexFromDisk(mode, actx = currentAccount()) {
         s.us_cert = effCert(tmdbEntry) || null;
         s.tmdb_id = tmdbEntry?.tmdb_id || null;
       }
-      // Re-attach audio metadata from qualityCache on every boot so
-      // entries written by an offline prober (scripts/probe-audio.mjs)
-      // — or by a previous server's prewarm — show up on tiles
-      // immediately, without waiting for the user to open a detail
-      // screen on each title.
-      if (mode === "movie") {
-        const qEntry = qualityCache[`movie:${s.id}`];
-        if (qEntry?.audio_channels) {
-          s.audio_channels = qEntry.audio_channels;
-          s.audio_codec = qEntry.audio_codec || null;
-          if (qEntry.audio_channels >= 3 && !s.tags.includes("surround")) {
-            s.tags.push("surround");
-          }
-        }
+      // Re-attach audio metadata (qualityCache / learned tracks / series
+      // summaries) on every load so the badges show without a rebuild.
+      // Owner panel only: those caches are keyed by the owner's ids.
+      if ((mode === "movie" || mode === "series") && isOwnerAccount(actx)) {
+        applyAudioToItem(s, mode === "movie" ? movieAudioSummary(s.id) : seriesAudioSummary(s.id));
+        if (!s.audio_badge && s.tags.includes("surround")) s.tags = s.tags.filter((t) => t !== "surround");
       }
       byId.set(s.id, s);
     }
@@ -3473,7 +3598,7 @@ async function xtream(action, params = {}, opts = {}) {
     // app into a broken state long after the panel recovers. Lets every
     // subsequent call retry against the live panel until it answers.
     const isAuthReject = !Array.isArray(v) && v && v.user_info && Number(v.user_info.auth) === 0;
-    if (!isAuthReject) cache.set(key, { t: Date.now(), v });
+    if (!isAuthReject && !opts.noCache) cache.set(key, { t: Date.now(), v });
     return v;
   })().finally(() => inflight.delete(key));
 
@@ -3553,17 +3678,20 @@ function projectStream(mode, s, actx = currentAccount()) {
   const tmdbEntry = mode !== "live" ? tmdbCache[`${mode}:${projectedId}`] : null;
   const us_cert = effCert(tmdbEntry) || null;
   const tmdb_id = tmdbEntry?.tmdb_id || null;
-  // Audio metadata: surfaced when the quality cache has been populated
-  // for this id (currently movie only — series episodes don't go through
-  // verifyQuality4k). Lets the client tag tiles with a "5.1" / "7.1"
-  // badge. Channel count > 2 also adds a synthetic "surround" tag so
-  // future chip filtering can pick out multi-channel titles.
-  const audioEntry = mode === "movie" ? qualityCache[`movie:${projectedId}`] : null;
-  const audio_channels = audioEntry?.audio_channels || null;
-  const audio_codec = audioEntry?.audio_codec || null;
-  if (audio_channels && audio_channels >= 3 && !tags.includes("surround")) {
-    tags = [...tags, "surround"];
-  }
+  // Audio metadata (surround badge + "surround" chip tag at >= 6 channels):
+  // owner panel only (the caches are keyed by the owner's ids).
+  const audioSummary = !isOwnerAccount(actx) ? null
+    : mode === "movie" ? movieAudioSummary(projectedId)
+    : mode === "series" ? seriesAudioSummary(projectedId) : null;
+  const af = surroundLib.audioFields(audioSummary);
+  if (af.audio_badge && !tags.includes("surround")) tags = [...tags, "surround"];
+  else if (!af.audio_badge && tags.includes("surround")) tags = tags.filter((t) => t !== "surround");
+  const audioOut = af.audio_channels ? {
+    audio_channels: af.audio_channels,
+    audio_codec: af.audio_codec,
+    audio_format: af.audio_format || undefined,
+    audio_badge: af.audio_badge || undefined,
+  } : null;
   if (mode === "series") {
     return {
       id: s.series_id,
@@ -3576,6 +3704,7 @@ function projectStream(mode, s, actx = currentAccount()) {
       us_cert,
       tmdb_id,
       tags,
+      ...(audioOut || {}),
     };
   }
   return {
@@ -3587,8 +3716,10 @@ function projectStream(mode, s, actx = currentAccount()) {
     year: s.year || s.releaseDate || null,
     rating: s.rating || s.rating_5based || null,
     added: s.added || null,
-    audio_channels,
-    audio_codec,
+    audio_channels: audioOut ? audioOut.audio_channels : null,
+    audio_codec: audioOut ? audioOut.audio_codec : null,
+    audio_format: audioOut ? audioOut.audio_format : undefined,
+    audio_badge: audioOut ? audioOut.audio_badge : undefined,
     // For live streams: panel returns epg_channel_id when EPG data exists
     // for this channel (empty string / null otherwise). The TV Guide uses
     // it to split channels into "with program data" / "without".
@@ -3884,13 +4015,9 @@ async function buildIndex(mode, actx = currentAccount(), { noYield = false } = {
       prewarmQualityCache(actx).catch(e => {
         console.warn(`[movie] quality prewarm errored: ${e.message}`);
       });
-      // Broader audio-metadata prewarm — walks all movies missing
-      // audio data, capped at AUDIO_PREWARM_BATCH per run. Lets the
-      // 5.1 / 7.1 badge populate on home rails without forcing the
-      // user to click into every detail.
-      prewarmAudioInfoCache(actx).catch(e => {
-        console.warn(`[movie] audio prewarm errored: ${e.message}`);
-      });
+      // Audio metadata for the 5.1 / 7.1 badges and the Surround rail:
+      // the gentle one-at-a-time crawler (owner panel only).
+      if (isOwnerAccount(actx)) startSurroundCrawler();
     }
   } finally {
     ix.running = false;
@@ -4154,6 +4281,7 @@ async function buildDiskIndex(actx, rootPath) {
       const backdropPath = [`${baseNoExt}-backdrop.jpg`, `${baseNoExt}-fanart.jpg`].find(p => { try { return fs.statSync(p).isFile(); } catch { return false; } }) || null;
       const container = path.extname(f.relpath).slice(1).toLowerCase();
       const maxCh = a.audioTracks.reduce((mx, t) => Math.max(mx, t.channels || 0), 0);
+      const trackSum = surroundLib.summarizeTracks(a.audioTracks);
       // client-safe audio/sub track summaries for the player selector
       const audioTracks = a.audioTracks.map(t => ({ index: t.i, codec: t.codec, channels: t.channels, lang: t.lang, label: t.title || langLabel(t.lang) || `Audio ${t.i + 1}`, default: t.default }));
       const subtitleTracks = a.subTracks.map(t => ({ index: t.i, codec: t.codec, lang: t.lang, kind: t.kind, label: t.title || langLabel(t.lang) || `Subtitle ${t.i + 1}` }));
@@ -4176,6 +4304,8 @@ async function buildDiskIndex(actx, rootPath) {
           title: episodeInfo.episodeTitle,
           container, durationSecs: a.durationSecs || null,
           audio_channels: maxCh || null,
+          audio_codec: trackSum?.codec || null,
+          audio_atmos: !!trackSum?.atmos,
         });
         continue; // absorbed into the series group, not its own tile
       }
@@ -4184,7 +4314,8 @@ async function buildDiskIndex(actx, rootPath) {
       let tags = streamTagsFor(title, ["disk"]);
       if (!tags.includes("disk")) tags = [...tags, "disk"];
       if (classifyAs4k(a.video.width, a.video.height) && !tags.includes("4k")) tags = [...tags, "4k"];
-      if (maxCh >= 3 && !tags.includes("surround")) tags = [...tags, "surround"];
+      const diskAudio = surroundLib.audioFields(trackSum);
+      if (diskAudio.audio_badge && !tags.includes("surround")) tags = [...tags, "surround"];
       const tmdbEntry = tmdbCache[`disk:${id}`];
       byId.set(id, {
         id, name: title, year: year || null,
@@ -4195,7 +4326,9 @@ async function buildDiskIndex(actx, rootPath) {
         us_cert: effCert(tmdbEntry) || null,
         tmdb_id: tmdbEntry?.tmdb_id || null,
         audio_channels: maxCh || null,
-        audio_codec: a.audioTracks[0]?.codec || null,
+        audio_codec: diskAudio.audio_codec || a.audioTracks[0]?.codec || null,
+        audio_format: diskAudio.audio_format || undefined,
+        audio_badge: diskAudio.audio_badge || undefined,
         durationSecs: a.durationSecs || null,
         audioTracks, subtitleTracks,
         tags,
@@ -4214,6 +4347,7 @@ async function buildDiskIndex(actx, rootPath) {
       const seriesId = group.seriesId;
       group.episodes.sort((x, y) => x.season - y.season || x.episodeNum - y.episodeNum);
       const tmdbEntry = tmdbCache[`disk:${seriesId}`];
+      const groupAudio = surroundLib.audioFields(surroundLib.summarizeTracks(group.episodes.map((e) => ({ channels: e.audio_channels, codec: e.audio_codec, title: e.audio_atmos ? "Atmos" : null }))));
       byId.set(seriesId, {
         id: seriesId, name: group.seriesName, year: group.year || null,
         icon: null,
@@ -4222,11 +4356,13 @@ async function buildDiskIndex(actx, rootPath) {
         rating: null,
         us_cert: effCert(tmdbEntry) || null,
         tmdb_id: tmdbEntry?.tmdb_id || null,
-        audio_channels: null,
-        audio_codec: null,
+        audio_channels: groupAudio.audio_channels,
+        audio_codec: groupAudio.audio_codec,
+        audio_format: groupAudio.audio_format || undefined,
+        audio_badge: groupAudio.audio_badge || undefined,
         durationSecs: null,
         audioTracks: [], subtitleTracks: [],
-        tags: ["disk", "series-group"],
+        tags: groupAudio.audio_badge ? ["disk", "series-group", "surround"] : ["disk", "series-group"],
         isSeriesGroup: true,
         episodeCount: group.episodes.length,
       });
@@ -7071,8 +7207,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       // Lets the TV render a "5.1" / "7.1" badge for tiles that will
       // exercise an AVR setup. Populated lazily as users open detail
       // screens — null until then.
-      audio_channels: s.audio_channels ?? null,
-      audio_codec: s.audio_codec ?? null,
+      ...audioTileFields(s),
       // Disk-only: a synthetic tile grouping Save-to-Disk episodes under
       // one series (see buildDiskIndex) — the client opens the episode
       // picker instead of playing this id directly.
@@ -7755,6 +7890,43 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     }
   }
 
+  // Surround sound — titles with CONFIRMED >= 6 audio channels (panel
+  // get_vod_info / learned transcode tracks / Disk ffprobe; never guessed).
+  // Movies and the owner's Disk library (each in its own home; series have
+  // too little data for a rail, see docs/SURROUND.md). Same language /
+  // variant / low-quality / CAM gates as Family, kid profiles get the
+  // allow-list (unrated hidden). One tile per tmdb_id, Atmos / 7.1 first
+  // then most-voted, lightly shuffled per visit. `__rail-surround` = See all.
+  if (mode === "movie" || mode === "disk") {
+    const seenSurround = new Set();
+    const rank = (s) => (s.audio_badge === "Atmos" ? 2 : s.audio_badge === "7.1" ? 1 : 0);
+    const surroundTiles = [...indexes[mode].byId.values()]
+      .filter((s) => surroundLib.isSurround(s.audio_channels) && !(s.tags || []).includes("cam")
+        && titleLangPasses(s.name) && !variantHidden(s) && !isLQ(s))
+      .map((s) => ({ s, t: tmdbFor(s.id) }))
+      .sort((a, b) => (rank(b.s) - rank(a.s)) || ((b.t?.vote_count || 0) - (a.t?.vote_count || 0)))
+      .filter((x) => {
+        const key = x.t?.tmdb_id || x.s.tmdb_id || `n:${String(x.s.name).toLowerCase()}`;
+        if (seenSurround.has(key)) return false;
+        seenSurround.add(key);
+        return true;
+      })
+      .map((x) => tileFor(x.s))
+      .filter((t) => t && isKidSafe(t));
+    if (surroundTiles.length >= 4) {
+      const ordered = [
+        ...jitterOrder(surroundTiles.slice(0, 160), seededRng(`sur:${visitSeed}:${req.profileId}:${mode}`), 60),
+        ...surroundTiles.slice(160),
+      ];
+      rails.push({
+        title: "Surround sound",
+        category_id: "__rail-surround",
+        total: surroundTiles.length,
+        items: ordered.slice(0, 100),
+      });
+    }
+  }
+
   // `category_id` here is a PSEUDO id the web client recognizes — it
   // surfaces a "See all ›" button on the rail header and routes the
   // click into the matching grid view.
@@ -8297,7 +8469,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   // visible name doesn't, leaving Tamil in `tagsPresent`.
   const onboardedSet = new Set(modeKeys);
   const chips = [];
-  for (const [key, label] of [["4k", "4K"], ["movies", "Movies"]]) {
+  for (const [key, label] of [["4k", "4K"], ["surround", "Surround"], ["movies", "Movies"]]) {
     if (tagsPresent.has(key)) chips.push({ key, label, kind: "synthetic" });
   }
   for (const g of CHANNEL_GROUPS) {
@@ -8345,6 +8517,11 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       prewarmDetails(mode, lead, req.account || currentAccount(), 8);
     }
   } catch {}
+
+  // Movie tiles shown without audio info jump the surround crawl queue.
+  if (mode === "movie" && !req.get("x-khouch-internal")) {
+    try { boostSurroundCrawl(rails.flatMap((r) => (r.items || []).slice(0, 24))); } catch {}
+  }
 
   // Collections row (additive top-level field: older clients ignore it).
   // Tiles here are COLLECTIONS, not titles: open /api/collections/:id.
@@ -8409,8 +8586,7 @@ app.get("/api/collection/:lang/:mode(movie|series)", (req, res) => {
       us_cert: effCert(t) || null,
       tags: s.tags || ["other"],
       container: s.container || null,
-      audio_channels: s.audio_channels ?? null,
-      audio_codec: s.audio_codec ?? null,
+      ...audioTileFields(s),
     };
   };
 
@@ -9161,6 +9337,7 @@ app.get("/api/search/all", async (req, res, next) => {
         category_id: s.category_id,
         tags: s.tags || [],
         container: s.container || null,
+        ...(mode !== "live" ? audioTileFields(s) : {}),
         isSeriesGroup: s.isSeriesGroup || undefined,
         // Explicit dub-language marker ("hindi", "punjabi", …) parsed from
         // the title's own "(Language)" suffix — null for the bare/default
@@ -9595,9 +9772,11 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
       // side by side with identical posters, so the client badge needs
       // this to tell them apart.
       dubLang: mode !== "live" ? (suffixOf(s.name) || null) : null,
+      ...(mode !== "live" ? audioTileFields(s) : {}),
       ...(resolved ? tileVariantFields(resolved) : {}),
     };
   });
+  if (mode === "movie" && q) { try { boostSurroundCrawl(results); } catch {} }
   // EPG programme-title pass for live — same rationale as the
   // search/all pass 3: event searches match what's AIRING, not what
   // channels are named.
@@ -10275,43 +10454,11 @@ app.get("/api/:mode(movie|series)/info/:id", async (req, res, next) => {
       }
     }
     // Opportunistic audio + resolution cache: we already paid the
-    // vod_info round-trip, so write the audio/video metadata straight
-    // into qualityCache. Lazy population — each movie a user opens a
-    // detail screen for gets cached on first view; tiles render their
-    // "5.1" badge on the next bootstrap / index re-emission.
-    if (mode === "movie" && v?.info) {
-      const cacheKey = `movie:${req.params.id}`;
-      const video = v.info.video || {};
-      const audio = v.info.audio || {};
-      const w = Number(video.width) || 0;
-      const h = Number(video.height) || 0;
-      if (w || h || audio.channels) {
-        const numId = parseInt(req.params.id, 10);
-        const entry = {
-          w, h,
-          codec: video.codec_name || null,
-          bitrate: Number(v.info.bitrate) || null,
-          is4k: classifyAs4k(w, h),
-          audio_codec: audio.codec_name || null,
-          audio_channels: Number(audio.channels) || 0,
-          audio_layout: audio.channel_layout || null,
-          checked_at: Date.now(),
-        };
-        qualityCache[cacheKey] = entry;
-        scheduleQualityCacheSave();
-        // Patch the in-memory index entry too so the NEXT projectStream
-        // emission (e.g. /api/index re-poll) carries the audio fields
-        // without waiting for a full rebuild.
-        const indexItem = indexes.movie?.byId?.get(numId);
-        if (indexItem) {
-          indexItem.audio_codec = entry.audio_codec;
-          indexItem.audio_channels = entry.audio_channels;
-          if (entry.audio_channels >= 3 && !indexItem.tags?.includes("surround")) {
-            indexItem.tags = [...(indexItem.tags || []), "surround"];
-          }
-        }
-      }
-    }
+    // vod_info round-trip, so record the audio/video metadata (qualityCache,
+    // in-memory index patch) for the 5.1 / 7.1 badges. Series: per-series
+    // audio summary over the episodes (owner panel only).
+    if (mode === "movie" && v?.info && isOwnerAccount(actx)) recordPanelVodInfo(req.params.id, v.info);
+    if (mode === "series" && v?.episodes) noteSeriesAudio(req.params.id, v, actx);
     // Panel mpaa_rating fallback. TMDB sometimes returns a tmdb_id with
     // an empty us_cert (no rating data on TMDB's side). The panel
     // itself often carries the original MPAA / TV rating in
@@ -10447,6 +10594,8 @@ app.get("/api/poster/:mode(movie|series|disk)/:id", async (req, res, next) => {
         };
       }
       Object.assign(out, trailerFieldsFor(out.trailer_key));
+      // Surround badge for the detail meta line (null fields = unknown).
+      Object.assign(out, detailAudioFields(mode, item));
     }
     res.json(out);
   } catch (e) { next(e); }
@@ -10567,6 +10716,7 @@ app.get("/api/episodes/:mode(series|disk)/:id(\\d{1,17})", async (req, res, next
               plot: te?.overview || null, air_date: te?.air_date || null,
               duration_secs: ep.durationSecs || null, container: ep.container || null,
               still: te?.still_path ? `${TMDB_IMG_BASE}/w400${te.still_path}` : null,
+              ...episodeAudioFields(ep.audio_channels ? { channels: ep.audio_channels, codec: ep.audio_codec || null, atmos: !!ep.audio_atmos } : null),
               ...episodeProgressFor(userState, "disk", ep.id, watchedSet),
             };
           }),
@@ -10588,6 +10738,7 @@ app.get("/api/episodes/:mode(series|disk)/:id(\\d{1,17})", async (req, res, next
         res.set("Retry-After", "30");
         return res.status(503).json({ error: "info_unavailable" });
       }
+      noteSeriesAudio(id, info, actx);
       const t = TMDB_API_KEY ? await Promise.race([
         ensureTmdbForItem("series", id, { name: item.name, year: item.year, lang: isoLangForItem(item) }).catch(() => null),
         new Promise((r) => setTimeout(() => r(null), 4000)),
@@ -10618,6 +10769,7 @@ app.get("/api/episodes/:mode(series|disk)/:id(\\d{1,17})", async (req, res, next
             duration_secs: Number(ep.info?.duration_secs) || null,
             container: ep.container_extension || null,
             still: tStill || panelStill,
+            ...episodeAudioFields(learnedTrackSummary("series", ep.id) || surroundLib.fromPanelAudio(ep.info?.audio)),
             ...episodeProgressFor(userState, "series", ep.id, watchedSet),
           };
         });
@@ -12814,6 +12966,7 @@ app.get("/api/similar/:mode/:id", (req, res) => {
       category_id: s.category_id,
       tags: s.tags || [],
       container: s.container || null,
+      ...audioTileFields(s),
     };
   };
 
@@ -13016,6 +13169,7 @@ app.get("/api/collections/:id(\\d{1,10})", async (req, res, next) => {
         category_id: s.category_id,
         tags: s.tags || [],
         container: s.container || null,
+        ...audioTileFields(s),
         trailer_key: t.trailer_key || null,
       })),
     });
@@ -14810,6 +14964,47 @@ app.get("/api/markers/:mode(movie|series|disk)/:id(\\d{1,17})", (req, res) => {
   });
 });
 
+// Surround: crawler progress + coverage (owner).
+app.get("/api/admin/surround", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  let movies = 0, known = 0, surround = 0, misses = 0;
+  for (const it of (indexes.movie?.byId?.values() || [])) {
+    movies++;
+    if (audioKnown(it.id)) known++;
+    if (audioMissFresh(it.id)) misses++;
+    if (surroundLib.isSurround(it.audio_channels)) surround++;
+  }
+  let disk = 0;
+  for (const it of (indexes.disk?.byId?.values() || [])) if (surroundLib.isSurround(it.audio_channels)) disk++;
+  const seriesKnown = Object.keys(seriesAudio).length;
+  const seriesSurround = Object.values(seriesAudio).filter((v) => surroundLib.isSurround(v && v.channels)).length;
+  res.json({
+    crawler: { ...surroundCrawler.stats(), intervalMs: SURROUND_CRAWL_INTERVAL_MS, enabled: process.env.SURROUND_CRAWL !== "0" },
+    movies: { total: movies, known, surround, noInfo: misses },
+    disk: { surround: disk },
+    series: { known: seriesKnown, surround: seriesSurround },
+  });
+});
+
+// One-time seed of series audio summaries from the on-disk info store
+// (get_series_info answers saved for stale-if-error). Local files only.
+async function seedSeriesAudioFromInfoStore() {
+  const actx = currentAccount();
+  const ix = indexes.series;
+  if (!ix?.ready || !isOwnerAccount(actx)) return 0;
+  let names;
+  try { names = new Set(await fs.promises.readdir(path.join(DATA_DIR, "info-cache"))); } catch { return 0; }
+  let n = 0;
+  for (const id of ix.byId.keys()) {
+    const key = xtreamKey(actx, MODES.series.info, { series_id: String(id) });
+    if (!names.has(path.basename(infoStore.fileFor(key)))) continue;
+    const rec = await infoStore.get(key).catch(() => null);
+    if (rec && rec.v && noteSeriesAudio(id, rec.v, actx)) n++;
+  }
+  if (n) console.log(`[surround] seeded ${n} series audio summaries from the info store`);
+  return n;
+}
+
 app.get("/api/admin/sidecar", (req, res) => {
   if (!requireOwner(req, res)) return;
   res.json({ sidecar: mediaSidecar.stats(), markers: markerStore.stats() });
@@ -15437,6 +15632,10 @@ app.listen(PORT, async () => {
       console.log(`[${mode}] loaded ${data.streams.length} items from disk (${ageH}h old)`);
     }
   }
+  // Surround: series summaries from saved info, then the movie audio crawler
+  // (also started after each movie index build).
+  seedSeriesAudioFromInfoStore().catch((e) => console.warn(`[surround] seed failed: ${e.message}`));
+  if (indexes.movie?.ready) setTimeout(startSurroundCrawler, 60_000).unref?.();
 
   await pickPanel(actx);
   console.log(`  active:     ${actx.host}`);

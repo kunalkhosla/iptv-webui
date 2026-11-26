@@ -2092,6 +2092,12 @@ function renderBrowseChipStrip(mode) {
     { key: "all", label: "All" },
     { key: "4k",  label: "4K" },
   ];
+  // Surround (>= 5.1 audio): Movies / Disk always; Series when the server's
+  // chip list says some tile carries the tag.
+  const srvChips = state.home[mode] && Array.isArray(state.home[mode].chips) ? state.home[mode].chips : [];
+  if (mode === "movie" || mode === "disk" || srvChips.some((c) => c && c.key === "surround")) {
+    chips.push({ key: "surround", label: "Surround" });
+  }
   if (state.filter.onboarded) {
     const seen = new Set(chips.map(c => c.key));
     for (const g of orderedGroups()) {
@@ -2535,6 +2541,7 @@ function setupGuidePagingObserver() {
 
 function chipLabel(key) {
   if (key === "all") return "All";
+  if (key === "surround") return "Surround";
   const genre = GUIDE_GENRE_CHIPS.find(g => g.key === key);
   if (genre) return genre.label;
   return labelForGroupKey(key);
@@ -3700,9 +3707,8 @@ function channelCard(s, opts = {}) {
   // s.audio_channels via the offline probe + lazy /api/movie/info
   // path. Anchored top-left so it doesn't fight the MKV badge
   // (top-right) or rating/cert (bottom corners).
-  if (state.mode !== "live" && s.audio_channels) {
-    const ch = Number(s.audio_channels);
-    const label = ch >= 8 ? "7.1" : ch >= 6 ? "5.1" : null;
+  if (state.mode !== "live") {
+    const label = audioBadgeOf(s);
     if (label) {
       const ab = document.createElement("span");
       ab.className = "audio-badge";
@@ -5581,6 +5587,22 @@ async function openMovie(s, mode = "movie") {
   }
 }
 
+// Surround badge for a title ("Atmos" / "7.1" / "5.1"), from the server's
+// audio_badge, else derived from audio_channels. Null for stereo/unknown.
+function audioBadgeOf(s) {
+  if (!s) return null;
+  if (s.audio_badge) return String(s.audio_badge);
+  const ch = Number(s.audio_channels) || 0;
+  return ch >= 8 ? "7.1" : ch >= 6 ? "5.1" : null;
+}
+// Detail meta-line pill: "5.1 · E-AC3" (format only when it adds something).
+function audioMetaPill(s) {
+  const b = audioBadgeOf(s);
+  if (!b) return null;
+  const fmt = s.audio_format && s.audio_format !== b ? ` · ${s.audio_format}` : "";
+  return `<span class="meta-audio" title="Surround sound">${escapeHtml(b + fmt)}</span>`;
+}
+
 function renderMovieMeta(s, info) {
   const bits = [];
   const year = (info && (info.releasedate || info.releaseDate || info.year)) || s.year;
@@ -5592,6 +5614,8 @@ function renderMovieMeta(s, info) {
   if (dur) bits.push(`<span class="meta-dim">${escapeHtml(formatDuration(dur))}</span>`);
   if (rating) bits.push(`<span class="meta-rating">★ ${escapeHtml(String(Number(rating).toFixed(1)))}</span>`);
   if (genre) bits.push(`<span class="meta-dim">${escapeHtml(String(genre))}</span>`);
+  const audio = audioMetaPill(s);
+  if (audio) bits.push(audio);
   el.seriesMeta.innerHTML = bits.join("");
 }
 
@@ -5983,6 +6007,11 @@ async function applyTmdbToDetail(mode, item) {
     if (!target.rating && d.rating) target.rating = d.rating;
     if (!target.runtime && d.runtime) target.runtime = d.runtime;
     if (d.us_cert) target.us_cert = d.us_cert;
+    if (d.audio_channels) {
+      target.audio_channels = d.audio_channels;
+      target.audio_badge = d.audio_badge || null;
+      target.audio_format = d.audio_format || null;
+    }
     if ((!target.genre || !String(target.genre).trim()) && d.genres && d.genres.length) {
       target.genre = d.genres.join(", ");
     }
@@ -6450,6 +6479,8 @@ function renderSeriesMeta(s, info) {
   if (seasonsCount) bits.push(`<span class="meta-dim">${seasonsCount} season${seasonsCount === 1 ? "" : "s"}</span>`);
   if (rating) bits.push(`<span class="meta-rating">★ ${escapeHtml(String(Number(rating).toFixed(1)))}</span>`);
   if (genre) bits.push(`<span class="meta-dim">${escapeHtml(String(genre))}</span>`);
+  const audio = audioMetaPill(s);
+  if (audio) bits.push(audio);
   el.seriesMeta.innerHTML = bits.join("");
 }
 

@@ -1529,7 +1529,8 @@ main {
   position: absolute;
   top: 6px;
   left: 6px;
-  background: rgba(240, 130, 69, .88); /* --accent at ~88% */
+  background: rgba(0, 0, 0, .62);
+  border: 1px solid rgba(240, 130, 69, .75); /* --accent */
   color: #fff;
   font: 700 9px/1 var(--font-body);
   letter-spacing: .06em;
@@ -2054,6 +2055,16 @@ body.player-theater #search-all-view { display: none; }
   color: var(--fg);
   letter-spacing: 0.14em;
   font-size: 11px;
+}
+/* Surround pill ("5.1 · E-AC3", "Atmos") on the detail meta line. */
+.series-meta .meta-audio {
+  padding: 4px 7px;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  color: var(--accent);
+  letter-spacing: 0.08em;
+  font-size: 11px;
+  font-weight: 700;
 }
 
 /* THE title — massive Bebas Neue with a brass offset like marquee
