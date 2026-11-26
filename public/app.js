@@ -7884,7 +7884,8 @@ async function reanchorTo(targetSecs) {
   try {
     resolved = await resolveStreamUrl(p.mode, p.item.id, p.ext, targetSecs);
   } catch (e) {
-    if (p._reanchorSeq === seq) p._reanchoring = false;
+    if (p._reanchorSeq !== seq) return; // a newer re-anchor owns the spinner
+    p._reanchoring = false;
     hideSpinner();
     toast("Couldn't re-anchor: " + e.message, 4000);
     return;
@@ -8847,7 +8848,16 @@ function runPlayerKeyAction(act) {
       seekToSecs(target);
     } else {
       setScrubVisual(scrubDurationSecs() > 0 ? target / scrubDurationSecs() : 0);
-      _keySeek.timer = setTimeout(() => { if (state.playing === p) seekToSecs(target); }, 600);
+      // Wait out an in-flight re-anchor and the new manifest (duration NaN
+      // until it loads) so the seek lands on the current timeline (max ~30 s).
+      const deadline = now + 30000;
+      const ks = _keySeek;
+      const fire = () => {
+        if (state.playing !== p || _keySeek !== ks) return;
+        if ((p._reanchoring || !Number.isFinite(el.video.duration)) && performance.now() < deadline) { ks.timer = setTimeout(fire, 250); return; }
+        seekToSecs(target);
+      };
+      ks.timer = setTimeout(fire, 600);
     }
     return;
   }
