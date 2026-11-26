@@ -7839,6 +7839,9 @@ function setScrubVisual(pct) {
   elScrubThumb.style.left = (pct * 100) + "%";
 }
 function seekToPct(pct) {
+  // Any seek that isn't the keyboard's own drops a pending key seek, so a
+  // later click on the bar is never undone by an older arrow press.
+  if (!_keySeekSeeking && _keySeek) { clearTimeout(_keySeek.timer); _keySeek = null; }
   const playlistDur = el.video.duration;
   if (!playlistDur || !isFinite(playlistDur)) return;
   const anchor = (state.playing && state.playing.transcodeAnchorSecs) || 0;
@@ -7884,7 +7887,7 @@ async function reanchorTo(targetSecs) {
   try {
     resolved = await resolveStreamUrl(p.mode, p.item.id, p.ext, targetSecs);
   } catch (e) {
-    if (p._reanchorSeq !== seq) return; // a newer re-anchor owns the spinner
+    if (p._reanchorSeq !== seq || state.playing !== p) return; // a newer re-anchor / player owns the spinner
     p._reanchoring = false;
     hideSpinner();
     toast("Couldn't re-anchor: " + e.message, 4000);
@@ -8824,7 +8827,12 @@ function playerKeyContext(e, inField) {
 // inside what is already playable seeks at once; one that needs the transcode
 // re-anchored waits until the presses stop, so holding the key restarts
 // ffmpeg once, not once per repeat.
-let _keySeek = null; // { target, at, timer }
+let _keySeek = null; // { target, at, timer, p }
+let _keySeekSeeking = false;
+function keySeekTo(secs) {
+  _keySeekSeeking = true;
+  try { seekToSecs(secs); } finally { _keySeekSeeking = false; }
+}
 function runPlayerKeyAction(act) {
   showControls();
   if (act.kind === "seek") {
@@ -8845,7 +8853,7 @@ function runPlayerKeyAction(act) {
     _keySeek = { target, at: now, timer: null, p };
     const inPlaylist = target - ((p.transcodeAnchorSecs) || 0);
     if (!p._reanchoring && (!p.transcode || (inPlaylist >= 0 && Number.isFinite(pd) && inPlaylist < pd))) {
-      seekToSecs(target);
+      keySeekTo(target);
     } else {
       setScrubVisual(scrubDurationSecs() > 0 ? target / scrubDurationSecs() : 0);
       // Wait out an in-flight re-anchor and the new manifest (duration NaN
@@ -8854,8 +8862,11 @@ function runPlayerKeyAction(act) {
       const ks = _keySeek;
       const fire = () => {
         if (state.playing !== p || _keySeek !== ks) return;
-        if ((p._reanchoring || !Number.isFinite(el.video.duration)) && performance.now() < deadline) { ks.timer = setTimeout(fire, 250); return; }
-        seekToSecs(target);
+        if (p._reanchoring || !Number.isFinite(el.video.duration)) {
+          if (performance.now() < deadline) ks.timer = setTimeout(fire, 250);
+          return; // stuck past 30 s: drop it rather than pile on another re-anchor
+        }
+        keySeekTo(target);
       };
       ks.timer = setTimeout(fire, 600);
     }
