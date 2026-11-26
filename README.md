@@ -176,6 +176,14 @@ reaper would free its session after ~3 min. While paused, clients send
 live) and the server refreshes the caller's existing session only. See
 [docs/PAUSE_KEEPALIVE.md](docs/PAUSE_KEEPALIVE.md).
 
+## Tile previews (TV)
+
+A focused poster tile on the TV expands and plays the cached trailer clip with
+sound (`/api/trailer/:key/preview.mp4?audio=1`), else a 90 s preview of the
+title stream (`GET /api/preview/:mode/:id`): the lowest-priority user of the
+provider connection, admitted only while nobody is watching and stopped by any
+real play. See [docs/TILE_PREVIEWS.md](docs/TILE_PREVIEWS.md).
+
 ## Native trailers (`/api/trailer/:key.mp4`)
 
 Trailers play inside the apps instead of opening YouTube. Details and the

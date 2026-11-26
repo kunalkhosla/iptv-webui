@@ -5321,6 +5321,48 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/seg_:n.ts", (req, res)
   fs.createReadStream(segPath).on("error", () => res.end()).pipe(res);
 });
 
+// Tile preview media (see GET /api/preview/:mode/:id further down). Signed
+// like /api/transcode (the Android players fetch media without cookies). A
+// stopped / replaced / displaced preview answers 410 so the player gives up.
+function activePreviewFor(req, res) {
+  const sid = req.params.sid;
+  if (req.query.s !== previewSig(sid)) { res.status(403).end(); return null; }
+  const p = activePreview;
+  if (!p || p.sid !== sid) { res.status(410).set("Cache-Control", "no-store").json({ error: "preview_stopped" }); return null; }
+  p.lastAccess = Date.now();
+  const e = streams.get(`${streamPreview.PREVIEW_OWNER_PREFIX}${sid}`);
+  if (e) e.lastSeen = e.mediaSeen = p.lastAccess;
+  return p;
+}
+app.get("/api/preview/:sid(p[0-9a-f]{16})/index.m3u8", async (req, res) => {
+  const p = activePreviewFor(req, res);
+  if (!p) return;
+  const file = path.join(p.dir, "index.m3u8");
+  for (let i = 0; i < 50; i++) {
+    if (activePreview !== p) return res.status(410).set("Cache-Control", "no-store").json({ error: "preview_stopped" });
+    let text = null;
+    try { text = fs.readFileSync(file, "utf8"); } catch {}
+    if (text && text.includes("#EXTINF")) {
+      p.lastAccess = Date.now();
+      const s = previewSig(p.sid);
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Cache-Control", "no-cache");
+      return res.send(text.replace(/^seg_(\d+)\.ts$/gm, `/api/preview/${p.sid}/seg_$1.ts?s=${s}`));
+    }
+    if (p.ended) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  res.status(504).set("Cache-Control", "no-store").json({ error: "preview_timeout" });
+});
+app.get("/api/preview/:sid(p[0-9a-f]{16})/seg_:n(\\d{1,6}).ts", (req, res) => {
+  const p = activePreviewFor(req, res);
+  if (!p) return;
+  const segPath = path.join(p.dir, `seg_${req.params.n}.ts`);
+  if (!fs.existsSync(segPath)) return res.status(404).end();
+  res.setHeader("Content-Type", "video/mp2t");
+  fs.createReadStream(segPath).on("error", () => res.end()).pipe(res);
+});
+
 // Single-file 720p MP4 piped live from ffmpeg. Used by the Android
 // phone's DownloadManager to save a watchable, ~1 GB-per-2-hour
 // copy of a movie or episode for offline playback.
@@ -5552,7 +5594,7 @@ async function runDownloadJob(job) {
     // Never touch the provider while someone else holds the slot (newest-wins would evict the viewer).
     // A Save-to-Disk transfer is not "someone": a phone download (a person
     // waiting for it) takes the slot from it.
-    const slotHeld = [...streams.entries()].some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced && !diskDlSchedule.isDiskDownloadOwner(k));
+    const slotHeld = [...streams.entries()].some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced && !v.preview && !diskDlSchedule.isDiskDownloadOwner(k));
     if (slotHeld) { await waitForViewer(); continue; }
     if (accountKey === accountKeyOf(ownerAccount)) preemptDiskDownloadsForViewer("queue");
     const ac = new AbortController();
@@ -7189,25 +7231,34 @@ function trailerFieldsFor(key) {
   if (!key || !isValidTrailerKey(key)) return { trailer: null };
   return { trailer: { key, url: `/api/trailer/${key}.mp4`, preview: `/api/trailer/${key}/preview.mp4`, cached: trailerCache.has(key) } };
 }
-function buildTrailerPreview(key, src) {
-  let p = trailerPreviewInflight.get(key);
+// withAudio (?audio=1, TV tile previews with sound): the same clip with the
+// trailer's first audio track re-encoded to stereo AAC, stored as <key>.a.mp4.
+function trailerPreviewFile(key, withAudio) {
+  return path.join(TRAILER_PREVIEW_DIR, `${key}${withAudio ? ".a" : ""}.mp4`);
+}
+function buildTrailerPreview(key, src, withAudio = false) {
+  const flightKey = `${key}${withAudio ? ".a" : ""}`;
+  let p = trailerPreviewInflight.get(flightKey);
   if (p) return p;
   p = (async () => {
     fs.mkdirSync(TRAILER_PREVIEW_DIR, { recursive: true });
-    const dest = path.join(TRAILER_PREVIEW_DIR, `${key}.mp4`);
-    const tmp = path.join(TRAILER_PREVIEW_DIR, `.${key}.${process.pid}.tmp.mp4`);
+    const dest = trailerPreviewFile(key, withAudio);
+    const tmp = path.join(TRAILER_PREVIEW_DIR, `.${flightKey}.${process.pid}.tmp.mp4`);
     const { runFfmpeg } = require("./lib/media-sidecar");
     const r = await runFfmpeg(spawn, "ffmpeg", [
       "-nostdin", "-hide_banner", "-v", "error", "-y", "-ss", "3", "-i", src, "-t", "30",
-      "-map", "0:v:0", "-an", "-sn", "-dn", "-c:v", "copy", "-movflags", "+faststart", "-f", "mp4", tmp,
+      ...(withAudio
+        ? ["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "128k"]
+        : ["-map", "0:v:0", "-an", "-sn", "-dn", "-c:v", "copy"]),
+      "-movflags", "+faststart", "-f", "mp4", tmp,
     ], { timeoutMs: 30_000, maxBytes: 1024 });
     let ok = false;
     try { ok = r.ok && fs.statSync(tmp).size > 10_000; } catch { ok = false; }
     if (!ok) { fs.rmSync(tmp, { force: true }); console.log(`[trailer] preview ${key} failed: ${String(r.error || "").slice(0, 200)}`); return null; }
     fs.renameSync(tmp, dest);
     return dest;
-  })().finally(() => trailerPreviewInflight.delete(key));
-  trailerPreviewInflight.set(key, p);
+  })().finally(() => trailerPreviewInflight.delete(flightKey));
+  trailerPreviewInflight.set(flightKey, p);
   return p;
 }
 app.get("/api/trailer/:key/preview.mp4", async (req, res, next) => {
@@ -7224,16 +7275,17 @@ app.get("/api/trailer/:key/preview.mp4", async (req, res, next) => {
       if (!req.get("x-khouch-internal")) trailerPrefetch.enqueue([{ key, trailerKey: key }]);
       return none("not_cached");
     }
-    const dest = path.join(TRAILER_PREVIEW_DIR, `${key}.mp4`);
+    const withAudio = req.query.audio === "1";
+    const dest = trailerPreviewFile(key, withAudio);
     let file = null;
     try { if (fs.statSync(dest).isFile()) file = dest; } catch { file = null; }
-    if (!file) file = await buildTrailerPreview(key, src);
+    if (!file) file = await buildTrailerPreview(key, src, withAudio);
     if (!file) return none("trailer_unavailable");
     let size;
     try { size = fs.statSync(file).size; } catch { return none("trailer_unavailable"); }
     res.sendFile(file, {
       acceptRanges: true, lastModified: false, etag: false, dotfiles: "allow",
-      headers: { "Content-Type": "video/mp4", "Cache-Control": "private, max-age=86400", "ETag": `"${key}-p-${size}"` },
+      headers: { "Content-Type": "video/mp4", "Cache-Control": "private, max-age=86400", "ETag": `"${key}-p${withAudio ? "a" : ""}-${size}"` },
     }, (err) => { if (err && !res.headersSent) none("trailer_unavailable"); });
   } catch (e) { next(e); }
 });
@@ -7242,7 +7294,7 @@ setInterval(() => {
   let names = [];
   try { names = fs.readdirSync(TRAILER_PREVIEW_DIR); } catch { return; }
   for (const n of names) {
-    const m = /^([A-Za-z0-9_-]{6,20})\.mp4$/.exec(n);
+    const m = /^([A-Za-z0-9_-]{6,20})(?:\.a)?\.mp4$/.exec(n);
     const f = path.join(TRAILER_PREVIEW_DIR, n);
     let old = false;
     try { old = Date.now() - fs.statSync(f).mtimeMs > 10 * 60_000; } catch {}
@@ -8902,6 +8954,8 @@ app.post("/api/progress/:mode(movie|series|disk)/:id", express.json(), (req, res
   if (!Number.isFinite(position) || position < 0) {
     return res.status(400).json({ error: "bad position" });
   }
+  // A player is running on this device: no tile preview elsewhere meanwhile.
+  previewViewerActivity(ownerKeyOf(req), "progress");
   const key = `${mode}:${id}`;
   const validDur = Number.isFinite(duration) && duration > 0 ? duration : null;
   const finished = validDur != null && (position >= validDur - 30 || position >= validDur * 0.95);
@@ -10051,6 +10105,8 @@ app.post("/api/live/health/:id", express.json({ limit: "4kb" }), (req, res) => {
   if (rl && now - rl.t < 60e3 && rl.n >= 30) return res.status(429).json({ error: "slow down" });
   if (!rl || now - rl.t >= 60e3) liveHealthRate.set(ok, { n: 1, t: now }); else rl.n += 1;
   if (liveHealthRate.size > 500) for (const [k, v] of liveHealthRate) if (now - v.t >= 60e3) liveHealthRate.delete(k);
+  // The end of this device's live session (tile previews may run again).
+  streamPreview.noteSignal(previewSignals, ok, "live-end", now);
   const report = liveRescue.sanitizeReport(req.body);
   if (!report) return res.json({ ok: true, recorded: false });
   liveRescue.recordReport(liveHealth, liveHealthKey(actx, id), report, now);
@@ -12239,6 +12295,7 @@ function makeAssistantTools(req) {
       for (const [owner, v] of streams) {
         if (v.accountKey !== accountKey || v.displaced) continue;
         if (diskDlSchedule.isBackgroundOwner(owner)) continue; // a download, not someone watching
+        if (v.preview) continue; // a tile preview, not someone watching
         // "Still watching?" window matches the idle reaper: one grace for
         // all modes (a buffering cast OR a VOD player playing out a deep
         // forward buffer stops fetching but is still wanted).
@@ -14052,6 +14109,10 @@ function parseStreamFromPanelUrl(panelUrl) {
 function admitStream(owner, mode, id, killer, accountKey) {
   const existing = streams.get(owner);
   noteViewerActivity(owner); // Save-to-Disk waits a grace after any viewer activity
+  // Anything real (a viewer, a phone download) beats a tile preview, which
+  // never counts against the cap. Save-to-Disk jobs never admit while a
+  // preview holds the slot (slotHolder), so they are not checked here.
+  if (!diskDlSchedule.isDiskDownloadOwner(owner)) stopPreviews(`admit ${mode}`);
   if (existing && existing.displaced) {
     // The previous request from this owner was displaced; the client
     // hasn't yet learned. Reject so it surfaces.
@@ -14080,7 +14141,7 @@ function admitStream(owner, mode, id, killer, accountKey) {
   // displaces owner B on account Y.
   const sameAccount = [];
   for (const [k, v] of streams) {
-    if (v.accountKey === accountKey && !v.displaced) sameAccount.push([k, v]);
+    if (v.accountKey === accountKey && !v.displaced && !v.preview) sameAccount.push([k, v]);
   }
   if (sameAccount.length >= MAX_CONCURRENT_STREAMS) {
     let oldest = sameAccount[0];
@@ -14132,6 +14193,8 @@ function callerIpOf(req) {
 // { mode, id } about once a minute while paused (up to 60 min); this only
 // refreshes the caller's EXISTING session for that title. No upstream I/O.
 app.post("/api/stream/heartbeat", express.json(), (req, res) => {
+  // A paused player on some device: no tile preview may hold the connection.
+  previewViewerActivity(ownerKeyOf(req), "heartbeat");
   const r = pauseKeepalive.handleHeartbeat(req.body, {
     streams, transcoders, callerOwner: ownerKeyOf(req), callerIp: callerIpOf(req),
     now: Date.now(), maxMs: PAUSE_KEEPALIVE_MAX_MS,
@@ -14139,6 +14202,193 @@ app.post("/api/stream/heartbeat", express.json(), (req, res) => {
   if (r.status === 410) return sendDisplaced(res);
   res.setHeader("Cache-Control", "no-store");
   res.status(r.status).json(r.body);
+});
+
+// --- Tile previews from the title stream (lib/stream-preview.js, docs/TILE_PREVIEWS.md)
+// Lowest priority user of the household's one provider connection: admitted
+// only while nobody is watching, stopped by anything real, one at a time.
+// TILE_STREAM_PREVIEW=0 turns it off (the endpoint answers 503 disabled).
+const streamPreview = require("./lib/stream-preview");
+const TILE_STREAM_PREVIEW = process.env.TILE_STREAM_PREVIEW !== "0";
+const PREVIEW_DURATION_SECS = 90;
+const PREVIEW_IDLE_MS = 20_000;       // running, no manifest/segment request: the TV left
+const PREVIEW_MAX_MS = 4 * 60_000;    // hard cap on one preview's life
+const PREVIEW_LINGER_MS = 60_000;     // after ffmpeg finished: segments stay this long past the last request
+const PREVIEW_DIR = path.join(TRANSCODE_DIR, "previews");
+const previewSignals = new Map();     // owner -> latest play/progress/heartbeat (noteSignal)
+const previewStartRate = new Map();   // requester -> { n, t }
+let activePreview = null;             // { sid, requester, mode, id, streamId, accountKey, dir, proc, ... }
+
+function previewSig(sid) {
+  return crypto.createHmac("sha256", PROXY_SECRET).update(`preview:${sid}`).digest("hex").slice(0, 16);
+}
+// Stop the current preview (if any): ffmpeg SIGKILLed at once (nothing to
+// keep, and its provider connection closes with the process), slot entry
+// removed, segments deleted. Returns null when nothing was stopped, else a
+// promise that resolves once that ffmpeg has exited (at most ~2 s).
+function stopPreviews(reason, exceptRequester = null) {
+  const p = activePreview;
+  if (!p) return null;
+  if (exceptRequester && p.requester === exceptRequester) return null;
+  activePreview = null;
+  streams.delete(`${streamPreview.PREVIEW_OWNER_PREFIX}${p.sid}`);
+  const proc = p.proc;
+  const running = !!proc && proc.exitCode === null && proc.signalCode === null;
+  const exited = running
+    ? new Promise((resolve) => {
+      const t = setTimeout(resolve, 2000);
+      proc.once("exit", () => { clearTimeout(t); resolve(); });
+    })
+    : Promise.resolve();
+  if (running) { try { proc.kill("SIGKILL"); } catch {} }
+  p.stopped = true;
+  setTimeout(() => fs.rm(p.dir, { recursive: true, force: true }, () => {}), 2000).unref?.();
+  console.log(`[preview] ${p.sid} stop (${reason}) ${p.mode}:${p.streamId} after ${Math.round((Date.now() - p.startedAt) / 1000)}s`);
+  return exited;
+}
+// A real player somewhere (progress / heartbeat / play request): remember it
+// for admission, and stop a preview another device is running. Returns
+// stopPreviews' exit promise (null = nothing stopped).
+function previewViewerActivity(owner, kind) {
+  streamPreview.noteSignal(previewSignals, owner, kind === "play-live" || kind === "play-vod" ? kind : "activity", Date.now());
+  if (kind === "play-live" || kind === "play-vod") return stopPreviews(`play ${kind === "play-live" ? "live" : "vod"}`);
+  return stopPreviews(kind, owner);
+}
+function spawnPreviewFfmpeg(p, hw) {
+  fs.rmSync(p.dir, { recursive: true, force: true });
+  fs.mkdirSync(p.dir, { recursive: true });
+  const args = streamPreview.previewFfmpegArgs({
+    sourceUrl: p.sourceUrl, startSecs: p.startSecs, durationSecs: PREVIEW_DURATION_SECS,
+    audioTrack: p.audioTrack, hw, vaapiDevice: VAAPI_DEVICE, reconnectArgs: panelReconnectArgs(),
+    userAgent: "Mozilla/5.0 (Linux; Android 12; Smart TV)", dir: p.dir,
+  });
+  const proc = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+  p.proc = proc;
+  p.hw = hw;
+  try { os.setPriority(proc.pid, 10); } catch {}
+  let err = "";
+  proc.stderr.on("data", (d) => { if (err.length < 2000) err += d.toString(); });
+  proc.on("error", () => {});
+  proc.on("exit", (code) => {
+    if (activePreview !== p || p.proc !== proc) return;
+    // The provider connection is closed now: the preview no longer holds the slot.
+    streams.delete(`${streamPreview.PREVIEW_OWNER_PREFIX}${p.sid}`);
+    const segs = (() => { try { return fs.readdirSync(p.dir).filter((f) => f.endsWith(".ts")).length; } catch { return 0; } })();
+    if (code !== 0 && segs === 0 && hw && !p.retried) {
+      // VAAPI refused this source (10-bit H.264, AV1...): once more in software.
+      p.retried = true;
+      console.log(`[preview] ${p.sid} hw run failed, retrying in software: ${err.trim().split("\n").pop()?.slice(0, 160) || code}`);
+      if (registerPreviewSlot(p)) spawnPreviewFfmpeg(p, false);
+      else stopPreviews("busy on retry");
+      return;
+    }
+    p.ended = true;
+    p.lastAccess = Date.now();
+    if (code !== 0) console.log(`[preview] ${p.sid} ffmpeg exit ${code} after ${segs} segment(s): ${err.trim().split("\n").pop()?.slice(0, 160) || ""}`);
+  });
+}
+// The preview's entry in the admission map: counts as holding the slot (Save
+// to Disk waits for it), displaced by any real admission (its killer).
+function registerPreviewSlot(p) {
+  const now = Date.now();
+  const adm = streamPreview.decideAdmission({
+    streams, signals: previewSignals, requester: p.requester, accountKey: p.accountKey, now,
+    idleGraceMs: LIVE_IDLE_GRACE_MS, isBackgroundOwner: diskDlSchedule.isBackgroundOwner, isDiskDownloadOwner: diskDlSchedule.isDiskDownloadOwner,
+  });
+  if (!adm.ok) return false;
+  streams.set(`${streamPreview.PREVIEW_OWNER_PREFIX}${p.sid}`, {
+    mode: p.mode, id: String(p.streamId), accountKey: p.accountKey,
+    since: now, lastSeen: now, mediaSeen: now, preview: true,
+    killers: new Set([() => stopPreviews("displaced")]), displaced: false,
+  });
+  return true;
+}
+setInterval(() => {
+  const p = activePreview;
+  if (!p) return;
+  const now = Date.now();
+  if (now - p.startedAt > PREVIEW_MAX_MS) stopPreviews("max age");
+  else if (!p.ended && now - p.lastAccess > PREVIEW_IDLE_MS) stopPreviews("idle");
+  else if (p.ended && now - p.lastAccess > PREVIEW_LINGER_MS) stopPreviews("done");
+}, 5000).unref?.();
+
+// GET /api/preview/:mode/:id -> { sid, url, mode, id, series_id, start, duration }
+// 409 busy (someone is watching), 403 not_allowed (kid gate), 503 disabled.
+app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    if (!TILE_STREAM_PREVIEW) return res.status(503).json({ error: "disabled" });
+    const actx = currentAccount();
+    if (!isOwnerAccount(actx)) return res.status(409).json({ error: "busy", reason: "account" });
+    const { mode, id } = req.params;
+    const requester = ownerKeyOf(req);
+    const now = Date.now();
+    const rl = previewStartRate.get(requester);
+    if (rl && now - rl.t < 60_000 && rl.n >= 20) return res.status(429).json({ error: "slow down" });
+    if (!rl || now - rl.t >= 60_000) previewStartRate.set(requester, { n: 1, t: now }); else rl.n += 1;
+    if (previewStartRate.size > 200) for (const [k, v] of previewStartRate) if (now - v.t >= 60_000) previewStartRate.delete(k);
+    const item = indexes[mode]?.byId?.get(parseInt(id, 10));
+    if (!item) return res.status(404).json({ error: "not in catalog" });
+    // Kid profiles: the title's rating must be within their allowed certs
+    // (unrated = no preview), like trailers.
+    const certs = kidCertsForProfile(findProfile(req.profileId));
+    if (certs && !certs.has(effCert(tmdbCache[`${mode}:${id}`]))) return res.status(403).json({ error: "not_allowed" });
+    const userState = getProfileState(req.profileId);
+    let streamId = String(id), ext = String(item.container || "mp4").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp4", durationSecs = null, seriesId = null;
+    if (mode === "movie") {
+      durationSecs = panelDurationSecsCached("movie", id) || (Number(tmdbCache[`movie:${id}`]?.runtime) * 60 || null);
+    } else {
+      seriesId = String(id);
+      const params = { series_id: seriesId };
+      const infoKey = xtreamKey(actx, MODES.series.info, params);
+      let info = cache.get(infoKey)?.v || null;
+      if (!info?.episodes) {
+        try { info = await xtream(MODES.series.info, params, { actx, timeout: INFO_PANEL_TIMEOUT_MS }); } catch { info = null; }
+      }
+      if (!info?.episodes) info = (await infoStore.get(infoKey).catch(() => null))?.v || null;
+      const le = userState.lastEpisode?.[seriesId] || userState.lastEpisode?.[String(parseInt(seriesId, 10))];
+      const ep = streamPreview.pickSeriesEpisode(info, le);
+      if (!ep) return res.status(503).json({ error: "info_unavailable" });
+      streamId = ep.id; ext = ep.ext; durationSecs = ep.durationSecs;
+    }
+    const prog = userState.progress?.[`${mode}:${streamId}`];
+    const startSecs = streamPreview.previewStartSecs({ progressSecs: prog?.p, durationSecs: durationSecs || prog?.d });
+    // One at a time: this replaces any current preview (ours or another
+    // device's); its provider connection must be closed before ours opens.
+    // No await between the last check and claiming activePreview below, so a
+    // concurrent request can't leave two running.
+    for (let i = 0; i < 3 && activePreview; i++) { const prev = stopPreviews("replaced"); if (prev) await prev; }
+    if (activePreview) return res.status(409).json({ error: "busy", reason: "preview" });
+    const sid = streamPreview.newSid((n) => crypto.randomBytes(n).toString("hex"));
+    const p = {
+      sid, requester, mode, id: String(id), streamId, accountKey: currentAccountKey(),
+      dir: path.join(PREVIEW_DIR, sid), startSecs, startedAt: now, lastAccess: now,
+      sourceUrl: streamUrl(mode, streamId, ext, actx),
+      audioTrack: cachedAudioPick(mode, streamId) ?? 0,
+    };
+    if (!registerPreviewSlot(p)) {
+      const adm = streamPreview.decideAdmission({ streams, signals: previewSignals, requester, accountKey: p.accountKey, now, idleGraceMs: LIVE_IDLE_GRACE_MS, isBackgroundOwner: diskDlSchedule.isBackgroundOwner, isDiskDownloadOwner: diskDlSchedule.isDiskDownloadOwner });
+      return res.status(409).json({ error: "busy", reason: adm.reason || "viewer" });
+    }
+    // Yield the connection like a viewer does: a running Save-to-Disk transfer stops now.
+    preemptDiskDownloadsForViewer("preview");
+    activePreview = p;
+    spawnPreviewFfmpeg(p, HW_ENCODE && !hwDecodeFailed.has(`${mode}:${streamId}`));
+    console.log(`[preview] ${sid} start ${mode}:${streamId}${seriesId ? ` (series ${seriesId})` : ""} at ${startSecs}s`);
+    res.json({
+      sid, url: `/api/preview/${sid}/index.m3u8?s=${previewSig(sid)}`,
+      mode, id: Number(streamId), series_id: seriesId ? Number(seriesId) : null,
+      start: startSecs, duration: PREVIEW_DURATION_SECS,
+    });
+  } catch (e) { next(e); }
+});
+// POST /api/preview/stop { sid } — the TV's focus left the tile.
+app.post("/api/preview/stop", express.json({ limit: "1kb" }), (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const sid = req.body?.sid;
+  if (!streamPreview.isValidSid(sid)) return res.status(400).json({ error: "bad sid" });
+  const stopped = activePreview?.sid === sid ? stopPreviews("client stop") : false;
+  res.json({ ok: true, stopped });
 });
 
 // Exact panel duration for a VOD title from what is ALREADY cached (never a
@@ -15234,6 +15484,10 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   // one provider connection right now, before this player reaches the
   // provider (Disk titles are local files and never need it).
   if (req.params.mode !== "disk") preemptDiskDownloadsForViewer(`play ${req.params.mode}`);
+  // ...and a tile preview (any device) stops before the player starts: wait
+  // for its ffmpeg (and so its provider connection) to be gone first.
+  const previewGone = previewViewerActivity(ownerKeyOf(req), req.params.mode === "live" ? "play-live" : "play-vod");
+  if (previewGone) await previewGone;
 
   // --- Disk (local) media. Decide direct-play vs transcode from the probed
   // codec metadata (no network probe). Return signed same-origin URLs; the
@@ -15684,6 +15938,8 @@ app.get("/api/streams", (_req, res) => {
       // A Save-to-Disk transfer: holds the provider slot but is not a viewer
       // (it yields to any play request and resumes after a restart).
       background: diskDlSchedule.isDiskDownloadOwner(owner),
+      // A tile preview (lowest priority, stops for any viewer); not a viewer.
+      preview: !!v.preview,
       account_hash: crypto.createHash("sha1").update(v.accountKey || "").digest("hex").slice(0, 10),
       mode: v.mode, id: v.id,
       since_ms: Date.now() - v.since,
@@ -15693,8 +15949,9 @@ app.get("/api/streams", (_req, res) => {
   }
   res.json({
     cap_per_account: MAX_CONCURRENT_STREAMS,
-    active: list.filter((x) => !x.background).length, // viewers (and phone-download fetches)
+    active: list.filter((x) => !x.background && !x.preview).length, // viewers (and phone-download fetches)
     background: list.filter((x) => x.background).length,
+    preview: list.filter((x) => x.preview).length,
     streams: list,
   });
 });
