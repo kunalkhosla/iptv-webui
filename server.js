@@ -2430,7 +2430,7 @@ async function prewarmEpgInner(actx) {
         isReference: (l) => /^epg_ripper_/.test(l), isCandidate: (l) => l === "provider",
         previous: shiftsToPersist(epgStatus.calibration?.groups),
       });
-      calibration = { shiftedChannels: r.applied.size, groups: r.groups };
+      calibration = { shiftedChannels: r.applied.size, groups: r.groups, zeroIds: r.zeroIds };
       for (const gk of r.absent) console.warn(`[epg] ${gk}: no channels this build; remembering its ${r.groups[gk].remembered.shiftMin} min shift (miss ${r.groups[gk].remembered.misses})`);
       for (const [gk, g] of Object.entries(r.groups)) if (g.shiftMin) console.log(`[epg] ${gk}: shifting ${g.channels} channel(s) by ${g.shiftMin} min (${g.reused ? "reused from last build" : `${JSON.stringify(g.votes)} of ${g.calibrated} calibrated`})`);
     } catch (e) {
@@ -9580,7 +9580,9 @@ app.get("/api/epg/short/:streamId", async (req, res, next) => {
       }))
       .filter(p => p.start && p.stop);
     // Same shift + overlap cleanup the bulk index gets (lib/epg-clean.js).
-    const out = fixPanelPrograms(rows, chId, epgStatus.calibration?.groups)
+    // Calibration is measured on the owner's panel only; other accounts get overlap cleanup but no shift.
+    const owner = isOwnerAccount(currentAccount());
+    const out = fixPanelPrograms(rows, chId, owner ? epgStatus.calibration?.groups : null, "provider", epgStatus.calibration?.zeroIds)
       .filter(p => p.stop > fromSec * 1000 && p.start < toSec * 1000)
       .sort((a, b) => a.start - b.start)
       .map(p => ({ title: p.title, description: p.desc, start_ts: Math.floor(p.start / 1000), stop_ts: Math.floor(p.stop / 1000) }));

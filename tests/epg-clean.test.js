@@ -272,3 +272,34 @@ test("fixPanelPrograms: panel fallback gets the measured provider/in shift, then
   assert.equal(fixPanelPrograms(rows, "bbc.uk", groups)[0].start, T0);
   assert.equal(fixPanelPrograms(rows, "mnplushd.in", undefined)[0].start, T0);
 });
+
+test("fixPanelPrograms: no shift without a country-tagged id, for zeroIds channels, or when groups withheld (non-owner)", () => {
+  const { fixPanelPrograms } = require("../lib/epg-clean");
+  const rows = [P(0, 60, "A"), P(1, 60, "B")];
+  // A "?" group must never be used for ids without a country tag.
+  const groups = { "provider/in": { shiftMin: -330 }, "provider/?": { shiftMin: -330 } };
+  assert.equal(fixPanelPrograms(rows, undefined, groups)[0].start, T0);
+  assert.equal(fixPanelPrograms(rows, "", groups)[0].start, T0);
+  assert.equal(fixPanelPrograms(rows, "plainchannel", groups)[0].start, T0);
+  // Channel measured at 0 is vetoed (array or Set); others in the group still shift.
+  assert.equal(fixPanelPrograms(rows, "a.in", groups, "provider", ["a.in"])[0].start, T0);
+  assert.equal(fixPanelPrograms(rows, "a.in", groups, "provider", new Set(["a.in"]))[0].start, T0);
+  assert.equal(fixPanelPrograms(rows, "b.in", groups, "provider", ["a.in"])[0].start, T0 - 330 * M);
+  assert.equal(fixPanelPrograms(rows, "b.in", groups, "provider", undefined)[0].start, T0 - 330 * M);
+  // Non-owner: server passes null groups -> no shift.
+  assert.equal(fixPanelPrograms(rows, "b.in", null)[0].start, T0);
+});
+
+test("calibrateEpgOffsets: reports channels measured at 0 as zeroIds", () => {
+  const mk = (id, off) => [0, 1, 2, 3, 4, 5].map((k) => P(k + off, 60, `show${id} part${k}`));
+  const byChannel = new Map(), names = new Map(), sourceOf = new Map();
+  for (let i = 0; i < 6; i++) {
+    byChannel.set(`ref${i}.in`, mk(i, 0)); names.set(`ref${i}.in`, [`chan${i}`]); sourceOf.set(`ref${i}.in`, "epg_ripper_x");
+    byChannel.set(`c${i}.in`, mk(i, 5.5)); names.set(`c${i}.in`, [`chan${i}`]); sourceOf.set(`c${i}.in`, "provider");
+  }
+  byChannel.set("ok.in", mk(9, 0)); names.set("ok.in", ["chan9"]); sourceOf.set("ok.in", "provider");
+  byChannel.set("refok.in", mk(9, 0)); names.set("refok.in", ["chan9"]); sourceOf.set("refok.in", "epg_ripper_x");
+  const r = calibrateEpgOffsets({ byChannel, names, sourceOf, nameKey: (n) => n,
+    isReference: (l) => /^epg_ripper_/.test(l), isCandidate: (l) => l === "provider", minGroup: 5, groupAgree: 0.8 });
+  assert.deepEqual(r.zeroIds, ["ok.in"]);
+});
