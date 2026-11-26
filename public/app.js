@@ -6208,7 +6208,7 @@ function renderSeriesEpisodes(seriesItem, info, sn, onPlay = playEpisode) {
       const thumbEl = epEl.querySelector(".ep-thumb");
       const img = new Image();
       img.referrerPolicy = "no-referrer";
-      img.onload = () => { thumbEl.style.backgroundImage = `url("${thumbUrl}")`; };
+      img.onload = () => { if (!thumbEl.dataset.still) thumbEl.style.backgroundImage = `url("${thumbUrl}")`; };
       img.src = thumbUrl;
     }
     epEl.dataset.epId = String(ep.id);
