@@ -5452,6 +5452,7 @@ function tryAlternateFormat() {
 }
 
 function closePlayer() {
+  _pauseKA.stop("close");
   if (_stillResolve) _stillResolve(false);
   endLiveSession();
   clearPlaybackExtras(state.playing);
@@ -6831,6 +6832,7 @@ function initCast() {
       if (ev.sessionState === cast.framework.SessionState.SESSION_STARTED ||
           ev.sessionState === cast.framework.SessionState.SESSION_RESUMED) {
         state.castSession = ctx.getCurrentSession();
+        _pauseKA.stop("cast");
         const device = state.castSession.getCastDevice().friendlyName;
         toast(`Cast connected: ${device}`, 2500);
         // Stop local playback so the laptop isn't playing the same stream
@@ -7603,6 +7605,51 @@ elPlayPause.addEventListener("click", (e) => {
 // Sync play/pause button icon + controls visibility
 el.video.addEventListener("play",  () => { elPlayPause.textContent = "⏸"; showControls(); });
 el.video.addEventListener("pause", () => { elPlayPause.textContent = "▶"; keepControlsVisible(); });
+
+// Pause keep-alive (docs/PAUSE_KEEPALIVE.md): a paused movie / episode / disk
+// title makes no media requests, so without this the server's idle reaper
+// frees the session after ~3 min and the resume fails. Heartbeats only while
+// paused locally (never live, never while casting), up to 60 min; stops on
+// play, close, tab hidden, cast handoff and end of title.
+const _pauseKA = KPauseKeepalive.create({
+  post: (t) => fetch("/api/stream/heartbeat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(t),
+  }).then(async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) })),
+  now: () => Date.now(),
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: (h) => clearTimeout(h),
+  // Test-only overrides (set before app.js loads); production uses the defaults.
+  intervalMs: Number(window.__khouchPauseKeepaliveIntervalMs) || undefined,
+  maxMs: Number(window.__khouchPauseKeepaliveMaxMs) || undefined,
+});
+let _pauseKABackgroundedAt = null; // pause start carried across a hidden tab
+function pauseKeepaliveTarget() {
+  const p = state.playing;
+  if (!p || !p.item || p.mode === "live" || state.castSession) return null;
+  if (!el.video.paused || el.video.ended || !el.video.currentSrc) return null;
+  return { mode: p.mode, id: String(p.item.id) };
+}
+el.video.addEventListener("pause", () => {
+  if (document.hidden) return;
+  const t = pauseKeepaliveTarget();
+  if (t) _pauseKA.paused(t.mode, t.id); else _pauseKA.stop("not-eligible");
+});
+el.video.addEventListener("play", () => { _pauseKABackgroundedAt = null; _pauseKA.stop("play"); });
+el.video.addEventListener("ended", () => { _pauseKABackgroundedAt = null; _pauseKA.stop("ended"); });
+el.video.addEventListener("emptied", () => { _pauseKABackgroundedAt = null; _pauseKA.stop("emptied"); });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    _pauseKABackgroundedAt = _pauseKA.pausedAt;
+    _pauseKA.stop("background");
+    return;
+  }
+  const at = _pauseKABackgroundedAt;
+  _pauseKABackgroundedAt = null;
+  const t = pauseKeepaliveTarget();
+  if (t && at != null) _pauseKA.resumeAfterBackground(t.mode, t.id, at);
+});
 
 // Loading spinner driver. `playing` fires when frames actually start
 // rendering (after the user-visible "preparing" gap). `waiting` fires
