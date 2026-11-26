@@ -58,6 +58,8 @@ Same rules on web (`public/pause-keepalive.js`), phone and TV
   coming back while still paused starts a fresh keep-alive.
 - Network errors: keep trying on the next interval. 401/403/404/405 stop it
   (signed out, or a server without the endpoint).
+- A pause whose keep-alive ended itself (cap, displaced, rejected,
+  no-session) is not restarted by a background / hidden round-trip.
 - Web treats a hidden tab as backgrounded (owner rule: background stops the
   keep-alive), so a paused tab left hidden for > 3 min is reaped as before.
 
@@ -69,8 +71,10 @@ Test-only overrides: server `PAUSE_KEEPALIVE_MAX_MS`; web
 
 `lib/vod-end.js`: when a VOD ffmpeg exits, the position reached in the title is
 `offsetSecs + playlistElapsedSecs(dir)` (a resumed transcode starts at its
-`-ss` anchor). The end is reached at the panel's exact `duration_secs`
-(cached `get_vod_info`, or the episode's info) minus 5 s, else at the TMDB
-runtime + 65 s (movies). Reaching it marks the playlist ended and keeps the
+`-ss` anchor). A trusted panel `duration_secs` (cached `get_vod_info`, or the
+episode's info) decides alone: end at duration - 5 s. It is ignored when more
+than 10% shorter than the TMDB runtime or over 2x it; then (or without one)
+the end is TMDB runtime + 65 s (movies). Stream-copy runs add 10 s per anchored
+seek (keyframe snap overstates the position). Reaching it marks the playlist ended and keeps the
 dir for the viewer instead of respawning past EOF. A "no packets" respawn
 right after a clean exit 0 is logged as `past end of file`, not `slot-held`.

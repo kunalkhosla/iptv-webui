@@ -145,6 +145,8 @@ test("vodReachedEnd: panel duration distrusted when TMDB disagrees; copy seeks r
   // Extended cut (panel longer than TMDB): trusted, no early end at the runtime.
   assert.equal(vodReachedEnd({ offsetSecs: 0, elapsedSecs: 7300, durationSecs: 9000, runtimeMin: 120 }).done, false);
   assert.equal(vodReachedEnd({ offsetSecs: 0, elapsedSecs: 8996, durationSecs: 9000, runtimeMin: 120 }).by, "duration");
+  // Absurd panel value (> 2x runtime): ignored, runtime decides.
+  assert.equal(vodReachedEnd({ offsetSecs: 0, elapsedSecs: 7300, durationSecs: 72000, runtimeMin: 120 }).by, "runtime");
   assert.equal(vodReachedEnd({ offsetSecs: 0, elapsedSecs: 6000, durationSecs: 6000, runtimeMin: 99 }).by, "duration");
   // Stream copy, resumed + 2 respawns: each seek may add a GOP.
   assert.equal(vodReachedEnd({ offsetSecs: 600, elapsedSecs: 5396, durationSecs: 6000, copySeeks: 3 }).done, false);
