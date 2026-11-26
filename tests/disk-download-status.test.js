@@ -84,3 +84,8 @@ test("parseIdsParam: digits only, empty -> null", () => {
   assert.strictEqual(parseIdsParam(undefined), null);
   assert.strictEqual(parseIdsParam("a,b"), null);
 });
+
+test("select: mode without ids falls back to the default list", () => {
+  const jobs = [{ jobId: "a", mode: "movie", id: 1, status: "done", createdAt: 1 }, { jobId: "b", mode: "series", id: 2, status: "queued", createdAt: 2 }];
+  assert.deepStrictEqual(selectDiskJobs(jobs, { mode: "movie", ids: null }).map((j) => j.jobId), ["b", "a"]);
+});
