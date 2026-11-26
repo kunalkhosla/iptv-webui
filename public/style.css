@@ -2141,6 +2141,7 @@ body.player-theater #search-all-view { display: none; }
 .showcard-credits > div { display: flex; gap: 10px; flex-wrap: wrap; }
 .series-creators,
 .series-cat-row,
+.series-part-of,
 .series-genres {
   font-size: 12.5px;
   line-height: 1.4;
@@ -2148,6 +2149,7 @@ body.player-theater #search-all-view { display: none; }
 }
 .series-creators b,
 .series-cat-row b,
+.series-part-of b,
 .series-genres b {
   color: var(--fg);
   font: 400 13px/1.4 var(--font-display);
@@ -2157,6 +2159,7 @@ body.player-theater #search-all-view { display: none; }
   align-self: center;
 }
 .series-cat-row a,
+.series-part-of a,
 .series-creators .person-link {
   color: var(--fg);
   text-decoration: none;
@@ -2164,6 +2167,7 @@ body.player-theater #search-all-view { display: none; }
   cursor: pointer;
 }
 .series-cat-row a:hover,
+.series-part-of a:hover,
 .series-creators .person-link:hover {
   color: var(--accent);
   border-bottom-color: var(--accent);
@@ -3322,4 +3326,190 @@ body.filter-open #scrim { opacity: 1; pointer-events: auto; }
 }
 @media (max-width: 720px) {
   .title-logo { max-height: 56px; max-width: min(100%, 280px); }
+}
+
+
+/* ── Netflix-style extras (docs/NETFLIX_FEATURES.md) ─────────────── */
+
+/* #7 Generated title card for tiles with no art (never initials). */
+.title-card {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  padding: 12px 10px;
+  text-align: center;
+  pointer-events: none;
+}
+.title-card-text {
+  color: #fff;
+  font: 400 clamp(15px, 1.6vw, 22px)/1.08 var(--font-display);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-shadow: 0 2px 8px rgba(0,0,0,0.45);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.channel.live .title-card-text { font-size: 15px; -webkit-line-clamp: 2; }
+.refine-poster-blank { position: relative; }
+
+/* #3 Muted trailer previews (hero + hovered tile). */
+.trailer-preview {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition: opacity .5s ease;
+  pointer-events: none;
+  background: transparent;
+}
+.trailer-preview.on { opacity: 1; }
+#hero .trailer-preview { filter: brightness(0.7); }
+.channel .logo .trailer-preview { z-index: 1; border-radius: inherit; }
+
+/* #4 Collections rail, page and tiles. */
+.rail-track.collections { grid-auto-columns: 300px; }
+.collection-tile {
+  all: unset;
+  cursor: pointer;
+  display: block;
+  border-radius: 6px;
+  transition: transform 0.18s ease;
+}
+.collection-tile:hover, .collection-tile:focus-visible { transform: scale(1.04); }
+.collection-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.collection-art {
+  position: relative;
+  aspect-ratio: 16/9;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--bg-2) center / cover no-repeat;
+  overflow: hidden;
+}
+.collection-shade {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 26px 12px 10px;
+  background: linear-gradient(180deg, transparent, rgba(0,0,0,0.85));
+}
+.collection-name {
+  color: #fff;
+  font: 400 21px/1.05 var(--font-display);
+  letter-spacing: 0.04em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.collection-sub { color: rgba(255,255,255,0.75); font-size: 12px; margin-top: 3px; }
+.collection-art .title-card { padding-bottom: 46px; }
+.collection-banner {
+  position: relative;
+  min-height: 220px;
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 22px;
+  background: var(--bg-2) center 30% / cover no-repeat;
+  display: flex; align-items: flex-end;
+}
+.collection-banner::before {
+  content: "";
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, rgba(13,17,36,0.92) 0%, rgba(13,17,36,0.55) 55%, rgba(13,17,36,0.15) 100%);
+}
+.collection-banner-info { position: relative; padding: 22px 24px; max-width: 680px; }
+.collection-banner-info h2 { margin: 0 0 6px; font: 400 36px/1 var(--font-display); letter-spacing: 0.03em; color: var(--fg); }
+.collection-banner-meta { color: var(--accent-2); font-size: 13px; font-weight: 600; }
+.collection-banner-info p {
+  margin: 10px 0 0; color: var(--fg); font-size: 13.5px; line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+.collection-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 18px 14px;
+}
+.collection-num {
+  position: absolute; top: 6px; left: 6px; z-index: 2;
+  min-width: 26px; height: 26px; padding: 0 7px;
+  border-radius: 13px;
+  background: rgba(0,0,0,0.72);
+  color: #fff;
+  font: 400 17px/26px var(--font-display);
+  text-align: center;
+}
+.collection-grid .channel .audio-badge { top: 36px; }
+
+/* #1 Scrub-thumbnail preview above the seek bar. */
+#player-trickplay {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 7;
+  padding: 2px;
+  background: #000;
+  border: 1px solid rgba(255,255,255,0.35);
+  border-radius: 6px;
+  box-shadow: 0 6px 22px rgba(0,0,0,0.6);
+  pointer-events: none;
+  display: flex; flex-direction: column; align-items: center;
+}
+#player-trickplay img { display: block; border-radius: 4px; object-fit: cover; background: #111; }
+#player-trickplay span { color: #fff; font: 600 12px/1.6 var(--font-body); font-variant-numeric: tabular-nums; }
+
+/* #2 Skip intro / recap button + credits countdown. */
+#player-skip {
+  position: absolute;
+  right: 16px;
+  bottom: 76px;
+  z-index: 6;
+  padding: 10px 18px;
+  font: 700 14px/1 var(--font-body);
+  color: #fff;
+  background: rgba(13, 17, 36, 0.78);
+  border: 1.5px solid rgba(255,255,255,0.85);
+  border-radius: 6px;
+  cursor: pointer;
+  pointer-events: auto;
+  animation: upnext-in .25s ease;
+}
+#player-skip:hover, #player-skip:focus-visible { background: #fff; color: #0d1124; }
+#player[data-mode="mini"] #player-skip { bottom: 60px; right: 10px; padding: 7px 12px; font-size: 12px; }
+#player-upnext.credits .upnext-label { color: var(--fg); font-size: 11px; }
+#player-upnext #player-upnext-credits {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid rgba(255,255,255,0.5);
+}
+
+/* #8 "Still watching?" */
+#player-still {
+  position: absolute; inset: 0;
+  z-index: 9;
+  display: grid; place-items: center;
+  background: rgba(5, 7, 16, 0.82);
+  pointer-events: auto;
+}
+#player-still .still-card { text-align: center; padding: 24px; max-width: 520px; }
+#player-still h2 { margin: 0 0 8px; font: 400 44px/1 var(--font-display); letter-spacing: 0.03em; color: var(--fg); }
+#player-still p { margin: 0 0 22px; color: var(--fg-dim); font-size: 14px; }
+#player-still .still-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+#player-still button {
+  padding: 11px 22px; font: 700 14px/1 var(--font-body); border-radius: 6px; cursor: pointer;
+  border: 1px solid rgba(255,255,255,0.5); background: transparent; color: var(--fg);
+}
+#player-still #player-still-continue { background: var(--accent); border-color: var(--accent); color: #fff; }
+#player-still button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+#player[data-mode="mini"] #player-still h2 { font-size: 26px; }
+#player[data-mode="mini"] #player-still p { margin-bottom: 12px; }
+
+@media (max-width: 720px) {
+  .rail-track.collections { grid-auto-columns: 240px; }
+  .collection-banner { min-height: 180px; }
+  .collection-banner-info { padding: 16px; }
+  .collection-banner-info h2 { font-size: 28px; }
+  .collection-grid { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 14px 10px; }
+  #player[data-mode="theater"] #player-skip,
+  #player[data-mode="theater"] #player-upnext { bottom: 116px; right: 10px; }
+  #player-still h2 { font-size: 32px; }
 }

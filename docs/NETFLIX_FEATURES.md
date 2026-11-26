@@ -198,3 +198,44 @@ a later load. With `poster: null`, clients draw a generated title card.
   markers stay).
   `MEDIA_SIDECAR_DISK_DELAY_MS` (first Disk-library pass after boot, default 10 min).
 - Logs: `[sidecar] ...`.
+
+## Web client (public/app.js, public/nf-helpers.js)
+
+Pure helpers live in `public/nf-helpers.js` (window `KNf`, also `require()`d
+by `tests/web-netflix.test.js`); they mirror the Android `:core` objects
+(`Trickplay`, `SkipLogic`, `StillWatching`, `TitleCard`) so all clients agree.
+
+- **Scrub thumbnails**: fetched on every VOD play (`movie` / `series` /
+  `disk`); the frame `KNf.frameFor` picks (largest <= position, else the next
+  one; none when both are > 3 x interval away) shows above the seek bar while
+  the pointer hovers or drags it. No frames = plain bar. Re-read every 30 s
+  only while a transcode may still grow the list.
+- **Skip intro / credits**: markers for `series` + Disk episodes. "Skip intro"
+  (or recap) inside its span seeks to its end. In the credits of an episode
+  with a next one, the Up Next card becomes a 10 s countdown (counts only while
+  playing; "Watch credits" dismisses it for the episode, "Play now" advances,
+  0 auto-advances). Without a credits marker the old last-20-s Up Next card
+  stays. Disk series groups now auto-advance like panel series.
+- **Trailer previews**: muted `preview.mp4` over the hero (after 1.5 s, while
+  the hero is >= 35 % on screen; the rotation waits for it and moves on at its
+  end) and over a hovered tile (desktop fine pointers, 0.9 s). Started only when
+  `/api/poster` says `trailer.cached` (an uncached key 404s, which the browser
+  logs). One at a time; stopped when the tab is hidden, something plays, a
+  detail page opens, the view changes or a rail scrolls. Never on Data Saver /
+  2G. A failed key is not retried for 2 min. Kid gating is the server's 404.
+- **Collections**: Movies home shows the `collections` rail (wide backdrop
+  tiles) before the 5th rail, hidden while a chip filter is on. A tile opens a
+  collection page (search-all view shell: banner + numbered titles in release
+  order). Movie detail shows "Part of <collection>" when `collection.url` is set.
+- **Episodes**: series and Disk series pages apply `/api/episodes` (still,
+  this profile's progress bar + "Resume at", watched check) on top of the
+  existing rows; fetched once per detail open.
+- **Posters**: tiles use the tile `poster` first, then an https panel icon,
+  then the `/api/poster` upgrade; without art they keep a generated title card
+  (`.title-card`, cleaned title on a palette gradient). No initials anywhere.
+- **Still watching?**: auto-advances (end of episode, credits countdown) are
+  counted; any key, click or wheel in the player resets the run, as does a
+  manually started title (a re-play of the same title for a codec / quality /
+  audio switch does not count). The 3rd consecutive auto-played episode opens
+  behind the prompt and its stream is not resolved until "Continue watching"
+  (or any key); "Back" / Escape closes the player.

@@ -17,6 +17,7 @@
 <script defer src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/hls.js@1.5.18/dist/hls.min.js"></script>
 <script defer src="/theatre-portraits.js"></script>
+<script defer src="/nf-helpers.js"></script>
 <script defer src="/app.js"></script>
 </head>
 <body>
@@ -244,13 +245,28 @@
          movies / live and when there's no next episode. Mirrors the
          Android TV "Up Next" affordance + autoplay-on-end. -->
     <div id="player-upnext" hidden>
-      <span class="upnext-label">Up Next</span>
+      <span class="upnext-label" id="player-upnext-label">Up Next</span>
       <span id="player-upnext-title" class="upnext-title"></span>
+      <button id="player-upnext-credits" type="button" hidden>Watch credits</button>
       <button id="player-upnext-play" type="button">▸ Play now</button>
+    </div>
+    <!-- Skip intro / recap (from /api/markers). Bottom-left, above the bar. -->
+    <button id="player-skip" type="button" hidden>Skip intro</button>
+    <!-- "Still watching?" after 3 auto-played episodes with no input. -->
+    <div id="player-still" hidden role="dialog" aria-modal="true" aria-labelledby="player-still-title">
+      <div class="still-card">
+        <h2 id="player-still-title">Still watching?</h2>
+        <p id="player-still-sub"></p>
+        <div class="still-actions">
+          <button id="player-still-continue" type="button">Continue watching</button>
+          <button id="player-still-back" type="button">Back</button>
+        </div>
+      </div>
     </div>
     <div id="player-overlay">
       <div id="player-scrim"></div>
       <div id="player-scrub-wrap">
+        <div id="player-trickplay" hidden aria-hidden="true"><img alt=""><span></span></div>
         <div id="player-scrub-track">
           <div id="player-scrub-buffered"></div>
           <div id="player-scrub-fill"></div>
@@ -320,6 +336,7 @@
             <div class="series-creators" id="series-creators" hidden></div>
             <div class="series-cat-row"  id="series-cat-row"  hidden></div>
             <div class="series-genres"   id="series-genres"   hidden></div>
+            <div class="series-part-of"  id="series-part-of"  hidden></div>
           </dl>
         </div>
       </div>

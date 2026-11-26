@@ -224,6 +224,15 @@ const el = {
   playerUpnext: document.getElementById("player-upnext"),
   playerUpnextTitle: document.getElementById("player-upnext-title"),
   playerUpnextPlay: document.getElementById("player-upnext-play"),
+  playerUpnextLabel: document.getElementById("player-upnext-label"),
+  playerUpnextCredits: document.getElementById("player-upnext-credits"),
+  playerSkip: document.getElementById("player-skip"),
+  playerStill: document.getElementById("player-still"),
+  playerStillSub: document.getElementById("player-still-sub"),
+  playerStillContinue: document.getElementById("player-still-continue"),
+  playerStillBack: document.getElementById("player-still-back"),
+  playerTrickplay: document.getElementById("player-trickplay"),
+  seriesPartOf: document.getElementById("series-part-of"),
   playerTitle: document.getElementById("player-title"),
   castHere: document.getElementById("cast-here"),
   playerClose: document.getElementById("player-close"),
@@ -1090,6 +1099,7 @@ function showGrid() {
   el.gridView.hidden = false;
   el.searchAllView.hidden = true;
   if (el.collectionView) el.collectionView.hidden = true;
+  stopAllPreviews();
   if (_heroTimer) { clearInterval(_heroTimer); _heroTimer = null; }
   if (state.playing && el.player.dataset.mode === "theater") setPlayerMode("mini");
 }
@@ -1100,6 +1110,7 @@ function showSearchAll() {
   el.gridView.hidden = true;
   el.searchAllView.hidden = false;
   if (el.collectionView) el.collectionView.hidden = true;
+  stopAllPreviews();
   if (_heroTimer) { clearInterval(_heroTimer); _heroTimer = null; }
   if (state.playing && el.player.dataset.mode === "theater") setPlayerMode("mini");
 }
@@ -1376,6 +1387,7 @@ let _heroIdx = 0;
 
 function renderHero() {
   // Tear down any previous rotation for the prior mode/state.
+  stopHeroPreview();
   if (_heroTimer) { clearInterval(_heroTimer); _heroTimer = null; }
   el.hero.innerHTML = "";
   el.hero.hidden = true;
@@ -1427,6 +1439,7 @@ function renderHero() {
   }
   renderHeroDots();
   attachHeroNavigation();
+  observeHeroVisibility();
 }
 
 // Touch-swipe + arrow-button + keyboard navigation for the hero
@@ -1441,7 +1454,7 @@ function attachHeroNavigation() {
     _heroIdx = (_heroIdx + delta + _heroItems.length) % _heroItems.length;
     paintHero(_heroItems[_heroIdx]);
     renderHeroDots();
-    if (_heroTimer) { clearInterval(_heroTimer); _heroTimer = setInterval(advanceHero, HERO_ROTATE_MS); }
+    restartHeroRotation();
   };
   prev?.addEventListener("click", () => jump(-1));
   next?.addEventListener("click", () => jump(1));
@@ -1492,7 +1505,7 @@ function renderHeroDots() {
       renderHeroDots();
       // Reset the rotation timer so the user gets a full HERO_ROTATE_MS
       // window on the slide they just picked.
-      if (_heroTimer) { clearInterval(_heroTimer); _heroTimer = setInterval(advanceHero, HERO_ROTATE_MS); }
+      restartHeroRotation();
     };
   }
 }
@@ -1577,7 +1590,180 @@ function paintHero(pick) {
   syncHeroThumbs();
   heroUp.onclick = (e) => { e.stopPropagation(); toggleFeedbackFromHero(state.mode, pick.id, "up"); syncHeroThumbs(); };
   heroDown.onclick = (e) => { e.stopPropagation(); toggleFeedbackFromHero(state.mode, pick.id, "down"); syncHeroThumbs(); };
+  scheduleHeroPreview(pick);
 }
+
+function restartHeroRotation() {
+  if (_heroTimer) clearInterval(_heroTimer);
+  _heroTimer = _heroItems.length > 1 && !_heroPreview?.playing ? setInterval(advanceHero, HERO_ROTATE_MS) : null;
+}
+
+// ── Muted trailer previews (#3) ──────────────────────────────────────
+// /api/trailer/:key/preview.mp4: a muted ~30 s clip of a CACHED trailer
+// (404 at once when not downloaded yet / not allowed for this profile, so
+// kid gating is the server's). One preview at a time: the hero's current
+// slide (after a short delay, while the hero is on screen) or the hovered
+// / focused tile (desktop pointers only). Stopped when the tab is hidden,
+// something plays, a detail page opens, or the element leaves the screen.
+// A failed key is not retried for 2 min.
+const HERO_PREVIEW_DELAY_MS = 1500;
+const TILE_PREVIEW_DELAY_MS = 900;
+const _previewFailedAt = new Map();
+let _heroPreview = null;   // { pick, video, timer, playing }
+let _tilePreview = null;   // { card, video, timer }
+let _heroVisible = true;
+let _heroObserver = null;
+function previewKeyUsable(key) {
+  if (!key || !KNf.previewUrlFor(key)) return false;
+  const t = _previewFailedAt.get(key);
+  return !(t && Date.now() - t < KNf.PREVIEW_FAIL_RETRY_MS);
+}
+// Only start a preview the server can answer at once: /api/poster's
+// `trailer.cached` (an uncached key answers 404, which the browser logs).
+// Resolves to the preview URL, or null.
+async function cachedPreviewUrl(mode, id, key) {
+  if (!mode || mode === "live" || id == null) return null;
+  const d = await posterFor(mode, id);
+  const t = d && d.trailer;
+  if (!t || !t.cached || (key && t.key && t.key !== key)) return null;
+  return typeof t.preview === "string" ? t.preview : KNf.previewUrlFor(t.key);
+}
+function previewsBlocked() {
+  return document.hidden || !KNf.previewAllowed(navigator)
+    || (!!state.playing && !el.player.hidden) || !el.seriesPanel.hidden;
+}
+function createPreviewVideo(key, url, onPlaying, onDone) {
+  const v = document.createElement("video");
+  v.className = "trailer-preview";
+  v.muted = true;
+  v.defaultMuted = true;
+  v.playsInline = true;
+  v.setAttribute("muted", "");
+  v.setAttribute("playsinline", "");
+  v.disablePictureInPicture = true;
+  v.preload = "auto";
+  v.setAttribute("aria-hidden", "true");
+  v.addEventListener("playing", () => { v.classList.add("on"); onPlaying && onPlaying(); }, { once: true });
+  v.addEventListener("error", () => { _previewFailedAt.set(key, Date.now()); onDone && onDone(false); }, { once: true });
+  v.addEventListener("ended", () => onDone && onDone(true), { once: true });
+  v.src = url;
+  const pr = v.play();
+  if (pr && pr.catch) pr.catch(() => {});
+  return v;
+}
+function destroyPreviewVideo(v) {
+  if (!v) return;
+  try { v.pause(); } catch {}
+  v.removeAttribute("src");
+  try { v.load(); } catch {}
+  v.remove();
+}
+function stopHeroPreview() {
+  const hp = _heroPreview;
+  _heroPreview = null;
+  if (!hp) return;
+  clearTimeout(hp.timer);
+  destroyPreviewVideo(hp.video);
+  if (hp.playing) restartHeroRotation();
+}
+function scheduleHeroPreview(pick) {
+  stopHeroPreview();
+  if (!pick || !pick.trailer_key || !previewKeyUsable(pick.trailer_key)) return;
+  const hp = { pick, video: null, timer: null, playing: false };
+  _heroPreview = hp;
+  const heroMode = state.mode;
+  hp.timer = setTimeout(async () => {
+    const url = await cachedPreviewUrl(heroMode, pick.id, pick.trailer_key);
+    if (!url || _heroPreview !== hp || _tilePreview || el.hero.hidden || !_heroVisible || previewsBlocked()) return;
+    if (_heroItems[_heroIdx] !== pick || state.mode !== heroMode) return;
+    hp.video = createPreviewVideo(pick.trailer_key, url, () => {
+      if (_heroPreview !== hp) return;
+      // Hold the rotation while the trailer plays; it advances at the end.
+      hp.playing = true;
+      if (_heroTimer) { clearInterval(_heroTimer); _heroTimer = null; }
+    }, (ended) => {
+      if (_heroPreview !== hp) return;
+      stopHeroPreview();
+      if (ended && _heroItems.length > 1) { advanceHero(); restartHeroRotation(); }
+    });
+    const fade = el.hero.querySelector(".hero-fade");
+    if (fade) el.hero.insertBefore(hp.video, fade); else el.hero.appendChild(hp.video);
+  }, HERO_PREVIEW_DELAY_MS);
+}
+function resumeHeroPreview() {
+  if (_heroPreview || el.hero.hidden || state.view !== "home" || !_heroItems.length) return;
+  scheduleHeroPreview(_heroItems[_heroIdx]);
+}
+function observeHeroVisibility() {
+  if (_heroObserver || !("IntersectionObserver" in window)) return;
+  _heroObserver = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      _heroVisible = e.isIntersecting && e.intersectionRatio >= 0.35;
+      if (!_heroVisible) stopHeroPreview();
+      else resumeHeroPreview();
+    }
+  }, { threshold: [0, 0.35, 0.6] });
+  _heroObserver.observe(el.hero);
+}
+function stopTilePreview() {
+  const tp = _tilePreview;
+  _tilePreview = null;
+  if (!tp) return;
+  clearTimeout(tp.timer);
+  destroyPreviewVideo(tp.video);
+}
+function startTilePreview(card) {
+  if (_tilePreview && _tilePreview.card === card) return;
+  stopTilePreview();
+  const key = card.dataset.trailerKey;
+  if (!previewKeyUsable(key)) return;
+  const tp = { card, video: null, timer: null };
+  _tilePreview = tp;
+  tp.timer = setTimeout(async () => {
+    const url = await cachedPreviewUrl(card.dataset.posterMode, card.dataset.posterId, key);
+    if (!url || _tilePreview !== tp || !card.isConnected || previewsBlocked()) return;
+    const logo = card.querySelector(".logo");
+    if (!logo) return;
+    stopHeroPreview(); // one preview at a time
+    tp.video = createPreviewVideo(key, url, null, () => {
+      if (_tilePreview !== tp) return;
+      stopTilePreview();
+      resumeHeroPreview();
+    });
+    logo.appendChild(tp.video);
+  }, TILE_PREVIEW_DELAY_MS);
+}
+function endTilePreview(card) {
+  if (!_tilePreview || (card && _tilePreview.card !== card)) return;
+  stopTilePreview();
+  resumeHeroPreview();
+}
+function stopAllPreviews() {
+  stopTilePreview();
+  stopHeroPreview();
+}
+// Desktop hover (fine pointer only: a tap on a phone opens the title).
+const _hoverPreviewMq = window.matchMedia ? window.matchMedia("(hover: hover) and (pointer: fine)") : null;
+document.addEventListener("mouseover", (e) => {
+  if (!_hoverPreviewMq || !_hoverPreviewMq.matches) return;
+  const card = e.target.closest && e.target.closest(".channel[data-trailer-key]");
+  if (card) startTilePreview(card);
+});
+document.addEventListener("mouseout", (e) => {
+  const card = e.target.closest && e.target.closest(".channel[data-trailer-key]");
+  if (card && !(e.relatedTarget && card.contains(e.relatedTarget))) endTilePreview(card);
+});
+document.addEventListener("focusin", (e) => {
+  const card = e.target.closest && e.target.closest(".channel[data-trailer-key]");
+  if (card) startTilePreview(card);
+  else if (_tilePreview) endTilePreview();
+});
+// A rail scrolled under a still pointer moves the tile away from it.
+document.addEventListener("scroll", () => { if (_tilePreview) endTilePreview(); }, { capture: true, passive: true });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopAllPreviews();
+  else resumeHeroPreview();
+});
 
 function renderRails() {
   el.rails.innerHTML = "";
@@ -1618,6 +1804,14 @@ function renderRails() {
   // payload hasn't returned yet.
   const serverHome = state.home[mode];
   if (serverHome && Array.isArray(serverHome.rails) && serverHome.rails.length) {
+    // Collections (Movies home only, not with chip filters: collection
+    // tiles carry no tags) go in before the 5th rail, like the phone.
+    const colls = (mode === "movie" && (!picks || picks.size === 0) && Array.isArray(serverHome.collections?.items))
+      ? serverHome.collections.items : [];
+    let railsShown = 0;
+    const maybeCollections = () => {
+      if (colls.length && railsShown === COLLECTIONS_SLOT) el.rails.appendChild(renderCollectionsRail(serverHome.collections));
+    };
     for (const r of serverHome.rails) {
       let items = gate(r.items || []);
       // "Seen it, not now" — only meaningful on the recommendation rail
@@ -1633,6 +1827,7 @@ function renderRails() {
         }
       }
       if (!items.length) continue;
+      maybeCollections();
       el.rails.appendChild(renderRail({
         title: r.title,
         items,
@@ -1641,7 +1836,10 @@ function renderRails() {
         blurb: r.blurb || null,
         snoozable: r.snoozable,
       }));
+      railsShown++;
     }
+    // Fewer rails than the slot: collections go last.
+    if (colls.length && railsShown < COLLECTIONS_SLOT) el.rails.appendChild(renderCollectionsRail(serverHome.collections));
     return;
   }
 
@@ -1715,6 +1913,127 @@ function renderRails() {
   }
 
   for (const r of rails) el.rails.appendChild(renderRail(r));
+}
+
+// ── Collections (#4): TMDB belongs_to_collection franchises ──────────
+// /api/home/movie `collections` (tiles are COLLECTIONS, not titles) →
+// a rail of wide backdrop tiles; a tile opens the collection page.
+const COLLECTIONS_SLOT = 4; // before the 5th rail (same as the phone)
+function collectionYears(c) {
+  if (!c || !c.first_year) return "";
+  return c.last_year && c.last_year !== c.first_year ? `${c.first_year}–${c.last_year}` : String(c.first_year);
+}
+function collectionTile(c) {
+  const t = document.createElement("button");
+  t.type = "button";
+  t.className = "collection-tile";
+  t.title = c.name || "";
+  const art = document.createElement("div");
+  art.className = "collection-art";
+  art.appendChild(titleCardEl(c.name));
+  const url = c.backdrop || c.poster;
+  if (url) {
+    const img = new Image();
+    img.referrerPolicy = "no-referrer";
+    img.onload = () => { art.style.backgroundImage = `url("${url}")`; art.querySelector(".title-card")?.remove(); };
+    img.src = url;
+  }
+  const shade = document.createElement("div");
+  shade.className = "collection-shade";
+  const nm = document.createElement("div");
+  nm.className = "collection-name";
+  nm.textContent = String(c.name || "").replace(/\s+Collection$/i, "");
+  const sub = document.createElement("div");
+  sub.className = "collection-sub";
+  sub.textContent = [c.count ? `${c.count} titles` : null, collectionYears(c) || null].filter(Boolean).join(" · ");
+  shade.append(nm, sub);
+  art.appendChild(shade);
+  t.appendChild(art);
+  t.onclick = () => openCollectionView(c.id, c.name);
+  return t;
+}
+function renderCollectionsRail(payload) {
+  const sec = document.createElement("section");
+  sec.className = "rail rail-collections";
+  const header = document.createElement("div");
+  header.className = "rail-header";
+  const h = document.createElement("h3");
+  h.className = "rail-title";
+  h.textContent = payload.title || "Collections";
+  header.appendChild(h);
+  if (Number.isFinite(payload.total) && payload.total > 0) {
+    const count = document.createElement("span");
+    count.className = "rail-count";
+    count.textContent = payload.total.toLocaleString();
+    header.appendChild(count);
+  }
+  const track = document.createElement("div");
+  track.className = "rail-track collections";
+  for (const c of payload.items || []) if (c && c.id != null) track.appendChild(collectionTile(c));
+  sec.append(header, track);
+  return sec;
+}
+// Collection page: rendered in the search-all view shell (like "More from
+// <actor>"): banner + the titles numbered in release order.
+let _collectionReq = 0;
+async function openCollectionView(id, name) {
+  if (id == null) return;
+  const req = ++_collectionReq;
+  closeDetail();
+  stopAllPreviews();
+  el.searchAllTitle.textContent = name || "Collection";
+  el.searchAllResults.innerHTML = `<div class="empty">Loading collection…</div>`;
+  showSearchAll();
+  let data = null;
+  try {
+    const r = await fetch(`/api/collections/${encodeURIComponent(id)}`);
+    if (r.ok) data = await r.json();
+  } catch {}
+  if (req !== _collectionReq) return;
+  if (!data || !Array.isArray(data.items) || !data.items.length) {
+    el.searchAllResults.innerHTML = `<div class="empty">This collection isn't available.</div>`;
+    return;
+  }
+  el.searchAllTitle.textContent = data.name || name || "Collection";
+  el.searchAllResults.innerHTML = "";
+  const banner = document.createElement("div");
+  banner.className = "collection-banner";
+  const bg = data.backdrop || data.poster;
+  if (bg) {
+    const img = new Image();
+    img.referrerPolicy = "no-referrer";
+    img.onload = () => { banner.style.backgroundImage = `url("${bg}")`; };
+    img.src = bg;
+  }
+  const info = document.createElement("div");
+  info.className = "collection-banner-info";
+  const h = document.createElement("h2");
+  h.textContent = data.name || name || "";
+  const meta = document.createElement("div");
+  meta.className = "collection-banner-meta";
+  meta.textContent = [`${data.items.length} title${data.items.length === 1 ? "" : "s"}`, collectionYears(data) || null].filter(Boolean).join(" · ");
+  info.append(h, meta);
+  if (data.overview) {
+    const ov = document.createElement("p");
+    ov.textContent = data.overview;
+    info.appendChild(ov);
+  }
+  banner.appendChild(info);
+  el.searchAllResults.appendChild(banner);
+  const grid = document.createElement("div");
+  grid.className = "collection-grid";
+  const prevMode = state.mode;
+  data.items.forEach((it, i) => {
+    state.mode = "movie"; // badges / progress in channelCard read state.mode
+    const card = channelCard(it, { mode: "movie", reason: data.name });
+    const n = document.createElement("span");
+    n.className = "collection-num";
+    n.textContent = String(i + 1);
+    card.querySelector(".logo")?.appendChild(n);
+    grid.appendChild(card);
+  });
+  state.mode = prevMode;
+  el.searchAllResults.appendChild(grid);
 }
 
 // Chip strip above the rails on Movies / Series home. Mirrors the
@@ -3085,10 +3404,10 @@ function channelCard(s, opts = {}) {
 
   const logo = document.createElement("div");
   logo.className = "logo";
-  const initialsEl = document.createElement("span");
-  initialsEl.className = "logo-initials";
-  initialsEl.textContent = initials(s.name);
-  logo.appendChild(initialsEl);
+  // Generated title card (cleaned title on a palette gradient) until real
+  // art loads; never the old 2-letter initials box. Removed by the poster
+  // observer once an image actually loads.
+  logo.appendChild(titleCardEl(s.name));
   // Icon + poster loading are both fully lazy via the shared
   // _posterObserver (see getPosterObserver()) — deferred until the card
   // scrolls near the viewport, not fired at build time. At catalog scale
@@ -3098,6 +3417,9 @@ function channelCard(s, opts = {}) {
   // grid/Guide pagination fixes: same URL is already known up front, only
   // the actual network fetch needs to wait for visibility.
   if (s.icon) card.dataset.icon = s.icon;
+  // Server-resolved poster (TMDB, else an https panel icon; never http:).
+  if (cardMode !== "live" && typeof s.poster === "string" && s.poster) card.dataset.poster = s.poster;
+  if (cardMode !== "live" && s.trailer_key) card.dataset.trailerKey = s.trailer_key;
   card.dataset.posterId = String(s.id);
   card.dataset.posterMode = cardMode;
   observePosterCard(card, logo);
@@ -3313,8 +3635,19 @@ function channelCard(s, opts = {}) {
   return card;
 }
 
-function initials(name) {
-  return (name || "").replace(/[^A-Za-z0-9 ]/g, "").trim().split(/\s+/).slice(0, 3).map(w => w[0]).join("").toUpperCase().slice(0, 4) || "TV";
+// Generated title card for art-less tiles (#7): the cleaned title on a
+// gradient picked by a stable hash of the title (same palette + hash as the
+// Android apps, public/nf-helpers.js).
+function titleCardEl(name) {
+  const card = document.createElement("span");
+  card.className = "title-card";
+  const [c1, c2] = KNf.titleCardColors(name || "");
+  card.style.background = `linear-gradient(135deg, ${c1}, ${c2})`;
+  const t = document.createElement("span");
+  t.className = "title-card-text";
+  t.textContent = KNf.displayTitle(name || "") || "Untitled";
+  card.appendChild(t);
+  return card;
 }
 
 function toggleFav(mode, id) {
@@ -3691,17 +4024,25 @@ function getPosterObserver() {
       _posterObserver.unobserve(card);
       const logo = card.querySelector(".logo");
       if (!logo) continue;
-      if (card.dataset.icon) {
+      // Art in order: the server-resolved poster, else the panel icon. An
+      // http: icon on an https page is mixed content (blocked or noisy):
+      // skip it and keep the title card.
+      const loadArt = (url, onFail) => {
         const img = new Image();
         img.referrerPolicy = "no-referrer";
         img.onload = () => {
           if (img.naturalWidth > 4 && img.naturalHeight > 4) {
-            logo.style.backgroundImage = `url("${card.dataset.icon}")`;
-            logo.querySelector(".logo-initials")?.remove();
-          }
+            logo.style.backgroundImage = `url("${url}")`;
+            logo.querySelector(".title-card")?.remove();
+          } else if (onFail) onFail();
         };
-        img.src = card.dataset.icon;
-      }
+        if (onFail) img.onerror = onFail;
+        img.src = url;
+      };
+      const icon = card.dataset.icon;
+      const iconOk = icon && !(location.protocol === "https:" && /^http:/i.test(icon));
+      if (card.dataset.poster) loadArt(card.dataset.poster, iconOk ? () => loadArt(icon) : null);
+      else if (iconOk) loadArt(icon);
       const mode = card.dataset.posterMode;
       const id = card.dataset.posterId;
       if (!mode || !id) continue;
@@ -3715,7 +4056,7 @@ function getPosterObserver() {
           img.referrerPolicy = "no-referrer";
           img.onload = () => {
             logo.style.backgroundImage = `url("${d.poster}")`;
-            logo.querySelector(".logo-initials")?.remove();
+            logo.querySelector(".title-card")?.remove();
           };
           img.src = d.poster;
         });
@@ -3957,10 +4298,28 @@ function armStallWatch() {
   }, 2000);
 }
 
+// Per-playback timers / overlays from the Netflix extras (trick-play
+// refresh, marker re-fetch, skip button, scrub preview).
+function clearPlaybackExtras(p) {
+  if (p) {
+    if (p._trickplayTimer) { clearInterval(p._trickplayTimer); p._trickplayTimer = null; }
+    if (p._markersTimer) { clearTimeout(p._markersTimer); p._markersTimer = null; }
+  }
+  hideTrickplay();
+  refreshSkipButton(null);
+}
+
 async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTrack) {
   saveScroll();
   clearStallWatch();
   clearProgressTracking();
+  stopAllPreviews();
+  const prevPlaying = state.playing;
+  clearPlaybackExtras(prevPlaying);
+  // A re-play of the same title (codec / stall fallback, audio or quality
+  // switch) is not a new player start for "Still watching?".
+  const sameTitle = !!prevPlaying && prevPlaying.mode === mode && String(prevPlaying.item.id) === String(item.id);
+  if (_stillResolve) _stillResolve(false); // a newer play() supersedes a pending prompt
   // Kill the *previous* transcoder by id (not all) so we can never have
   // two upstream panel connections live at once, while also avoiding a
   // race where a fire-and-forget kill-all POST arrives at the server
@@ -4077,7 +4436,8 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
   // Up-Next card; clears the card from any prior item.
   refreshNextEpisode();
 
-  if (state.castSession) { recordAsPlayed(); castMedia(state.playing); return; }
+  if (state.castSession) { _stillWatching.cancelPendingAutoStart(); recordAsPlayed(); castMedia(state.playing); return; }
+  const needStillPrompt = sameTitle ? false : _stillWatching.onPlayerStart();
 
   el.player.hidden = false;
   setPlayerMode(mode === "live" ? "mini" : "theater");
@@ -4089,6 +4449,22 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
   // resolveStreamUrl + transcoder warmup runs. The `playing` event
   // hides it once frames are flowing.
   if (el.spinner) el.spinner.hidden = false;
+
+  // "Still watching?": the 3rd auto-played episode in a row waits behind
+  // the prompt; nothing is streamed until the viewer answers.
+  if (needStillPrompt) {
+    if (el.spinner) el.spinner.hidden = true;
+    // Stop the previous episode's buffered tail behind the prompt.
+    if (state.hls) { state.hls.destroy(); state.hls = null; }
+    el.video.pause();
+    el.video.removeAttribute("src");
+    el.video.load();
+    const ok = await askStillWatching(state.playing.label);
+    if (state.playing !== myPlaying) return;
+    if (!ok) { closePlayer(); return; }
+    _stillWatching.onUserInteraction();
+    if (el.spinner) el.spinner.hidden = false;
+  }
 
   let resolved;
   try {
@@ -4168,6 +4544,10 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
     url = resolved.proxy;
     isHls = ext === "m3u8";
   }
+
+  // Netflix extras for this title: scrub thumbnails + skip markers.
+  loadTrickplay(state.playing);
+  loadMarkers(state.playing);
 
   if (state.hls) { state.hls.destroy(); state.hls = null; }
   el.video.removeAttribute("src");
@@ -4580,6 +4960,9 @@ function tryAlternateFormat() {
 }
 
 function closePlayer() {
+  if (_stillResolve) _stillResolve(false);
+  clearPlaybackExtras(state.playing);
+  hideUpNext();
   sendProgress();
   clearProgressTracking();
   clearStallWatch();
@@ -4596,6 +4979,7 @@ function closePlayer() {
   refreshLiveRemoteVisibility();
   refreshPlayerFavorite();
   updateUrl();
+  resumeHeroPreview();
 }
 
 // --- Movie / disk detail (reuses the series modal's hero + close UI) -
@@ -4614,6 +4998,7 @@ function restoreDiskSeriesOnlyButtons() {
 
 async function openMovie(s, mode = "movie") {
   saveScroll();
+  stopAllPreviews();
   // Switch to the item's mode so updateUrl() builds the right path
   // rather than inheriting whatever tab the user was on before clicking
   // (e.g. from search-all). Lightweight version of setMode — no rail
@@ -4791,6 +5176,7 @@ function closeMovie() {
   state.openMovie = null;
   state.openMovieData = null;
   updateUrl();
+  resumeHeroPreview();
 }
 
 // Season currently rendered inside the series modal — kept on
@@ -4798,6 +5184,7 @@ function closeMovie() {
 // re-fetching the panel info.
 async function openSeries(s) {
   saveScroll();
+  stopAllPreviews();
   // Mirror of openMovie: switch state.mode to "series" so updateUrl
   // builds a `/series/...` path even when the click came from a
   // search-all view or person-credits strip while the user was on
@@ -4831,6 +5218,7 @@ async function openSeries(s) {
   el.seriesPlot.textContent = s.plot || "";
   el.seriesSeasonSelect.innerHTML = "";
   el.seriesEpisodes.innerHTML = `<div class="empty">Loading episodes…</div>`;
+  state.openEpisodesExtras = fetchEpisodesExtras("series", s.id);
   refreshSeriesMyListBtn();
   refreshSeriesThumbBtns();
   refreshSeriesDiskBtn();
@@ -4916,6 +5304,7 @@ async function openSeries(s) {
 // unmodified.
 async function openDiskSeriesGroup(s) {
   saveScroll();
+  stopAllPreviews();
   if (state.mode !== "disk") {
     state.mode = "disk";
     for (const b of el.modeButtons) b.classList.toggle("active", b.dataset.mode === "disk");
@@ -4940,6 +5329,7 @@ async function openDiskSeriesGroup(s) {
   el.seriesPlot.textContent = s.plot || "";
   el.seriesSeasonSelect.innerHTML = "";
   el.seriesEpisodes.innerHTML = `<div class="empty">Loading episodes…</div>`;
+  state.openEpisodesExtras = fetchEpisodesExtras("disk", s.id);
   updateUrl({ push: true });
   applyTmdbToDetail("disk", s);
   // No renderSimilarRails("disk", s) here — it early-returns for any
@@ -5019,12 +5409,17 @@ function closeDiskSeries() {
   el.seriesEpisodes.innerHTML = "";
   state.openDiskSeries = null;
   state.openDiskSeriesData = null;
+  state.openEpisodesExtras = null;
   updateUrl();
+  resumeHeroPreview();
 }
 
-function playDiskEpisode(seriesItem, ep, sn) {
+function playDiskEpisode(seriesItem, ep, sn, seriesData) {
   const title = ep.title || `Episode ${ep.episode_num}`;
   const ext = ep.container_extension || "mp4";
+  // Series context for next-episode autoplay / credits countdown (captured
+  // before closeDiskSeries() wipes state.openDiskSeriesData).
+  const data = seriesData || state.openDiskSeriesData;
   // state.lastEpisode is keyed by seriesId with no mode namespace — safe
   // to reuse for a disk series-group id since it lives in a completely
   // different id space (SHA1-derived) than real panel series ids. Drives
@@ -5032,7 +5427,8 @@ function playDiskEpisode(seriesItem, ep, sn) {
   rememberEpisode(seriesItem.id, ep, sn, seriesItem.name);
   closeDiskSeries();
   play("disk",
-       { id: ep.id, name: title, container: ext },
+       { id: ep.id, name: title, container: ext, _series: seriesItem, _data: data, _season: sn,
+         _durationSecs: episodeDurationSecs(ep) },
        `${seriesItem.name} · S${sn}E${ep.episode_num}`);
   pushRecent("disk", seriesItem.id);
 }
@@ -5163,6 +5559,18 @@ function renderTmdbExtras(mode, item, d) {
       selectCategory(item.category_id);
     };
   } else { catRow.hidden = true; catRow.innerHTML = ""; }
+
+  // "Part of <collection>" (#4) — movie detail only, when the collection
+  // has 2+ titles (server sets collection.url then).
+  const partOf = el.seriesPartOf;
+  if (partOf) {
+    const col = mode === "movie" && d && d.collection;
+    if (col && col.url && col.id != null) {
+      partOf.innerHTML = `<b>Part of</b><a href="#">${escapeHtml(col.name || "Collection")}</a>`;
+      partOf.querySelector("a").onclick = (e) => { e.preventDefault(); openCollectionView(col.id, col.name); };
+      partOf.hidden = false;
+    } else { partOf.hidden = true; partOf.innerHTML = ""; }
+  }
 
   // Genres — display as a comma-separated row. Already shown in the
   // meta line, but here gets the bold-uppercase label treatment.
@@ -5605,8 +6013,12 @@ function playEpisode(seriesItem, ep, sn, seriesData) {
 // season; returns null when it's the last episode of the last season or
 // the series data isn't available. Sourced from the cached series-info
 // tree stashed on the playing item by playEpisode (no re-fetch).
+// A series episode, or a Disk-library series-group episode (carries _series).
+function isEpisodePlay(p) {
+  return !!p && (p.mode === "series" || (p.mode === "disk" && !!(p.item && p.item._series)));
+}
 function computeNextEpisode(playing) {
-  if (!playing || playing.mode !== "series") return null;
+  if (!isEpisodePlay(playing)) return null;
   const item = playing.item;
   const seriesItem = item._series;
   const data = item._data;
@@ -5639,7 +6051,7 @@ function computeNextEpisode(playing) {
 // new state.playing. No-op (and hides the card) for movies / live.
 function refreshNextEpisode() {
   hideUpNext();
-  if (!state.playing || state.playing.mode !== "series") {
+  if (!isEpisodePlay(state.playing)) {
     if (state.playing) state.playing.nextEpisode = null;
     return;
   }
@@ -5660,13 +6072,18 @@ function playNextEpisode() {
   if (!next || !next._pick) return;
   const { seriesItem, ep, sn, data } = next._pick;
   hideUpNext();
-  playEpisode(seriesItem, ep, sn, data);
+  if (state.playing.mode === "disk") playDiskEpisode(seriesItem, ep, sn, data);
+  else playEpisode(seriesItem, ep, sn, data);
 }
 
 const UPNEXT_LEAD_SECS = 20; // show the card in the last N seconds
-function showUpNext() {
+function showUpNext(creditsLeft) {
   const next = state.playing && state.playing.nextEpisode;
   if (!next) return;
+  const credits = Number.isFinite(creditsLeft);
+  if (el.playerUpnextLabel) el.playerUpnextLabel.textContent = credits ? `Next episode in ${creditsLeft}s` : "Up Next";
+  if (el.playerUpnextCredits) el.playerUpnextCredits.hidden = !credits;
+  el.playerUpnext.classList.toggle("credits", credits);
   el.playerUpnextTitle.textContent = next.label;
   el.playerUpnext.hidden = false;
 }
@@ -5746,6 +6163,15 @@ function renderSeriesEpisodes(seriesItem, info, sn, onPlay = playEpisode) {
   }
   el.seriesEpisodes.appendChild(frag);
 
+  // /api/episodes (#6): server still + this profile's per-episode
+  // progress / watched. Fetched once per detail open (openSeries /
+  // openDiskSeriesGroup), applied to whichever season is rendered.
+  const extrasP = state.openEpisodesExtras;
+  if (extrasP) extrasP.then((map) => {
+    if (!map || state.openEpisodesExtras !== extrasP) return;
+    applyEpisodeExtras(map);
+  });
+
   // Upgrade thumbnails to TMDB stills when available. Single fetch
   // per (series, season); cached server-side and in-memory after first
   // call, so re-opening the same season is instant. Skipped for disk —
@@ -5767,13 +6193,63 @@ function renderSeriesEpisodes(seriesItem, info, sn, onPlay = playEpisode) {
   });
 }
 
+async function fetchEpisodesExtras(mode, id) {
+  try {
+    const r = await fetch(`/api/episodes/${mode}/${encodeURIComponent(id)}`, { cache: "no-store" });
+    if (!r.ok) return null;
+    const d = await r.json();
+    const map = new Map();
+    for (const season of d?.seasons || []) {
+      for (const ep of season?.episodes || []) if (ep && ep.id != null) map.set(String(ep.id), ep);
+    }
+    return map;
+  } catch { return null; }
+}
+function applyEpisodeExtras(map) {
+  for (const node of el.seriesEpisodes.querySelectorAll(".episode[data-ep-id]")) {
+    const ep = map.get(node.dataset.epId);
+    if (!ep) continue;
+    const thumbEl = node.querySelector(".ep-thumb");
+    if (thumbEl && typeof ep.still === "string" && /^https:/i.test(ep.still)) {
+      const url = ep.still;
+      const img = new Image();
+      img.referrerPolicy = "no-referrer";
+      img.onload = () => { thumbEl.style.backgroundImage = `url("${url}")`; };
+      img.src = url;
+    }
+    if (ep.watched) node.classList.add("watched");
+    const pr = ep.progress;
+    const pct = pr && Number.isFinite(pr.pct) ? Math.min(99, Math.max(2, Math.round(pr.pct))) : null;
+    if (pct != null && thumbEl) {
+      let bar = thumbEl.querySelector(".ep-progress");
+      if (!bar) {
+        bar = document.createElement("div");
+        bar.className = "ep-progress";
+        bar.appendChild(document.createElement("span"));
+        thumbEl.appendChild(bar);
+      }
+      bar.firstElementChild.style.width = `${pct}%`;
+      const body = node.querySelector(".ep-body");
+      let resume = node.querySelector(".ep-resume");
+      if (!resume && body) {
+        resume = document.createElement("div");
+        resume.className = "ep-resume";
+        body.appendChild(resume);
+      }
+      if (resume) resume.textContent = `Resume at ${pct}%`;
+    }
+  }
+}
+
 function closeSeries() {
   el.seriesPanel.hidden = true;
   el.seriesPanel.removeAttribute("data-mode");
   el.seriesEpisodes.innerHTML = "";
   state.openSeries = null;
   state.openSeriesData = null;
+  state.openEpisodesExtras = null;
   updateUrl();
+  resumeHeroPreview();
 }
 
 // Generic detail-panel close — used by the X button and Escape so the
@@ -6271,7 +6747,7 @@ function renderRefineBody() {
       poster.appendChild(img);
     } else {
       poster.classList.add("refine-poster-blank");
-      poster.textContent = initials(it.name);
+      poster.appendChild(titleCardEl(it.name));
     }
     const name = document.createElement("div");
     name.className = "refine-name";
@@ -6653,10 +7129,26 @@ function updateScrubBar() {
   }
   const realBufEnd = anchor + bufEnd;
   elScrubBuffered.style.width = Math.min(100, (realBufEnd / denom) * 100) + "%";
-  // Up-Next card: surface in the last ~20s of a series episode that has a
-  // next episode. denom is the authoritative full duration (handles the
+  // Skip intro / recap button + credits countdown (#2), from /api/markers.
+  const p = state.playing;
+  const act = p && p.markers ? KNf.skipAction(p.markers, realPos, denom, !!p.nextEpisode) : null;
+  refreshSkipButton(act);
+  if (act && act.kind === "credits" && !p.creditsDismissed) {
+    // Counts only while actually playing; the card replaces Up Next.
+    const now = performance.now();
+    if (!el.video.paused && p._creditsTick) p.creditsPlayedMs = (p.creditsPlayedMs || 0) + Math.min(1000, now - p._creditsTick);
+    p._creditsTick = el.video.paused ? 0 : now;
+    const left = KNf.countdownLeft(p.creditsPlayedMs || 0);
+    if (left <= 0) { autoAdvanceToNext(); return; }
+    showUpNext(left);
+    return;
+  }
+  if (p) p._creditsTick = 0;
+  // Up-Next card: surface in the last ~20s of an episode that has a next
+  // episode (when no credits marker is known, or the viewer chose to watch
+  // the credits). denom is the authoritative full duration (handles the
   // transcode-playlist-vs-source-length case). Hidden otherwise.
-  if (state.playing && state.playing.mode === "series" && state.playing.nextEpisode
+  if (isEpisodePlay(p) && p.nextEpisode
       && denom > 0 && realPos >= denom - UPNEXT_LEAD_SECS && realPos < denom) {
     showUpNext();
   } else if (el.playerUpnext && !el.playerUpnext.hidden) {
@@ -6753,21 +7245,184 @@ async function reanchorTo(targetSecs) {
 elScrubTrack.addEventListener("click", (e) => seekToPct(pctFromEvent(e)));
 
 // Drag: move thumb visually; seek only on release
+let _scrubDragging = false;
 elScrubTrack.addEventListener("pointerdown", (e) => {
   e.currentTarget.setPointerCapture(e.pointerId);
+  _scrubDragging = true;
   let lastPct = pctFromEvent(e);
   setScrubVisual(lastPct);
+  showTrickplayAt(lastPct);
   const onMove = (ev) => {
     lastPct = pctFromEvent(ev);
     setScrubVisual(lastPct);
   };
-  const onUp = () => {
+  const onUp = (ev) => {
+    _scrubDragging = false;
     seekToPct(lastPct);
     elScrubTrack.removeEventListener("pointermove", onMove);
+    if (ev.pointerType !== "mouse") hideTrickplay();
   };
   elScrubTrack.addEventListener("pointermove", onMove);
   elScrubTrack.addEventListener("pointerup", onUp, { once: true });
+  elScrubTrack.addEventListener("pointercancel", () => { _scrubDragging = false; hideTrickplay(); }, { once: true });
 });
+// Scrub-thumbnail preview (#1): follows the pointer over the bar (mouse
+// hover or a drag); hidden when there are no frames near that time.
+elScrubTrack.addEventListener("pointermove", (e) => showTrickplayAt(pctFromEvent(e)));
+elScrubTrack.addEventListener("pointerleave", () => { if (!_scrubDragging) hideTrickplay(); });
+
+// Source-time duration the scrubber speaks in (full VOD length while
+// transcoding, else the element's own duration). 0 = unknown.
+function scrubDurationSecs() {
+  const pd = el.video.duration;
+  const full = (state.playing && state.playing.fullDurationSecs) || 0;
+  if (state.playing && state.playing.transcode && full > 0) return full;
+  return pd && isFinite(pd) ? pd : 0;
+}
+function seekToSecs(secs) {
+  const d = scrubDurationSecs();
+  if (d > 0 && Number.isFinite(secs)) seekToPct(Math.max(0, Math.min(1, secs / d)));
+}
+
+// ── Trick-play thumbnails (#1) ───────────────────────────────────────
+// GET /api/trickplay/:mode/:id → {frames, interval, width, height, url}.
+// Coverage is partial (only transcoded / Disk-library titles), so "none"
+// is the common case and the bar stays plain. While a transcode can still
+// grow the list it is re-read every 30 s.
+async function loadTrickplay(p) {
+  if (!p || !KNf.trickplaySupported(p.mode)) return;
+  try {
+    const r = await fetch(`/api/trickplay/${p.mode}/${encodeURIComponent(p.item.id)}`);
+    if (!r.ok || state.playing !== p) return;
+    const info = await r.json();
+    if (state.playing !== p) return;
+    p.trickplay = info && Array.isArray(info.frames) && info.frames.length ? info : null;
+    if (!p._trickplayTimer && p.transcode && !(info && info.complete)) {
+      p._trickplayTimer = setInterval(() => {
+        if (state.playing !== p) { clearInterval(p._trickplayTimer); return; }
+        loadTrickplay(p);
+      }, KNf.TRICKPLAY_REFRESH_MS);
+    }
+  } catch {}
+}
+function hideTrickplay() {
+  if (el.playerTrickplay) el.playerTrickplay.hidden = true;
+}
+function showTrickplayAt(pct) {
+  const box = el.playerTrickplay;
+  const p = state.playing;
+  const info = p && p.trickplay;
+  if (!box || !info || p.mode === "live") { hideTrickplay(); return; }
+  const dur = scrubDurationSecs();
+  if (!(dur > 0)) { hideTrickplay(); return; }
+  const secs = pct * dur;
+  const t = KNf.frameFor(info.frames, secs, info.interval);
+  const url = t == null ? null : KNf.frameUrl(info, t);
+  if (!url) { hideTrickplay(); return; }
+  const img = box.firstElementChild;
+  const w = Math.min(Number(info.width) || 240, window.innerWidth < 600 ? 160 : 240);
+  const h = info.width && info.height ? Math.round(w * info.height / info.width) : Math.round(w * 9 / 16);
+  img.style.width = `${w}px`;
+  img.style.height = `${h}px`;
+  if (img.dataset.src !== url) {
+    img.dataset.src = url;
+    img.onerror = () => { if (img.dataset.src === url) hideTrickplay(); };
+    img.src = url;
+  }
+  box.lastElementChild.textContent = formatPos(secs);
+  const wrap = box.parentElement.getBoundingClientRect();
+  const bar = elScrubTrack.getBoundingClientRect();
+  box.style.left = `${KNf.previewLeft(pct, bar.left - wrap.left, bar.width, w + 4, wrap.width)}px`;
+  box.hidden = false;
+}
+
+// ── Skip intro / credits markers (#2) ────────────────────────────────
+// GET /api/markers/:mode/:id (series / disk episodes; movies are always
+// null). null fields = no button. All-null with an unanalysed head is
+// re-read once after 2 min of playback.
+async function loadMarkers(p, isRetry) {
+  if (!p || !KNf.markersSupported(p.mode)) return;
+  try {
+    const r = await fetch(`/api/markers/${p.mode}/${encodeURIComponent(p.item.id)}`);
+    if (!r.ok || state.playing !== p) return;
+    const m = await r.json();
+    if (state.playing !== p) return;
+    p.markers = m;
+    if (!isRetry && KNf.markersWorthRefetch(m)) {
+      p._markersTimer = setTimeout(() => { if (state.playing === p) loadMarkers(p, true); }, KNf.MARKERS_REFETCH_AFTER_MS);
+    }
+  } catch {}
+}
+function refreshSkipButton(act) {
+  const b = el.playerSkip;
+  if (!b) return;
+  if (act && (act.kind === "intro" || act.kind === "recap")) {
+    b.textContent = act.label;
+    b.dataset.target = String(act.target);
+    b.hidden = false;
+  } else if (!b.hidden) {
+    b.hidden = true;
+  }
+}
+if (el.playerSkip) el.playerSkip.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const t = Number(el.playerSkip.dataset.target);
+  el.playerSkip.hidden = true;
+  if (Number.isFinite(t)) seekToSecs(t);
+});
+if (el.playerUpnextCredits) el.playerUpnextCredits.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (state.playing) state.playing.creditsDismissed = true;
+  hideUpNext();
+});
+// End of an episode / end of the credits countdown: play the next one
+// as an AUTO advance (counts toward "Still watching?").
+function autoAdvanceToNext() {
+  const p = state.playing;
+  if (!isEpisodePlay(p) || !p.nextEpisode || p._advancing) return;
+  p._advancing = true;
+  _stillWatching.noteAutoAdvance();
+  playNextEpisode();
+}
+
+// ── "Still watching?" (#8) ───────────────────────────────────────────
+// After 3 consecutive auto-played episodes with no input, the next one
+// opens paused behind a prompt and its stream is not resolved until the
+// viewer answers. Any key / click / wheel in the player counts as input.
+const _stillWatching = KNf.createStillWatching(3);
+let _stillResolve = null;
+function askStillWatching(label) {
+  return new Promise((resolve) => {
+    el.playerStillSub.textContent = label ? `Next: ${label}` : "";
+    el.playerStill.hidden = false;
+    keepControlsVisible();
+    _stillResolve = (ok) => {
+      _stillResolve = null;
+      el.playerStill.hidden = true;
+      resolve(ok);
+    };
+    el.playerStillContinue.focus({ preventScroll: true });
+  });
+}
+function answerStillWatching(ok) {
+  if (_stillResolve) _stillResolve(ok);
+}
+el.playerStillContinue.addEventListener("click", (e) => { e.stopPropagation(); answerStillWatching(true); });
+el.playerStillBack.addEventListener("click", (e) => { e.stopPropagation(); answerStillWatching(false); });
+// Capture phase so the prompt sees keys before the global shortcuts.
+document.addEventListener("keydown", (e) => {
+  if (_stillResolve) {
+    if (e.key === "Tab") return; // keep keyboard focus moves between the two buttons
+    if ((e.key === "Enter" || e.key === " ") && document.activeElement === el.playerStillBack) return; // let the button's own click run
+    e.preventDefault();
+    e.stopPropagation();
+    answerStillWatching(e.key !== "Escape");
+    return;
+  }
+  if (state.playing && !el.player.hidden) _stillWatching.onUserInteraction();
+}, true);
+el.player.addEventListener("pointerdown", () => _stillWatching.onUserInteraction(), true);
+el.player.addEventListener("wheel", () => _stillWatching.onUserInteraction(), { capture: true, passive: true });
 
 // Live badge vs scrub bar visibility
 function refreshScrubState() {
@@ -7500,9 +8155,7 @@ el.video.addEventListener("ended", () => {
   // Series autoplay: when an episode finishes and there's a next one,
   // advance to it automatically (mirrors the Android TV behavior).
   // Movies / live fall through and just keep the saved progress.
-  if (state.playing && state.playing.mode === "series" && state.playing.nextEpisode) {
-    playNextEpisode();
-  }
+  if (isEpisodePlay(state.playing) && state.playing.nextEpisode) autoAdvanceToNext();
 });
 // Up-Next "Play now" → skip immediately to the next episode.
 if (el.playerUpnextPlay) el.playerUpnextPlay.addEventListener("click", playNextEpisode);

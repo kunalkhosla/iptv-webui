@@ -6122,7 +6122,7 @@ app.get("/branding.local.js", (_req, res) => {
 // negotiation involved.
 const SPA_ASSET_VERSION = process.env.GIT_SHA || "dev";
 const SPA_HTML = fs.readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
-  .replace(/(href|src)="\/(style\.css|app\.js|theatre-portraits\.js)"/g,
+  .replace(/(href|src)="\/(style\.css|app\.js|nf-helpers\.js|theatre-portraits\.js)"/g,
     (_m, attr, file) => `${attr}="/${file}?v=${SPA_ASSET_VERSION}"`);
 function sendSpaShell(res) {
   res.type("html").setHeader("Cache-Control", "no-cache, must-revalidate").send(SPA_HTML);
