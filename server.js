@@ -2120,7 +2120,7 @@ async function prewarmTmdbCache(mode, actx = currentAccount()) {
 // ──────────────────────────────────────────────────────────────────
 const zlib = require("zlib");
 const { promisify } = require("util");
-const { calibrateEpgOffsets, cleanEpgIndexOverlaps, shiftsToPersist, epgIdCountry } = require("./lib/epg-clean");
+const { fixPanelPrograms, calibrateEpgOffsets, cleanEpgIndexOverlaps, shiftsToPersist, epgIdCountry } = require("./lib/epg-clean");
 const epgIndex = new Map(); // epg_channel_id → sorted [{ start, stop, title, desc }]
 let epgIndexBuiltAt = 0;
 const epgIndexFile = path.join(DATA_DIR, "epg-xmltv.json");
@@ -9571,15 +9571,19 @@ app.get("/api/epg/short/:streamId", async (req, res, next) => {
       try { return Buffer.from(String(s), "base64").toString("utf8"); }
       catch { return String(s); }
     };
-    const out = list
+    const rows = list
       .map(p => ({
-        title:       decode(p.title),
-        description: decode(p.description),
-        start_ts:    Number(p.start_timestamp) || (p.start ? Math.floor(new Date(p.start).getTime() / 1000) : null),
-        stop_ts:     Number(p.stop_timestamp)  || (p.end   ? Math.floor(new Date(p.end).getTime()   / 1000) : null),
+        title: decode(p.title),
+        desc:  decode(p.description),
+        start: (Number(p.start_timestamp) || (p.start ? Math.floor(new Date(p.start).getTime() / 1000) : 0)) * 1000,
+        stop:  (Number(p.stop_timestamp)  || (p.end   ? Math.floor(new Date(p.end).getTime()   / 1000) : 0)) * 1000,
       }))
-      .filter(p => p.start_ts && p.stop_ts && p.stop_ts > fromSec && p.start_ts < toSec)
-      .sort((a, b) => a.start_ts - b.start_ts);
+      .filter(p => p.start && p.stop);
+    // Same shift + overlap cleanup the bulk index gets (lib/epg-clean.js).
+    const out = fixPanelPrograms(rows, chId, epgStatus.calibration?.groups)
+      .filter(p => p.stop > fromSec * 1000 && p.start < toSec * 1000)
+      .sort((a, b) => a.start - b.start)
+      .map(p => ({ title: p.title, description: p.desc, start_ts: Math.floor(p.start / 1000), stop_ts: Math.floor(p.stop / 1000) }));
     res.json({ stream_id: streamId, programs: out, source: "panel" });
   } catch (e) { next(e); }
 });

@@ -259,3 +259,16 @@ test("deletion rule needs enough dropped programmes", () => {
   cleanEpgIndexOverlaps(m, T0);
   assert.equal(m.get("c").length, 6);
 });
+
+test("fixPanelPrograms: panel fallback gets the measured provider/in shift, then overlap cleanup", () => {
+  const { fixPanelPrograms } = require("../lib/epg-clean");
+  // MN+ shape: IST labelled as UTC (Southpaw really airs 5.5h earlier), merged-schedule slot dropped.
+  const rows = [P(0, 120, "Southpaw"), P(2, 120, "Woman in Gold"), P(4, 60, "Movie"), P(4, 60, "Ali")];
+  const groups = { "provider/in": { shiftMin: -330 } };
+  const out = fixPanelPrograms(rows, "mnplushd.in", groups);
+  assert.deepEqual(out.map((p) => p.title), ["Southpaw", "Woman in Gold"]);
+  assert.equal(out[0].start, T0 - 330 * M);
+  // No measured shift for the group (or a different country): times untouched.
+  assert.equal(fixPanelPrograms(rows, "bbc.uk", groups)[0].start, T0);
+  assert.equal(fixPanelPrograms(rows, "mnplushd.in", undefined)[0].start, T0);
+});
