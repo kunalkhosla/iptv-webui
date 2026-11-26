@@ -6723,7 +6723,7 @@ function renderSeriesEpisodes(seriesItem, info, sn, onPlay = playEpisode) {
   if (extrasP) extrasP.then((map) => {
     if (!map || state.openEpisodesExtras !== extrasP) return;
     applyEpisodeExtras(map);
-    if (el.seriesSeasonSelect.value === String(sn) || !el.seriesSeasonSelect.value) setSeasonOverview(map.seasonInfo?.get(String(sn))?.overview || "");
+    if (el.seriesSeasonSelect.value === String(sn) || !el.seriesSeasonSelect.value) setSeasonOverview(map.seasonInfo?.get(String(Number(sn)))?.overview || "");
   });
 
   // Upgrade thumbnails to TMDB stills when available. Single fetch
@@ -6832,7 +6832,7 @@ function applyEpisodeInfo(node, ep) {
   }
   const cr = KNf.episodeCredits(ep);
   const air = /^\d{4}-\d{2}-\d{2}$/.test(ep.air_date || "") ? ep.air_date : "";
-  const hasMore = cr.guests || cr.crew || (plotText.length > 140);
+  const hasMore = cr.guests || cr.crew || air || plotText.length > 90;
   node.querySelector(".ep-more")?.remove();
   node.querySelector(".ep-expand")?.remove();
   if (!hasMore) return;
@@ -7876,14 +7876,21 @@ async function reanchorTo(targetSecs) {
   showSpinner();
   toast("Skipping ahead — restarting transcode at the new position…", 4000);
   const p = state.playing;
+  // Overlapping re-anchors (keyboard seeks): only the newest one may land.
+  const seq = (p._reanchorSeq || 0) + 1;
+  p._reanchorSeq = seq;
+  p._reanchoring = true;
   let resolved;
   try {
     resolved = await resolveStreamUrl(p.mode, p.item.id, p.ext, targetSecs);
   } catch (e) {
+    if (p._reanchorSeq === seq) p._reanchoring = false;
     hideSpinner();
     toast("Couldn't re-anchor: " + e.message, 4000);
     return;
   }
+  if (p._reanchorSeq !== seq || state.playing !== p) return;
+  p._reanchoring = false;
   let url = resolved.transcode
     + (p.quality ? `&q=${p.quality}` : "")
     + audioTrackSuffix(p);
@@ -8806,7 +8813,8 @@ function playerKeyContext(e, inField) {
     mini: el.player.getAttribute("data-mode") === "mini",
     inField: inField || !!(ae && ae.isContentEditable),
     modifier: e.metaKey || e.ctrlKey || e.altKey,
-    menuOpen: !!(el.playerTracksMenu && !el.playerTracksMenu.hidden) || !el.liveRemote.hidden,
+    menuOpen: !!(el.playerTracksMenu && !el.playerTracksMenu.hidden) || !el.liveRemote.hidden
+      || !el.refineModal.hidden || !el.remindersModal.hidden || !el.filterModal.hidden || !el.settingsMenu.hidden,
     live: state.playing && state.playing.mode === "live",
     casting: !!state.castSession,
   };
@@ -8822,14 +8830,20 @@ function runPlayerKeyAction(act) {
     const p = state.playing;
     if (!p) return;
     const now = performance.now();
+    const pd = el.video.duration;
+    // A transcode whose full length isn't known yet: seek inside what is
+    // encoded (absolute times can't be clamped against the playlist length).
+    if (p.transcode && !(p.fullDurationSecs > 0)) {
+      if (Number.isFinite(pd) && pd > 0) el.video.currentTime = Math.max(0, Math.min(pd - 1, el.video.currentTime + act.delta));
+      return;
+    }
     const pos = ((p.transcodeAnchorSecs) || 0) + el.video.currentTime;
-    const pending = _keySeek && now - _keySeek.at < 1200 ? _keySeek.target : NaN;
+    const pending = _keySeek && _keySeek.p === p && now - _keySeek.at < 1200 ? _keySeek.target : NaN;
     const target = KNf.keySeekTarget(pos, act.delta, scrubDurationSecs(), pending);
     if (_keySeek && _keySeek.timer) clearTimeout(_keySeek.timer);
-    _keySeek = { target, at: now, timer: null };
+    _keySeek = { target, at: now, timer: null, p };
     const inPlaylist = target - ((p.transcodeAnchorSecs) || 0);
-    const pd = el.video.duration;
-    if (!p.transcode || (inPlaylist >= 0 && Number.isFinite(pd) && inPlaylist < pd)) {
+    if (!p._reanchoring && (!p.transcode || (inPlaylist >= 0 && Number.isFinite(pd) && inPlaylist < pd))) {
       seekToSecs(target);
     } else {
       setScrubVisual(scrubDurationSecs() > 0 ? target / scrubDurationSecs() : 0);
@@ -8883,7 +8897,6 @@ document.addEventListener("keydown", (e) => {
   const keyAct = KNf.playerKeyAction(e.key, playerKeyContext(e, inField));
   if (keyAct) {
     e.preventDefault();
-    e.stopPropagation();
     runPlayerKeyAction(keyAct);
     return;
   }
