@@ -96,6 +96,12 @@ test("trickplay store: put/list/filePath/complete/evict", async () => {
     r = await st.evict();
     assert.equal(r.removed, 0);
     assert.deepEqual(st.list("disk", "7").times, [0, 10]);
+    // Complete titles have their own budget; evicted ones leave a tombstone.
+    const st3 = createTrickplayStore({ dir, maxBytes: 300, maxCompleteBytes: 300 });
+    r = await st3.evict();
+    assert.equal(r.removed, 1);
+    assert.deepEqual(st3.list("disk", "7").times, []);
+    assert.equal(st3.list("disk", "7").evicted, true);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

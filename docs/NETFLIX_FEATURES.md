@@ -52,8 +52,10 @@ movie stream id, series **episode** id, or disk file id)
 `GET /api/trickplay/:mode/:id/:t.jpg` -> `image/jpeg`
 (`Cache-Control: private, max-age=604800, immutable`), or `404 {"error":"no_frame"}`.
 
-Storage: `DATA_DIR/trickplay/<mode>-<id>/<t>.jpg`, LRU-evicted by title above
-`TRICKPLAY_CACHE_MAX_MB` (default 2048).
+Storage: `DATA_DIR/trickplay/<mode>-<id>/<t>.jpg`, LRU-evicted by title:
+partial (piggyback) titles above `TRICKPLAY_CACHE_MAX_MB` (default 2048),
+complete Disk-library titles above `TRICKPLAY_DISK_MAX_MB` (default 8192; an
+evicted one is not regenerated).
 
 ## 2. Skip intro / credits markers
 
@@ -188,6 +190,10 @@ a later load. With `poster: null`, clients draw a generated title card.
 ## Ops
 
 - `GET /api/admin/sidecar` (owner): queue/tracking stats + marker counts.
-- `MEDIA_SIDECAR=0` turns the sidecar off. `TRICKPLAY_CACHE_MAX_MB`.
+- `MEDIA_SIDECAR=0` turns the sidecar off. `TRICKPLAY_CACHE_MAX_MB`, `TRICKPLAY_DISK_MAX_MB`.
+- Offline jobs yield to any viewer: panel streams, transcodes, and open
+  `/api/diskfile` direct-play responses (plus 2 min after the last one).
+- Fingerprints are kept for at most 3000 episodes (oldest dropped; their
+  markers stay).
   `MEDIA_SIDECAR_DISK_DELAY_MS` (first Disk-library pass after boot, default 10 min).
 - Logs: `[sidecar] ...`.

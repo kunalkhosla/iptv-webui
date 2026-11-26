@@ -4705,11 +4705,18 @@ const DISK_MIME = {
 // Direct-play a local file with HTTP Range support → native instant seeking
 // in the browser/Chromecast. Account-bound signature; absPath comes from the
 // account's disk.meta, never the query (no path traversal).
-let diskfileLastSeen = 0; // direct-play Disk viewers (not in `streams`); the media sidecar yields to them
+// Direct-play Disk viewers (not in `streams`); the media sidecar yields to
+// them: open responses (one open-ended Range can stream a whole movie) plus
+// a 2 min tail after the last one.
+let diskfileLastSeen = 0;
+let diskfileActive = 0;
 app.get("/api/diskfile", (req, res) => {
   const r = resolveDiskRequest("file", req, true);
   if (!r) return res.status(403).end();
   diskfileLastSeen = Date.now();
+  diskfileActive++;
+  let counted = true;
+  res.on("close", () => { if (counted) { counted = false; diskfileActive--; diskfileLastSeen = Date.now(); } });
   let stat; try { stat = fs.statSync(r.meta.absPath); } catch { return res.status(404).end(); }
   const total = stat.size;
   const ext = path.extname(r.meta.absPath).slice(1).toLowerCase();
@@ -10166,9 +10173,11 @@ async function tmdbSeasonsEpisodes(tmdbId, seasonNums, timeoutMs = 6000) {
   const out = new Map();
   if (!TMDB_API_KEY || !tmdbId) return out;
   const nums = [...new Set(seasonNums.filter(Number.isFinite))].slice(0, 60);
+  let timer;
   const done = Promise.all(nums.map(async (n) => { out.set(n, await tmdbSeasonEpisodes(tmdbId, n)); }));
-  await Promise.race([done, new Promise((r) => setTimeout(r, timeoutMs))]);
-  return out;
+  await Promise.race([done, new Promise((r) => { timer = setTimeout(r, timeoutMs); })]);
+  clearTimeout(timer);
+  return new Map(out); // snapshot: late seasons don't land after the deadline
 }
 async function tmdbSeasonEpisodes(tmdbId, seasonNum) {
   if (!TMDB_API_KEY || !tmdbId || !Number.isFinite(seasonNum)) return new Map();
@@ -14251,6 +14260,7 @@ const TRICKPLAY_INTERVAL_SEC = 10;
 const trickplayStore = createTrickplayStore({
   dir: path.join(DATA_DIR, "trickplay"),
   maxBytes: (() => { const m = parseFloat(process.env.TRICKPLAY_CACHE_MAX_MB || ""); return (Number.isFinite(m) && m > 0 ? m : 2048) * 1024 ** 2; })(),
+  maxCompleteBytes: (() => { const m = parseFloat(process.env.TRICKPLAY_DISK_MAX_MB || ""); return (Number.isFinite(m) && m > 0 ? m : 8192) * 1024 ** 2; })(),
 });
 const markerStore = createMarkerStore({ dir: path.join(DATA_DIR, "markers"), log: (m) => console.log(m) });
 
@@ -14302,7 +14312,7 @@ function sidecarViewerActive() {
   const now = Date.now();
   for (const v of streams.values()) if (!v.displaced && now - v.lastSeen < 60_000) return true;
   for (const t of transcoders.values()) if (now - t.lastAccess < 60_000) return true;
-  return now - diskfileLastSeen < 120_000;
+  return diskfileActive > 0 || now - diskfileLastSeen < 120_000;
 }
 
 const mediaSidecar = createMediaSidecar({
@@ -14344,7 +14354,8 @@ if (process.env.MEDIA_SIDECAR !== "0") {
       }
       for (const [id, m] of ix.meta) {
         if (!m || m.isSeriesGroup || !m.absPath) continue;
-        if (!trickplayStore.list("disk", id).complete) {
+        const tl = trickplayStore.list("disk", id);
+        if (!tl.complete && !tl.evicted) {
           if (mediaSidecar.enqueueOffline({ kind: "offline-thumbs", key: `th:disk:${id}`, mode: "disk", id: String(id), file: m.absPath })) n++;
         }
       }
