@@ -3511,5 +3511,10 @@ body.filter-open #scrim { opacity: 1; pointer-events: auto; }
   .collection-grid { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 14px 10px; }
   #player[data-mode="theater"] #player-skip,
   #player[data-mode="theater"] #player-upnext { bottom: 116px; right: 10px; }
+  #player-upnext { flex-wrap: wrap; row-gap: 6px; max-width: calc(100% - 20px); }
+  #player-upnext .upnext-label { flex-basis: 100%; }
+  #player-upnext .upnext-title { flex: 1 1 100%; }
+  #player-upnext #player-upnext-credits { margin-left: auto; }
+  #player-upnext:not(.credits) #player-upnext-play { margin-left: auto; }
   #player-still h2 { font-size: 32px; }
 }
