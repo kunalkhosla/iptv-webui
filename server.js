@@ -6127,7 +6127,7 @@ app.get("/branding.local.js", (_req, res) => {
 // negotiation involved.
 const SPA_ASSET_VERSION = process.env.GIT_SHA || "dev";
 const SPA_HTML = fs.readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
-  .replace(/(href|src)="\/(style\.css|app\.js|nf-helpers\.js|rescue-logic\.js|theatre-portraits\.js)"/g,
+  .replace(/(href|src)="\/(style\.css|app\.js|nf-helpers\.js|rescue-logic\.js|pause-keepalive\.js|theatre-portraits\.js)"/g,
     (_m, attr, file) => `${attr}="/${file}?v=${SPA_ASSET_VERSION}"`);
 function sendSpaShell(res) {
   res.type("html").setHeader("Cache-Control", "no-cache, must-revalidate").send(SPA_HTML);
@@ -13501,6 +13501,9 @@ const hwDecodeFailed = new Set();
 // When a VOD run using VAAPI dies with no output, retry it once in software.
 const { vodSoftwareFallbackEligible, transcodeSourceUnavailable } = require("./lib/transcode-fallback");
 const { noteOwner, handleStopRequest } = require("./lib/transcode-stop");
+const { vodReachedEnd, noPacketsLabel } = require("./lib/vod-end");
+const pauseKeepalive = require("./lib/pause-keepalive");
+const PAUSE_KEEPALIVE_MAX_MS = pauseKeepalive.maxMsFrom(process.env.PAUSE_KEEPALIVE_MAX_MS);
 
 // Circuit breaker: transcoderKey -> timestamp of the last give-up where the
 // source never connected (invalid/broken upstream). A fresh request for that
@@ -13721,7 +13724,7 @@ function admitStream(owner, mode, id, killer, accountKey) {
     // A later reap/displace then fired the whole pile — dozens of SIGTERMs at
     // one ffmpeg → exit 123 ("> 3 system signals") → the cast died on a brief
     // viewer blip. One killer is enough; the latest targets the current quality.
-    existing.lastSeen = Date.now();
+    existing.lastSeen = existing.mediaSeen = Date.now();
     if (killer) { existing.killers.clear(); existing.killers.add(killer); }
     return { ok: true };
   }
@@ -13754,6 +13757,9 @@ function admitStream(owner, mode, id, killer, accountKey) {
     accountKey,
     since: Date.now(),
     lastSeen: Date.now(),
+    // Last REAL media request (manifest/segment/bytes). lastSeen can also be
+    // bumped by a pause heartbeat; mediaSeen bounds how long that may last.
+    mediaSeen: Date.now(),
     killers: new Set(killer ? [killer] : []),
     displaced: false,
   });
@@ -13768,8 +13774,45 @@ function touchStream(owner) {
   const entry = streams.get(owner);
   if (!entry) return true; // no record = first request for this owner
   if (entry.displaced) return false;
-  entry.lastSeen = Date.now();
+  entry.lastSeen = entry.mediaSeen = Date.now();
   return true;
+}
+
+// Client IP exactly as ownerKeyOf derives it (for pause-heartbeat matching
+// against the Android players' cookie-less "ip:" owner keys).
+function callerIpOf(req) {
+  const xff = (req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return xff || req.socket.remoteAddress || "unknown";
+}
+
+// Pause keep-alive (lib/pause-keepalive.js). While a movie/episode/disk title
+// is PAUSED the player makes no media requests, so the idle reaper would free
+// the slot (and delete the transcode) after LIVE_IDLE_GRACE_MS. Clients POST
+// { mode, id } about once a minute while paused (up to 60 min); this only
+// refreshes the caller's EXISTING session for that title. No upstream I/O.
+app.post("/api/stream/heartbeat", express.json(), (req, res) => {
+  const r = pauseKeepalive.handleHeartbeat(req.body, {
+    streams, transcoders, callerOwner: ownerKeyOf(req), callerIp: callerIpOf(req),
+    now: Date.now(), maxMs: PAUSE_KEEPALIVE_MAX_MS,
+  });
+  if (r.status === 410) return sendDisplaced(res);
+  res.setHeader("Cache-Control", "no-store");
+  res.status(r.status).json(r.body);
+});
+
+// Exact panel duration for a VOD title from what is ALREADY cached (never a
+// panel call): get_vod_info for movies, the cached series info for episodes.
+function panelDurationSecsCached(mode, id) {
+  if (mode === "movie") {
+    for (const vid of [String(id), Number(id)]) {
+      const hit = cache.get(xtreamKey(ownerAccount, MODES.movie.info, { vod_id: vid }));
+      const d = Number(hit?.v?.info?.duration_secs);
+      if (Number.isFinite(d) && d > 0) return d;
+    }
+    return null;
+  }
+  if (mode === "series") return sidecarGroupFor("series", id)?.dur || null;
+  return null;
 }
 
 function dropStreamKiller(owner, killer) {
@@ -14328,6 +14371,8 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     }
     const tail = redactUrl(stderrBuf.split("\n").filter(Boolean).slice(-3).join(" | "));
     const now = Date.now();
+    const prevExitCode = entry.lastExitCode;
+    entry.lastExitCode = code;
     entry.restarts = (entry.restarts || []).filter((ts) => now - ts < RESTART_WINDOW_MS);
     // Self-heal: an unexpected exit (provider EOF / I/O error, CDN-host
     // rotation, or a watchdog SIGTERM of a wedged ffmpeg) respawns against a
@@ -14377,11 +14422,23 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
       };
       setTimeout(reapWhenIdle, 30_000);
     };
-    if (mode === "movie" && !connectFail) {
-      const knownRuntimeMin = tmdbCache[`${mode}:${id}`]?.runtime;
-      const knownDurationSecs = Number.isFinite(knownRuntimeMin) ? knownRuntimeMin * 60 : null;
-      if (knownDurationSecs && playlistElapsedSecs(dir) >= knownDurationSecs + 65) {
-        console.log(`[transcode ${key}] exit ${code} — reached known runtime (${knownRuntimeMin}min), transcode complete`);
+    // offsetSecs + elapsed (lib/vod-end.js): a resumed transcode's playlist
+    // starts at its -ss anchor, so elapsed alone never reached the runtime.
+    // Panel duration_secs (exact) first; TMDB runtime (movies) as fallback.
+    if ((mode === "movie" || mode === "series") && !connectFail) {
+      const knownRuntimeMin = mode === "movie" ? tmdbCache[`${mode}:${id}`]?.runtime : null;
+      const end = vodReachedEnd({
+        offsetSecs, elapsedSecs: playlistElapsedSecs(dir),
+        durationSecs: panelDurationSecsCached(mode, id), runtimeMin: knownRuntimeMin,
+      });
+      if (end.done) {
+        const via = end.by === "duration" ? "panel duration" : `known runtime (${knownRuntimeMin}min)`;
+        console.log(`[transcode ${key}] exit ${code} — reached ${via} at ${Math.round(end.position)}s, transcode complete`);
+        try {
+          const m3u8 = path.join(dir, "index.m3u8");
+          const text = fs.readFileSync(m3u8, "utf8");
+          if (!text.includes("#EXT-X-ENDLIST")) fs.appendFileSync(m3u8, "#EXT-X-ENDLIST\n");
+        } catch {}
         finishInert();
         return;
       }
@@ -14506,7 +14563,10 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     const backoff = slotHeldRetry
       ? Math.min(SLOT_RELEASE_MS + 2000 * entry.restarts.length, 12_000)
       : Math.min(1000 * entry.restarts.length, 5000);
-    const why = slotHeldRetry ? " (slot-held — waiting for the cap slot to free)" : "";
+    const why = !slotHeldRetry ? ""
+      : noPacketsLabel({ previousExitCode: prevExitCode, stderr: stderrBuf }) === "past end of file"
+        ? " (past end of file — the previous run ended cleanly)"
+        : " (slot-held — waiting for the cap slot to free)";
     console.log(`[transcode ${key}] exit ${code} — respawn #${entry.restarts.length} in ${backoff}ms (start_number=${nextStart})${why}${tail ? ": " + tail : ""}`);
     setTimeout(() => {
       if (transcoders.get(key) !== entry) return; // replaced/removed during backoff

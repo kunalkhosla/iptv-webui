@@ -168,6 +168,14 @@ minutes before start the server pushes a Home Assistant notification (when
 `HA_URL`/`HA_TOKEN` are set) and open clients show a banner. A reminder never
 opens a stream. See [docs/REMINDERS.md](docs/REMINDERS.md).
 
+## Pause keep-alive
+
+A paused movie / episode / disk title makes no media requests, so the idle
+reaper would free its session after ~3 min. While paused, clients send
+`POST /api/stream/heartbeat` `{ mode, id }` every minute (max 60 min; never for
+live) and the server refreshes the caller's existing session only. See
+[docs/PAUSE_KEEPALIVE.md](docs/PAUSE_KEEPALIVE.md).
+
 ## Native trailers (`/api/trailer/:key.mp4`)
 
 Trailers play inside the apps instead of opening YouTube. Details and the
