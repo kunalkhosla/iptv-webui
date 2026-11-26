@@ -4675,7 +4675,7 @@ function claimPanelFromDiskDownloads(label) {
 function streamingNowViewers60s() {
   const now = Date.now();
   for (const [owner, v] of streams) {
-    if (v.displaced || now - v.lastSeen >= 60_000 || v.mode === "disk") continue;
+    if (v.displaced || v.preview || now - v.lastSeen >= 60_000 || v.mode === "disk") continue;
     if (!diskDlSchedule.isBackgroundOwner(owner)) return true;
   }
   return false;
@@ -5326,7 +5326,7 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/seg_:n.ts", (req, res)
 // stopped / replaced / displaced preview answers 410 so the player gives up.
 function activePreviewFor(req, res) {
   const sid = req.params.sid;
-  if (req.query.s !== previewSig(sid)) { res.status(403).end(); return null; }
+  if (!previewSigOk(sid, req.query.s)) { res.status(403).end(); return null; }
   const p = activePreview;
   if (!p || p.sid !== sid) { res.status(410).set("Cache-Control", "no-store").json({ error: "preview_stopped" }); return null; }
   p.lastAccess = Date.now();
@@ -5594,6 +5594,9 @@ async function runDownloadJob(job) {
     // Never touch the provider while someone else holds the slot (newest-wins would evict the viewer).
     // A Save-to-Disk transfer is not "someone": a phone download (a person
     // waiting for it) takes the slot from it.
+    // A tile preview gives way: wait for its ffmpeg (and connection) to be gone.
+    const previewGone = stopPreviews("phone download");
+    if (previewGone) { await previewGone; continue; }
     const slotHeld = [...streams.entries()].some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced && !v.preview && !diskDlSchedule.isDiskDownloadOwner(k));
     if (slotHeld) { await waitForViewer(); continue; }
     if (accountKey === accountKeyOf(ownerAccount)) preemptDiskDownloadsForViewer("queue");
@@ -14193,8 +14196,9 @@ function callerIpOf(req) {
 // { mode, id } about once a minute while paused (up to 60 min); this only
 // refreshes the caller's EXISTING session for that title. No upstream I/O.
 app.post("/api/stream/heartbeat", express.json(), (req, res) => {
-  // A paused player on some device: no tile preview may hold the connection.
-  previewViewerActivity(ownerKeyOf(req), "heartbeat");
+  // A paused player on some device (a valid heartbeat): no tile preview may
+  // hold the connection.
+  if (pauseKeepalive.parseHeartbeat(req.body).ok) previewViewerActivity(ownerKeyOf(req), "heartbeat");
   const r = pauseKeepalive.handleHeartbeat(req.body, {
     streams, transcoders, callerOwner: ownerKeyOf(req), callerIp: callerIpOf(req),
     now: Date.now(), maxMs: PAUSE_KEEPALIVE_MAX_MS,
@@ -14218,9 +14222,20 @@ const PREVIEW_DIR = path.join(TRANSCODE_DIR, "previews");
 const previewSignals = new Map();     // owner -> latest play/progress/heartbeat (noteSignal)
 const previewStartRate = new Map();   // requester -> { n, t }
 let activePreview = null;             // { sid, requester, mode, id, streamId, accountKey, dir, proc, ... }
+// Bumped by every real play request: a preview request that was waiting
+// (series info, the previous preview's exit) when one arrived gives up.
+let previewPlayEpoch = 0;
+const PREVIEW_MIN_GAP_MS = 5_000;     // provider connection churn: at most one new preview per 5 s
+let previewLastStartAt = 0;
+try { fs.rmSync(PREVIEW_DIR, { recursive: true, force: true }); } catch {} // crash leftovers
 
 function previewSig(sid) {
   return crypto.createHmac("sha256", PROXY_SECRET).update(`preview:${sid}`).digest("hex").slice(0, 16);
+}
+function previewSigOk(sid, s) {
+  const want = Buffer.from(previewSig(sid));
+  const got = Buffer.from(typeof s === "string" ? s : "");
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
 }
 // Stop the current preview (if any): ffmpeg SIGKILLed at once (nothing to
 // keep, and its provider connection closes with the process), slot entry
@@ -14251,6 +14266,7 @@ function stopPreviews(reason, exceptRequester = null) {
 // stopPreviews' exit promise (null = nothing stopped).
 function previewViewerActivity(owner, kind) {
   streamPreview.noteSignal(previewSignals, owner, kind === "play-live" || kind === "play-vod" ? kind : "activity", Date.now());
+  if (kind === "play-live" || kind === "play-vod") previewPlayEpoch++;
   if (kind === "play-live" || kind === "play-vod") return stopPreviews(`play ${kind === "play-live" ? "live" : "vod"}`);
   return stopPreviews(kind, owner);
 }
@@ -14277,6 +14293,7 @@ function spawnPreviewFfmpeg(p, hw) {
     if (code !== 0 && segs === 0 && hw && !p.retried) {
       // VAAPI refused this source (10-bit H.264, AV1...): once more in software.
       p.retried = true;
+      hwDecodeFailed.add(`${p.mode}:${p.streamId}`);
       console.log(`[preview] ${p.sid} hw run failed, retrying in software: ${err.trim().split("\n").pop()?.slice(0, 160) || code}`);
       if (registerPreviewSlot(p)) spawnPreviewFfmpeg(p, false);
       else stopPreviews("busy on retry");
@@ -14286,6 +14303,18 @@ function spawnPreviewFfmpeg(p, hw) {
     p.lastAccess = Date.now();
     if (code !== 0) console.log(`[preview] ${p.sid} ffmpeg exit ${code} after ${segs} segment(s): ${err.trim().split("\n").pop()?.slice(0, 160) || ""}`);
   });
+}
+// Why a preview may not start now (null = it may): someone is watching
+// (decideAdmission), or the server itself is using the provider (a liveness /
+// codec probe, the xmltv download, a catalog rebuild's claim).
+function previewBlockedReason(requester) {
+  const adm = streamPreview.decideAdmission({
+    streams, signals: previewSignals, requester, accountKey: currentAccountKey(), now: Date.now(),
+    idleGraceMs: LIVE_IDLE_GRACE_MS, isBackgroundOwner: diskDlSchedule.isBackgroundOwner, isDiskDownloadOwner: diskDlSchedule.isDiskDownloadOwner,
+  });
+  if (!adm.ok) return adm.reason || "viewer";
+  if (anyProbeInflight() || diskDownloadPanelBusy > 0 || Date.now() - diskDownloadPanelClaimAt < DISK_DOWNLOAD_PANEL_CLAIM_MS) return "provider";
+  return null;
 }
 // The preview's entry in the admission map: counts as holding the slot (Save
 // to Disk waits for it), displaced by any real admission (its killer).
@@ -14319,10 +14348,11 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     res.set("Cache-Control", "no-store");
     if (!TILE_STREAM_PREVIEW) return res.status(503).json({ error: "disabled" });
     const actx = currentAccount();
-    if (!isOwnerAccount(actx)) return res.status(409).json({ error: "busy", reason: "account" });
+    if (!isOwnerAccount(actx)) return res.status(403).json({ error: "not_allowed" });
     const { mode, id } = req.params;
     const requester = ownerKeyOf(req);
     const now = Date.now();
+    const epoch0 = previewPlayEpoch;
     const rl = previewStartRate.get(requester);
     if (rl && now - rl.t < 60_000 && rl.n >= 20) return res.status(429).json({ error: "slow down" });
     if (!rl || now - rl.t >= 60_000) previewStartRate.set(requester, { n: 1, t: now }); else rl.n += 1;
@@ -14333,6 +14363,9 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     // (unrated = no preview), like trailers.
     const certs = kidCertsForProfile(findProfile(req.profileId));
     if (certs && !certs.has(effCert(tmdbCache[`${mode}:${id}`]))) return res.status(403).json({ error: "not_allowed" });
+    // Cheap pre-check before any panel call: someone is watching -> 409 now.
+    const pre = previewBlockedReason(requester);
+    if (pre) return res.status(409).json({ error: "busy", reason: pre });
     const userState = getProfileState(req.profileId);
     let streamId = String(id), ext = String(item.container || "mp4").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp4", durationSecs = null, seriesId = null;
     if (mode === "movie") {
@@ -14353,12 +14386,25 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     }
     const prog = userState.progress?.[`${mode}:${streamId}`];
     const startSecs = streamPreview.previewStartSecs({ progressSecs: prog?.p, durationSecs: durationSecs || prog?.d });
+    // Connection churn: at most one new preview per PREVIEW_MIN_GAP_MS (the
+    // request waits out the rest of the gap).
+    const gap = previewLastStartAt + PREVIEW_MIN_GAP_MS - Date.now();
+    if (gap > 0) await new Promise((r) => setTimeout(r, gap));
     // One at a time: this replaces any current preview (ours or another
     // device's); its provider connection must be closed before ours opens.
-    // No await between the last check and claiming activePreview below, so a
-    // concurrent request can't leave two running.
     for (let i = 0; i < 3 && activePreview; i++) { const prev = stopPreviews("replaced"); if (prev) await prev; }
+    // Yield the connection like a viewer does: a running Save-to-Disk transfer
+    // stops, and its connection must be gone before ours opens.
+    if (preemptDiskDownloadsForViewer("preview")) {
+      for (let i = 0; i < 30 && [...streams.keys()].some((k) => diskDlSchedule.isDiskDownloadOwner(k)); i++) await new Promise((r) => setTimeout(r, 100));
+    }
+    // Final checks, then claim: no await from here to spawn, so a concurrent
+    // request or a real play can't slip in between.
+    if (previewPlayEpoch !== epoch0) return res.status(409).json({ error: "busy", reason: "play" });
     if (activePreview) return res.status(409).json({ error: "busy", reason: "preview" });
+    if ([...streams.keys()].some((k) => diskDlSchedule.isDiskDownloadOwner(k))) return res.status(409).json({ error: "busy", reason: "download" });
+    const late = previewBlockedReason(requester);
+    if (late) return res.status(409).json({ error: "busy", reason: late });
     const sid = streamPreview.newSid((n) => crypto.randomBytes(n).toString("hex"));
     const p = {
       sid, requester, mode, id: String(id), streamId, accountKey: currentAccountKey(),
@@ -14370,9 +14416,8 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
       const adm = streamPreview.decideAdmission({ streams, signals: previewSignals, requester, accountKey: p.accountKey, now, idleGraceMs: LIVE_IDLE_GRACE_MS, isBackgroundOwner: diskDlSchedule.isBackgroundOwner, isDiskDownloadOwner: diskDlSchedule.isDiskDownloadOwner });
       return res.status(409).json({ error: "busy", reason: adm.reason || "viewer" });
     }
-    // Yield the connection like a viewer does: a running Save-to-Disk transfer stops now.
-    preemptDiskDownloadsForViewer("preview");
     activePreview = p;
+    previewLastStartAt = Date.now();
     spawnPreviewFfmpeg(p, HW_ENCODE && !hwDecodeFailed.has(`${mode}:${streamId}`));
     console.log(`[preview] ${sid} start ${mode}:${streamId}${seriesId ? ` (series ${seriesId})` : ""} at ${startSecs}s`);
     res.json({
@@ -14387,7 +14432,7 @@ app.post("/api/preview/stop", express.json({ limit: "1kb" }), (req, res) => {
   res.set("Cache-Control", "no-store");
   const sid = req.body?.sid;
   if (!streamPreview.isValidSid(sid)) return res.status(400).json({ error: "bad sid" });
-  const stopped = activePreview?.sid === sid ? stopPreviews("client stop") : false;
+  const stopped = activePreview?.sid === sid ? !!stopPreviews("client stop") : false;
   res.json({ ok: true, stopped });
 });
 
@@ -15486,7 +15531,10 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   if (req.params.mode !== "disk") preemptDiskDownloadsForViewer(`play ${req.params.mode}`);
   // ...and a tile preview (any device) stops before the player starts: wait
   // for its ffmpeg (and so its provider connection) to be gone first.
-  const previewGone = previewViewerActivity(ownerKeyOf(req), req.params.mode === "live" ? "play-live" : "play-vod");
+  // (A local Disk file uses no provider connection: it stops a preview but
+  // leaves no "someone is watching" signal.)
+  const previewGone = req.params.mode === "disk" ? stopPreviews("play disk")
+    : previewViewerActivity(ownerKeyOf(req), req.params.mode === "live" ? "play-live" : "play-vod");
   if (previewGone) await previewGone;
 
   // --- Disk (local) media. Decide direct-play vs transcode from the probed

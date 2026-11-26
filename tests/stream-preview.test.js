@@ -76,6 +76,17 @@ test("signals: a live play on another device blocks until its health report (ses
   assert.equal(decide(new Map(), sig, "s:tv", 64 * MIN).ok, false);
 });
 
+test("signals: progress / heartbeat never drop an un-ended live hold", () => {
+  const sig = new Map();
+  sp.noteSignal(sig, "s:phone", "play-live", 0);
+  sp.noteSignal(sig, "s:phone", "activity", 60_000);
+  assert.equal(decide(new Map(), sig, "s:tv", 30 * MIN).ok, false);
+  sp.noteSignal(sig, "s:phone", "live-end", 40 * MIN);
+  sp.noteSignal(sig, "s:phone", "activity", 41 * MIN);
+  assert.equal(decide(new Map(), sig, "s:tv", 43 * MIN).ok, false);
+  assert.equal(decide(new Map(), sig, "s:tv", 45 * MIN).ok, true);
+});
+
 test("signals: an unreported live play stops blocking after the 3 h cap", () => {
   const sig = new Map();
   sp.noteSignal(sig, "s:web", "play-live", 0);
@@ -126,7 +137,7 @@ test("sids + ffmpeg args", () => {
   const s = a.join(" ");
   assert.match(s, /-ss 600 -i http:\/\/x\/y\.mkv -t 90 /);
   assert.match(s, /-map 0:a:2\?/);
-  assert.match(s, /libx264/);
+  assert.match(s, /-threads 2 -filter_threads 1 .*libx264/);
   assert.match(s, /-c:a aac -ac 2/);
   assert.ok(s.endsWith("/tmp/d/index.m3u8"));
   assert.ok(!a.includes("-readrate"));
@@ -139,7 +150,7 @@ test("sids + ffmpeg args", () => {
 test("server wiring: preview never counts as a viewer and anything real stops it", () => {
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   // Real play requests stop previews before the player starts.
-  assert.match(src, /const previewGone = previewViewerActivity\(ownerKeyOf\(req\), req\.params\.mode === "live" \? "play-live" : "play-vod"\);\n\s*if \(previewGone\) await previewGone;/);
+  assert.match(src, /const previewGone = req\.params\.mode === "disk" \? stopPreviews\("play disk"\)\n\s*: previewViewerActivity\(ownerKeyOf\(req\), req\.params\.mode === "live" \? "play-live" : "play-vod"\);\n\s*if \(previewGone\) await previewGone;/);
   assert.ok(src.indexOf("const previewGone = previewViewerActivity") < src.indexOf("const direct = streamUrl(req.params.mode, req.params.id, req.params.ext);"));
   // Any real admission stops a preview; previews never count against the cap.
   assert.match(src, /if \(!diskDlSchedule\.isDiskDownloadOwner\(owner\)\) stopPreviews\(`admit \$\{mode\}`\);/);
@@ -148,7 +159,11 @@ test("server wiring: preview never counts as a viewer and anything real stops it
   assert.match(src, /active: list\.filter\(\(x\) => !x\.background && !x\.preview\)\.length/);
   // Progress + heartbeat + live-health hooks.
   assert.match(src, /previewViewerActivity\(ownerKeyOf\(req\), "progress"\)/);
-  assert.match(src, /previewViewerActivity\(ownerKeyOf\(req\), "heartbeat"\)/);
+  assert.match(src, /if \(pauseKeepalive\.parseHeartbeat\(req\.body\)\.ok\) previewViewerActivity\(ownerKeyOf\(req\), "heartbeat"\)/);
+  // A real play during the preview request's awaits makes it give up.
+  assert.match(src, /if \(previewPlayEpoch !== epoch0\) return res\.status\(409\)/);
+  // A phone download waits for the preview's ffmpeg to exit first.
+  assert.match(src, /const previewGone = stopPreviews\("phone download"\);\n\s*if \(previewGone\) \{ await previewGone; continue; \}/);
   assert.match(src, /streamPreview\.noteSignal\(previewSignals, ok, "live-end", now\)/);
   // The preview route writes no history / progress / recents.
   const route = src.slice(src.indexOf('app.get("/api/preview/:mode(movie|series)'), src.indexOf('app.post("/api/preview/stop"'));

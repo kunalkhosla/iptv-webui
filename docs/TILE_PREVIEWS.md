@@ -36,9 +36,13 @@ episode). Owner account only. `Cache-Control: no-store`.
   the last 10 %), else ~10 % in (60 s .. 15 min; 300 s when the length is
   unknown). Series: the profile's continue pointer (`lastEpisode`, which already
   moves to the next episode when one is finished), else S1E1.
-- Errors: `409 {"error":"busy","reason"}` (someone is watching; clients back off
-  60 s), `403 not_allowed` (kid profile and the title's rating is not in its
-  allowed certs; unrated = refused), `404` not in catalog, `429` (> 20 starts a
+- Errors: `409 {"error":"busy","reason"}` — `viewer` / `live-viewer` /
+  `download` (someone is watching or downloading: clients back off 60 s),
+  `provider` (the server is probing / downloading the guide / rebuilding the
+  catalog), `play` (a real play started while this request waited),
+  `preview` (another preview claimed the slot meanwhile); `403 not_allowed`
+  (not the owner account, or a kid profile and the title's rating is not in
+  its allowed certs; unrated = refused), `404` not in catalog, `429` (> 20 starts a
   minute per device), `503 disabled` (`TILE_STREAM_PREVIEW=0`) or
   `503 info_unavailable` (no series info).
 - `POST /api/preview/stop {"sid"}`: stop it (focus left the tile). A stopped,
@@ -57,17 +61,26 @@ connection (lib/stream-preview.js):
   kept alive by heartbeats), and no recent sign of a player on ANOTHER device:
   a VOD play request / progress post / pause heartbeat in the last 3 min, or a
   live play request whose session has not ended (live health report) within
-  3 h. The asking device's own signals do not count.
+  3 h (a progress post / heartbeat never shortens that hold). The asking
+  device's own signals do not count. Nor while the server itself uses the
+  provider (a liveness / codec probe, the xmltv download, a catalog rebuild).
+  Checked before any panel call, and again right before ffmpeg starts.
+- **Churn**: at most one new preview per 5 s (the request waits out the gap);
+  software encodes use 2 threads; a title whose VAAPI decode fails is
+  remembered (software next time).
 - **Never displaces anything**, and is stopped (ffmpeg SIGKILLed, so its
   provider connection closes) by: any real `GET /api/stream` (any mode, any
-  device; the request waits for that ffmpeg to exit before answering), any
-  admission of a real owner (`/api/proxy`, `/api/transcode`, phone downloads),
+  device; the request waits for that ffmpeg to exit before answering; a Disk
+  play stops it but leaves no "watching" signal), any
+  admission of a real owner (`/api/proxy`, `/api/transcode`; a phone download
+  waits for the preview's ffmpeg to exit first),
   a progress post or pause heartbeat from another device, a new preview
   (one at a time; the old one's ffmpeg exits before the new one opens), an
   explicit stop, 20 s without a playlist / segment request while encoding, 60 s
   after the last request once encoded, or 4 min in total.
 - **Save to Disk yields to it like to a viewer**: a running transfer is
-  preempted when a preview starts, and jobs wait while it holds the slot.
+  preempted when a preview starts (the preview opens only once the transfer's
+  connection is gone), and jobs wait while it holds the slot.
 - `GET /api/streams`: preview entries carry `preview: true`, are NOT counted in
   `active`, and are counted in a new top-level `preview`.
 
