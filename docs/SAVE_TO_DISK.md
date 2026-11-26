@@ -25,7 +25,11 @@ household's single IPTV stream slot.
 `no valid episodes`, `mode must be movie or series`); `403 { error: "owner only" }`.
 No dedupe: the client must not re-queue a title that is queued, running or done.
 
-`GET /api/disk-download/jobs` -> `{ jobs: [job...newest first, max 100], window }`
+`GET /api/disk-download/jobs` -> `{ jobs: [job...newest first], window }`: every
+queued/downloading/paused job plus the newest 100 done/failed.
+`GET /api/disk-download/jobs?mode=series&ids=1,2,3` -> every job for just those
+source ids, uncapped (a detail page asking about its own titles). Done/failed
+history is kept for the newest 200 jobs only.
 
 job:
 

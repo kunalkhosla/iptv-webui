@@ -48,3 +48,39 @@ test("projection: episode title and window default closed", () => {
   assert.strictEqual(p.totalBytes, null);
   assert.strictEqual(p.pct, null);
 });
+
+const { selectDiskJobs, projectDiskJobs, parseIdsParam } = require("../lib/disk-download-status");
+
+test("select: every active job survives the cap, finished ones are capped", () => {
+  const jobs = [];
+  for (let i = 0; i < 150; i++) jobs.push({ jobId: `q${i}`, mode: "series", id: 1000 + i, status: "queued", createdAt: i });
+  for (let i = 0; i < 150; i++) jobs.push({ jobId: `d${i}`, mode: "movie", id: i, status: "done", createdAt: 500 + i });
+  const out = selectDiskJobs(jobs, { cap: 100 });
+  assert.strictEqual(out.filter((j) => j.status === "queued").length, 150);
+  assert.strictEqual(out.filter((j) => j.status === "done").length, 100);
+  assert.ok(out.every((j, i) => i === 0 || out[i - 1].createdAt >= j.createdAt));
+});
+
+test("select: mode + ids returns every job for those titles, uncapped", () => {
+  const jobs = [];
+  for (let i = 0; i < 300; i++) jobs.push({ jobId: `d${i}`, mode: "series", id: i, status: "done", createdAt: i });
+  jobs.push({ jobId: "m", mode: "movie", id: 5, status: "done", createdAt: 999 });
+  const out = selectDiskJobs(jobs, { mode: "series", ids: ["0", "5", "299"], cap: 100 });
+  assert.deepStrictEqual(out.map((j) => j.jobId), ["d299", "d5", "d0"]);
+});
+
+test("projectDiskJobs: othersRunning excludes the job itself", () => {
+  const a = { jobId: "a", mode: "movie", id: 1, status: "downloading", createdAt: 1 };
+  const b = { jobId: "b", mode: "movie", id: 2, status: "queued", createdAt: 2 };
+  const [pa, pb] = projectDiskJobs([a, b], [a, b], { windowOpen: true });
+  assert.strictEqual(pa.waiting_for, null);
+  assert.strictEqual(pb.waiting_for, "queue");
+  assert.strictEqual(projectDiskJobs([b], [b], { windowOpen: true })[0].waiting_for, null);
+});
+
+test("parseIdsParam: digits only, empty -> null", () => {
+  assert.deepStrictEqual(parseIdsParam("1, 22,x,333"), ["1", "22", "333"]);
+  assert.strictEqual(parseIdsParam(""), null);
+  assert.strictEqual(parseIdsParam(undefined), null);
+  assert.strictEqual(parseIdsParam("a,b"), null);
+});

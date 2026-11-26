@@ -13316,12 +13316,10 @@ app.get("/api/disk/series/:id", (req, res) => {
   });
 });
 
-// Client-safe projection of a job (pct / waiting_for: lib/disk-download-status.js).
-const { projectDiskDownloadJob: projectDiskJob } = require("./lib/disk-download-status");
-function projectDiskDownloadJob(j) {
-  const othersRunning = [...diskDownloadJobs.values()]
-    .some((o) => o !== j && (o.status === "downloading" || o.status === "paused"));
-  return projectDiskJob(j, { windowOpen: isDiskDownloadWindowOpen(), othersRunning });
+// Client-safe projection of jobs (pct / waiting_for / selection: lib/disk-download-status.js).
+const diskJobStatus = require("./lib/disk-download-status");
+function projectDiskDownloadJobs(list) {
+  return diskJobStatus.projectDiskJobs(list, diskDownloadJobs.values(), { windowOpen: isDiskDownloadWindowOpen() });
 }
 function diskDownloadWindowInfo() {
   return {
@@ -13369,18 +13367,17 @@ app.post("/api/disk-download", express.json(), (req, res) => {
   } else {
     return res.status(400).json({ ok: false, error: "mode must be movie or series" });
   }
-  res.json({ ok: true, jobIds: ids, jobs: ids.map((id) => projectDiskDownloadJob(diskDownloadJobs.get(id))), window: diskDownloadWindowInfo() });
+  res.json({ ok: true, jobIds: ids, jobs: projectDiskDownloadJobs(ids.map((id) => diskDownloadJobs.get(id))), window: diskDownloadWindowInfo() });
 });
 
 // Owner-only: poll job status for the "downloading…" badge on tiles/
-// detail pages. Newest first, capped at 100 so a long download history
-// doesn't grow the response unbounded.
+// detail pages. Newest first: every active job + the newest 100 finished;
+// `?mode=series&ids=1,2` lists every job for just those titles, uncapped.
 app.get("/api/disk-download/jobs", (req, res) => {
   if (!requireOwner(req, res)) return;
-  const jobs = [...diskDownloadJobs.values()]
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .slice(0, 100)
-    .map(projectDiskDownloadJob);
+  const mode = req.query.mode === "movie" || req.query.mode === "series" ? req.query.mode : null;
+  const ids = mode ? diskJobStatus.parseIdsParam(req.query.ids) : null;
+  const jobs = projectDiskDownloadJobs(diskJobStatus.selectDiskJobs(diskDownloadJobs.values(), { mode, ids }));
   res.json({ jobs, window: diskDownloadWindowInfo() });
 });
 
