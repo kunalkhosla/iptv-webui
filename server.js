@@ -4754,6 +4754,9 @@ async function runDiskDownloadJob(job) {
       const expectedTotal = resumed
         ? Number(resp.headers.get("content-range")?.split("/")?.[1]) || null
         : Number(resp.headers.get("content-length")) || null;
+      // Shown as "Saving N%" (GET /api/disk-download/jobs). Kept from an
+      // earlier attempt when this one's response omits the size.
+      if (expectedTotal != null) job.totalBytes = expectedTotal;
       const source = Readable.fromWeb(resp.body);
       // touchStream keeps streams' lastSeen fresh for the whole transfer —
       // without it, admitStream() is only called once per pause/resume
@@ -13313,14 +13316,19 @@ app.get("/api/disk/series/:id", (req, res) => {
   });
 });
 
-// Client-safe projection of a job — omits internal fields (pausedReason
-// is informative enough without exposing the raw killer/abort plumbing).
+// Client-safe projection of a job (pct / waiting_for: lib/disk-download-status.js).
+const { projectDiskDownloadJob: projectDiskJob } = require("./lib/disk-download-status");
 function projectDiskDownloadJob(j) {
+  const othersRunning = [...diskDownloadJobs.values()]
+    .some((o) => o !== j && (o.status === "downloading" || o.status === "paused"));
+  return projectDiskJob(j, { windowOpen: isDiskDownloadWindowOpen(), othersRunning });
+}
+function diskDownloadWindowInfo() {
   return {
-    id: j.jobId, mode: j.mode, sourceId: j.id, status: j.status,
-    title: j.mode === "movie" ? j.title : j.episodeTitle,
-    seriesTitle: j.seriesTitle || null, season: j.season || null, episodeNum: j.episodeNum || null,
-    bytesWritten: j.bytesWritten, error: j.error, createdAt: j.createdAt, finishedAt: j.finishedAt || null,
+    open: isDiskDownloadWindowOpen(),
+    startHour: DISK_DOWNLOAD_WINDOW_START_HOUR,
+    endHour: DISK_DOWNLOAD_WINDOW_END_HOUR,
+    tz: DISK_DOWNLOAD_WINDOW_TZ,
   };
 }
 
@@ -13361,7 +13369,7 @@ app.post("/api/disk-download", express.json(), (req, res) => {
   } else {
     return res.status(400).json({ ok: false, error: "mode must be movie or series" });
   }
-  res.json({ ok: true, jobIds: ids });
+  res.json({ ok: true, jobIds: ids, jobs: ids.map((id) => projectDiskDownloadJob(diskDownloadJobs.get(id))), window: diskDownloadWindowInfo() });
 });
 
 // Owner-only: poll job status for the "downloading…" badge on tiles/
@@ -13373,7 +13381,7 @@ app.get("/api/disk-download/jobs", (req, res) => {
     .sort((a, b) => b.createdAt - a.createdAt)
     .slice(0, 100)
     .map(projectDiskDownloadJob);
-  res.json({ jobs });
+  res.json({ jobs, window: diskDownloadWindowInfo() });
 });
 
 app.post("/api/admin/rescan-disk", async (req, res) => {
