@@ -35,7 +35,7 @@ Tiles (home rails, `/api/search/:mode`, `/api/search/all`,
 - tag `surround` in `tags` <=> `audio_badge` present (>= 6 channels; it used to
   mean >= 3).
 
-Detail: `GET /api/poster/:mode/:id` always carries `audio_channels`,
+Detail: `GET /api/poster/:mode/:id` (with TMDB configured) carries `audio_channels`,
 `audio_codec`, `audio_format`, `audio_badge` (null = unknown). Series use the
 series summary. `GET /api/episodes/:mode/:id`: each episode carries the same
 four fields when known (omitted otherwise).
@@ -61,13 +61,18 @@ four fields when known (omitted otherwise).
 60 s after boot (owner panel only):
 
 - one `get_vod_info` at a time, `SURROUND_CRAWL_INTERVAL_MS` apart (default
-  4000); not cached in the 24 h memory cache; transient errors back off
-  60 s -> 15 min.
+  4000), always against the owner panel; not cached in the 24 h memory cache;
+  pauses (15 s polls) while anyone on the owner account is streaming;
+  transient errors back off 60 s -> 15 min, an id failing 3 times is skipped
+  until restart; a 4xx / non-JSON answer counts as a miss. A degraded panel
+  answer (auth reject, empty shell) is never recorded as a miss.
+- quality-cache.json is saved at most once a minute from crawler writes.
 - order: movie tiles a client was just shown without audio info (home rails
   incl. For You, per-mode search; newest first, max 2000 queued), then
   4K-tagged titles, then newest `added`.
-- skips titles already known (`quality-cache` has `audio_channels`) or a fresh
-  miss. A full pass over the ~10k unknown titles takes ~12 h; then it idles and
+- skips titles already known (`quality-cache` has `audio_channels`, including
+  0 = panel probed the video but reported no audio; re-checked only when that
+  entry is replaced) or a fresh miss. A full pass over the ~10k unknown titles takes ~12 h; then it idles and
   re-checks every 10 min / on a boost.
 - The old burst prewarm (1500 calls per index build, concurrency 2) is gone; the
   4K verification pass now skips fresh misses.

@@ -116,3 +116,27 @@ test("crawler: transient failure backs off and continues", async () => {
 test("crawler: requires its callbacks", () => {
   assert.throws(() => S.createAudioCrawler({}));
 });
+
+test("crawler: yields while shouldYield, skips an id after 3 failures", async () => {
+  let watching = true;
+  let yieldSleeps = 0;
+  const probed = [];
+  let crawler;
+  crawler = S.createAudioCrawler({
+    candidates: () => [7, 8],
+    isKnown: () => false,
+    shouldYield: () => watching,
+    probe: async (id) => { probed.push(id); if (id === 7) throw new Error("500"); return "found"; },
+    sleep: async () => {
+      if (watching) { yieldSleeps++; if (yieldSleeps >= 3) watching = false; return; }
+      if (probed.length >= 6) crawler.stop();
+    },
+    yieldPollMs: 1, intervalMs: 1,
+  });
+  crawler.start();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(yieldSleeps, 3, "waited while watching");
+  assert.equal(probed.filter((x) => x === 7).length, 3, "id 7 tried 3 times then skipped");
+  assert.equal(crawler.stats().skipped, 1);
+  assert.ok(probed.includes(8));
+});

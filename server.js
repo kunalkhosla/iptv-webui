@@ -819,17 +819,29 @@ const qualityCache = (() => {
   } catch { return {}; }
 })();
 let qualityCacheSaveTimer = null;
-function scheduleQualityCacheSave() {
-  if (qualityCacheSaveTimer) return;
+let qualityCacheSaveDue = 0;
+let qualityCacheSaving = false;
+// delayMs: 500 for interactive writes; the background crawler passes 60 s
+// (the file is ~9 MB, rewriting it every probe would be wasteful). An
+// earlier deadline replaces a later one.
+function scheduleQualityCacheSave(delayMs = 500) {
+  const due = Date.now() + delayMs;
+  if (qualityCacheSaveTimer) {
+    if (due >= qualityCacheSaveDue) return;
+    clearTimeout(qualityCacheSaveTimer);
+  }
+  qualityCacheSaveDue = due;
   qualityCacheSaveTimer = setTimeout(async () => {
     qualityCacheSaveTimer = null;
+    if (qualityCacheSaving) { scheduleQualityCacheSave(1000); return; }
+    qualityCacheSaving = true;
     try {
       await fs.promises.writeFile(qualityCacheFile + ".tmp", JSON.stringify(qualityCache));
       await fs.promises.rename(qualityCacheFile + ".tmp", qualityCacheFile);
     } catch (e) {
       console.warn(`save quality-cache failed: ${e.message}`);
-    }
-  }, 500);
+    } finally { qualityCacheSaving = false; }
+  }, delayMs);
 }
 // Audio codec cache for live channels. Sports panels routinely ship
 // MP2 / AC3 / E-AC3 audio with H.264 video — the video parses cleanly
@@ -901,7 +913,7 @@ function loadJsonObject(file) {
     return d && typeof d === "object" && !Array.isArray(d) ? d : {};
   } catch { return {}; }
 }
-function makeJsonSaver(file, obj, label) {
+function makeJsonSaver(file, obj, label, delayMs = 1000) {
   let timer = null;
   let saving = false;
   const save = () => {
@@ -916,7 +928,7 @@ function makeJsonSaver(file, obj, label) {
       } catch (e) {
         console.warn(`save ${label} failed: ${e.message}`);
       } finally { saving = false; }
-    }, 1000);
+    }, delayMs);
   };
   return save;
 }
@@ -925,7 +937,11 @@ function makeJsonSaver(file, obj, label) {
 const AUDIO_MISS_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const audioCrawlMissesFile = path.join(DATA_DIR, "audio-crawl-misses.json");
 const audioCrawlMisses = loadJsonObject(audioCrawlMissesFile);
-const scheduleAudioCrawlMissesSave = makeJsonSaver(audioCrawlMissesFile, audioCrawlMisses, "audio-crawl-misses");
+// Expired misses are dropped at boot (the file only holds live verdicts).
+for (const [k, t] of Object.entries(audioCrawlMisses)) {
+  if (!Number.isFinite(t) || Date.now() - t >= AUDIO_MISS_TTL_MS) delete audioCrawlMisses[k];
+}
+const scheduleAudioCrawlMissesSave = makeJsonSaver(audioCrawlMissesFile, audioCrawlMisses, "audio-crawl-misses", 30_000);
 const audioMissFresh = (id) => {
   const t = audioCrawlMisses[`movie:${id}`];
   return Number.isFinite(t) && Date.now() - t < AUDIO_MISS_TTL_MS;
@@ -975,7 +991,8 @@ function audioTileFields(s) {
 }
 // Detail-page fields: always present (null = unknown). Series fall back to
 // the persisted summary when the index item has none yet.
-function detailAudioFields(mode, item) {
+function detailAudioFields(mode, item, actx = currentAccount()) {
+  if (!isOwnerAccount(actx) && mode !== "disk") return surroundLib.audioFields(null);
   if (item && item.audio_channels) {
     return {
       audio_channels: item.audio_channels,
@@ -1015,7 +1032,10 @@ function seriesAudioSummary(seriesId) {
 // Records a get_vod_info answer: video verdict + audio into qualityCache.
 // Video dims unknown (panel probed nothing but audio) -> is4k null (never
 // demotes). Returns the entry, or null when the answer had neither.
-function recordPanelVodInfo(movieId, info) {
+// Owner panel only writes (qualityCache, misses, index patch are keyed by the
+// owner's ids); a member answer is only summarised for the caller.
+// `opts.saveDelayMs`: quality-cache save debounce (crawler: 60 s).
+function recordPanelVodInfo(movieId, info, actx = currentAccount(), opts = {}) {
   const video = (info && info.video && typeof info.video === "object" && !Array.isArray(info.video)) ? info.video : {};
   const audio = surroundLib.fromPanelAudio(info && info.audio);
   const w = Number(video.width) || 0;
@@ -1034,15 +1054,16 @@ function recordPanelVodInfo(movieId, info) {
     audio_profile: audio ? audio.profile : null,
     checked_at: Date.now(),
   };
+  if (!isOwnerAccount(actx)) return entry;
   qualityCache[`movie:${movieId}`] = entry;
-  scheduleQualityCacheSave();
+  scheduleQualityCacheSave(opts.saveDelayMs || 500);
   if (audio && audioCrawlMisses[`movie:${movieId}`]) {
     delete audioCrawlMisses[`movie:${movieId}`];
     scheduleAudioCrawlMissesSave();
   }
   // Patch the in-memory owner index so tiles carry it without a rebuild.
   const numId = parseInt(movieId, 10);
-  applyAudioToItem(indexes.movie?.byId?.get(numId), movieAudioSummary(numId));
+  applyAudioToItem(getIndexesFor(actx).movie?.byId?.get(numId), movieAudioSummary(numId));
   return entry;
 }
 
@@ -1454,8 +1475,10 @@ async function verifyQuality4k(movieId, actx = currentAccount()) {
   }
   // Neither video dims nor audio = the panel never probed the file: not
   // cached (retried by the next 4K pass), noted for the surround crawler.
-  const entry = recordPanelVodInfo(movieId, info && info.info);
-  if (!entry) { noteAudioMiss(movieId); return null; }
+  const entry = recordPanelVodInfo(movieId, info && info.info, actx);
+  // Only a real answer that carries nothing is a miss; an auth reject /
+  // empty shell from a degraded panel is just a failure (retried).
+  if (!entry) { if (isOwnerAccount(actx) && isUsableInfo(info, "movie")) noteAudioMiss(movieId); return null; }
   return entry;
 }
 
@@ -1476,14 +1499,28 @@ const audioKnown = (id) => {
   const q = qualityCache[`movie:${id}`];
   return (!!q && ("audio_channels" in q)) || audioMissFresh(id);
 };
+// Always the owner panel + owner index, whatever async context started it.
+const ownerMovieIndex = () => getIndexesFor(getOwnerAccount()).movie;
 const surroundCrawler = surroundLib.createAudioCrawler({
   intervalMs: SURROUND_CRAWL_INTERVAL_MS,
-  isKnown: (id) => audioKnown(id) || !indexes.movie?.byId?.has(id),
-  candidates: () => (indexes.movie?.ready ? surroundLib.sweepOrder(indexes.movie.byId.values()) : []),
+  isKnown: (id) => audioKnown(id) || !ownerMovieIndex()?.byId?.has(id),
+  candidates: () => (ownerMovieIndex()?.ready ? surroundLib.sweepOrder(ownerMovieIndex().byId.values()) : []),
+  // Metadata calls don't use the stream slot, but stay out of the way while
+  // anyone is watching (same rule as the other background panel passes).
+  shouldYield: () => streamingNow(getOwnerAccount()),
   probe: async (id) => {
-    // noCache: a crawl must not pin ~10k info answers in the 24 h memory cache.
-    const info = await xtream(MODES.movie.info, { vod_id: id }, { timeout: 20_000, noCache: true });
-    const entry = recordPanelVodInfo(id, info && info.info);
+    const actx = getOwnerAccount();
+    let info;
+    try {
+      // noCache: a crawl must not pin ~10k info answers in the 24 h memory cache.
+      info = await xtream(MODES.movie.info, { vod_id: id }, { actx, timeout: 20_000, noCache: true });
+    } catch (e) {
+      // A 4xx / non-JSON answer is about this title, not the panel: a miss.
+      if (/^Panel 4\d\d\b/.test(String(e && e.message)) || (e && e.name === "SyntaxError")) { noteAudioMiss(id); return "none"; }
+      throw e;
+    }
+    if (!isUsableInfo(info, "movie")) throw new Error("unusable info answer");
+    const entry = recordPanelVodInfo(id, info.info, actx, { saveDelayMs: 60_000 });
     if (!entry || !entry.audio_channels) { if (!entry) noteAudioMiss(id); return "none"; }
     return "found";
   },
@@ -10769,7 +10806,7 @@ app.get("/api/episodes/:mode(series|disk)/:id(\\d{1,17})", async (req, res, next
             duration_secs: Number(ep.info?.duration_secs) || null,
             container: ep.container_extension || null,
             still: tStill || panelStill,
-            ...episodeAudioFields(learnedTrackSummary("series", ep.id) || surroundLib.fromPanelAudio(ep.info?.audio)),
+            ...episodeAudioFields((isOwnerAccount(actx) ? learnedTrackSummary("series", ep.id) : null) || surroundLib.fromPanelAudio(ep.info?.audio)),
             ...episodeProgressFor(userState, "series", ep.id, watchedSet),
           };
         });
@@ -15634,11 +15671,12 @@ app.listen(PORT, async () => {
   }
   // Surround: series summaries from saved info, then the movie audio crawler
   // (also started after each movie index build).
-  seedSeriesAudioFromInfoStore().catch((e) => console.warn(`[surround] seed failed: ${e.message}`));
   if (indexes.movie?.ready) setTimeout(startSurroundCrawler, 60_000).unref?.();
 
   await pickPanel(actx);
   console.log(`  active:     ${actx.host}`);
+  // Series audio summaries from saved info (keys include the active host).
+  seedSeriesAudioFromInfoStore().catch((e) => console.warn(`[surround] seed failed: ${e.message}`));
 
   const STALE_MS = TTL_MS;
   const needsRebuild = (mode) => {

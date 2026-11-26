@@ -2092,10 +2092,10 @@ function renderBrowseChipStrip(mode) {
     { key: "all", label: "All" },
     { key: "4k",  label: "4K" },
   ];
-  // Surround (>= 5.1 audio): Movies / Disk always; Series when the server's
-  // chip list says some tile carries the tag.
+  // Surround (>= 5.1 audio): only when the server's chip list says some
+  // tile in this home carries the tag (accounts without audio data get none).
   const srvChips = state.home[mode] && Array.isArray(state.home[mode].chips) ? state.home[mode].chips : [];
-  if (mode === "movie" || mode === "disk" || srvChips.some((c) => c && c.key === "surround")) {
+  if (srvChips.some((c) => c && c.key === "surround")) {
     chips.push({ key: "surround", label: "Surround" });
   }
   if (state.filter.onboarded) {
