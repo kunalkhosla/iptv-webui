@@ -1634,7 +1634,7 @@ async function cachedPreviewUrl(mode, id, key) {
     if (Date.now() - (_trailerRecheckAt.get(k) || 0) > 60_000) {
       _trailerRecheckAt.set(k, Date.now());
       try {
-        const r = await fetch(`/api/poster/${mode}/${encodeURIComponent(id)}`);
+        const r = await fetch(`/api/poster/${mode}/${encodeURIComponent(id)}`, { cache: "no-cache" });
         if (r.ok) {
           const fresh = await r.json();
           if (fresh && fresh.trailer) {
@@ -1700,6 +1700,10 @@ function scheduleHeroPreview(pick) {
       if (_heroPreview !== hp) return;
       // Hold the rotation while the trailer plays; it advances at the end.
       hp.playing = true;
+      // A clip that stalls after starting (no error, no end) must not
+      // freeze the rotation: the clip is ~30 s.
+      clearTimeout(hp.timer);
+      hp.timer = setTimeout(() => { if (_heroPreview === hp) { stopHeroPreview(); if (_heroItems.length > 1) advanceHero(); } }, 45_000);
       if (_heroTimer) { clearInterval(_heroTimer); _heroTimer = null; }
     }, (ended) => {
       if (_heroPreview !== hp) return;
@@ -1708,8 +1712,8 @@ function scheduleHeroPreview(pick) {
     });
     const fade = el.hero.querySelector(".hero-fade");
     if (fade) el.hero.insertBefore(hp.video, fade); else el.hero.appendChild(hp.video);
-    // A stalled clip (no error, no end) must not freeze the rotation.
-    hp.timer = setTimeout(() => { if (_heroPreview === hp) { stopHeroPreview(); if (_heroItems.length > 1) advanceHero(); } }, 45_000);
+    // Never started within 20 s: give up (the rotation keeps going meanwhile).
+    hp.timer = setTimeout(() => { if (_heroPreview === hp && !hp.playing) stopHeroPreview(); }, 20_000);
   }, HERO_PREVIEW_DELAY_MS);
 }
 function resumeHeroPreview() {
@@ -6103,7 +6107,8 @@ function markPlayingFinished() {
   const p = state.playing;
   const key = _progressKey;
   if (!p || !key || p.mode === "live") return;
-  const dur = scrubDurationSecs();
+  // Same rule as sendProgress: a transcode needs its real full duration.
+  const dur = p.transcode ? (p.fullDurationSecs || 0) : scrubDurationSecs();
   if (!(dur > 0)) return;
   clearProgressTracking();
   delete state.progress[key];
@@ -6236,7 +6241,7 @@ function renderSeriesEpisodes(seriesItem, info, sn, onPlay = playEpisode) {
       if (!thumbEl || thumbEl.dataset.still) continue; // /api/episodes still already applied
       const img = new Image();
       img.referrerPolicy = "no-referrer";
-      img.onload = () => { thumbEl.style.backgroundImage = `url("${stills[epId]}")`; };
+      img.onload = () => { if (!thumbEl.dataset.still) thumbEl.style.backgroundImage = `url("${stills[epId]}")`; };
       img.src = stills[epId];
     }
   });
