@@ -68,8 +68,8 @@ PROXY_SECRET=...              # strongly recommended; required once you invite a
 IPTV_HOST_FALLBACK=http://backup-panel.example   # optional secondary panel
 HA_URL=http://homeassistant.local:8123            # optional: programme-reminder pushes via Home Assistant
 HA_TOKEN=...                                       # optional: HA long-lived token
-HA_NOTIFY_SERVICE=mobile_app_your_phone            # optional: default notify service
-HA_NOTIFY_PROFILES=Alice=mobile_app_alice,Bob=mobile_app_bob   # optional: per-profile notify service
+HA_NOTIFY_SERVICE=mobile_app_your_phone            # optional: owner household default notify service
+HA_NOTIFY_PROFILES=Alice=mobile_app_alice,Bob=mobile_app_bob   # optional: per owner-user profile notify service
 ```
 
 `IPTV_*` and `APP_*` are used ONLY on first boot to seed the owner

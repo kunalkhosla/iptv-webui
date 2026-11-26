@@ -3540,6 +3540,11 @@ body.filter-open #scrim { opacity: 1; pointer-events: auto; }
 .guide-program .gp-bell:focus-visible { opacity: 1; }
 .guide-program .gp-bell:hover { color: var(--fg); background: var(--bg-2); }
 .guide-program .gp-bell.on { opacity: 1; color: var(--accent); }
+/* Touch screens have no hover: keep the bell visible. */
+@media (hover: none) {
+  .guide-program .gp-bell { opacity: 1; }
+  .guide-program:has(.gp-bell) .gp-title { padding-right: 20px; }
+}
 .guide-program.has-reminder { border-color: rgba(var(--accent-rgb), 0.55); }
 .guide-program.has-reminder .gp-title { padding-right: 20px; }
 

@@ -12,7 +12,8 @@ banner. **A reminder never opens a stream**; only the viewer's OK does.
 - `POST /api/reminders` `{ stream_id, title, start_ts, stop_ts }` (seconds; start
   in the future, at most 14 days ahead). Idempotent for the same profile,
   channel, start and title. Snaps to the bulk guide's times for that airing.
-  At most 100 pending per profile.
+  `stop_ts` is clamped to at most 12 h after start. At most 100 pending and 200
+  in total per profile (the oldest finished ones make room).
 - `DELETE /api/reminders/:id`
 - `POST /api/reminders/:id/ack`: banner handled (OK or Dismiss) on any client.
 
@@ -22,7 +23,8 @@ All return the `GET` payload.
 R = { id, stream_id, channel, title, start_ts, stop_ts,
       status: "pending" | "fired" | "missed" | "dropped",
       note: null | "Time changed" | "Channel moved" | "No longer in the guide"
-            | "Channel no longer available" | "Server was offline at start time",
+            | "Channel no longer available" | "Server was offline at start time"
+            | "Moved earlier in the guide; already started",
       starts_in_secs }
 ```
 
@@ -30,15 +32,21 @@ R = { id, stream_id, channel, title, start_ts, stop_ts,
 
 A 20 s timer fires reminders from start - 2 min until start + 5 min (later than
 that they become `missed`). Push: `POST {HA_URL}/api/services/notify/<service>`
-with `HA_TOKEN`; the service is the profile's entry in `HA_NOTIFY_PROFILES`
-(`Nick=service,...`, matched on nick or profile id) or `HA_NOTIFY_SERVICE`.
-Without HA config only the in-app banner shows. Log: `[reminders] fired ...`.
+with `HA_TOKEN`. Push only for a reminder set on the owner account by one of
+the owner user's own profiles: the service is that profile's entry in
+`HA_NOTIFY_PROFILES` (`Nick=service,...`, matched on nick or profile id, only
+against the owner user's profiles) or else `HA_NOTIFY_SERVICE`. Other users'
+profiles and deleted profiles never push (in-app banner only). Without HA
+config only the in-app banner shows. Log: `[reminders] fired ...`; a non-OK HA
+reply logs its status. An unreadable `reminders.json` is kept as
+`reminders.json.corrupt-<ts>` before the store starts empty.
 
 ## Guide changes
 
 After each guide rebuild, pending reminders (owner account) are checked
 against the bulk XMLTV guide: the same title within 3 hours on that channel
-moves the reminder ("Time changed"); if the guide covers that slot and the
+moves the reminder ("Time changed"; moved to a time already more than 5 min
+past, it is `missed`: "Moved earlier in the guide; already started"); if the guide covers that slot and the
 programme is gone it is `dropped` ("No longer in the guide"); a channel id that
 left the catalog is re-homed to a copy of the same channel ("Channel moved") or
 dropped. Channels with no bulk-guide data keep their reminders as set.

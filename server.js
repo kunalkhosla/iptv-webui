@@ -6127,7 +6127,7 @@ app.get("/branding.local.js", (_req, res) => {
 // negotiation involved.
 const SPA_ASSET_VERSION = process.env.GIT_SHA || "dev";
 const SPA_HTML = fs.readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
-  .replace(/(href|src)="\/(style\.css|app\.js|nf-helpers\.js|theatre-portraits\.js)"/g,
+  .replace(/(href|src)="\/(style\.css|app\.js|nf-helpers\.js|rescue-logic\.js|theatre-portraits\.js)"/g,
     (_m, attr, file) => `${attr}="/${file}?v=${SPA_ASSET_VERSION}"`);
 function sendSpaShell(res) {
   res.type("html").setHeader("Cache-Control", "no-cache, must-revalidate").send(SPA_HTML);
@@ -9654,12 +9654,31 @@ app.get("/api/variants/:mode(movie|series)/:id", (req, res) => {
 // here ever opens a panel connection.
 const liveRescue = require("./lib/live-rescue");
 const liveHealthFile = path.join(DATA_DIR, "live-health.json");
-const liveHealth = (() => {
+// Read a small JSON store. Missing = null. Unreadable = null too, but the bad
+// file is kept as <file>.corrupt-<ts> first so the next save can't erase it.
+function loadJsonStore(file, label, valid) {
+  let raw;
+  try { raw = fs.readFileSync(file, "utf8"); }
+  catch (e) {
+    if (e.code !== "ENOENT") console.error(`[${label}] read ${path.basename(file)} failed: ${e.message}`);
+    return null;
+  }
   try {
-    const d = JSON.parse(fs.readFileSync(liveHealthFile, "utf8"));
-    return d && typeof d === "object" ? d : {};
-  } catch { return {}; }
-})();
+    const d = JSON.parse(raw);
+    if (valid(d)) return d;
+    throw new Error("unexpected shape");
+  } catch (e) {
+    const bad = `${file}.corrupt-${Date.now()}`;
+    try { fs.copyFileSync(file, bad); } catch {}
+    console.error(`[${label}] ${path.basename(file)} unreadable (${e.message}); kept ${path.basename(bad)}, starting empty`);
+    return null;
+  }
+}
+const liveHealth = loadJsonStore(liveHealthFile, "rescue", (d) => !!d && typeof d === "object" && !Array.isArray(d)) || {};
+function pruneLiveHealth() {
+  const n = liveRescue.pruneHealth(liveHealth, Date.now());
+  if (n) { console.log(`[rescue] pruned ${n} faded health records`); scheduleLiveHealthSave(); }
+}
 let liveHealthSaveTimer = null;
 function scheduleLiveHealthSave() {
   if (liveHealthSaveTimer) return;
@@ -9680,6 +9699,8 @@ function flushLiveHealthSync() {
     fs.renameSync(liveHealthFile + ".tmp", liveHealthFile);
   } catch (e) { console.warn(`flush live-health failed: ${e.message}`); }
 }
+pruneLiveHealth();
+setInterval(pruneLiveHealth, 6 * 3600e3).unref?.();
 // Owner copies keyed by bare id; other accounts get an account prefix.
 function liveHealthKey(actx, id) {
   if (isOwnerAccount(actx)) return String(id);
@@ -9693,6 +9714,8 @@ function liveGroupsFor(ix) {
   liveGroupCache.set(ix.byId, g);
   return g;
 }
+// The liveness cache is keyed by bare stream id (owner panel), so only the
+// owner account can use it; other accounts' ids may name different channels.
 function liveDeadState(id) {
   const entry = audioCodecCache[`live:${id}`];
   if (!entry || !entry.dead) return null;
@@ -9719,8 +9742,8 @@ app.post("/api/live/health/:id", express.json({ limit: "4kb" }), (req, res) => {
 });
 app.get("/api/live/alternates/:id", (req, res) => {
   res.set("Cache-Control", "no-store");
+  if (!/^\d{1,12}$/.test(String(req.params.id))) return res.status(400).json({ error: "bad id" });
   const idInt = parseInt(req.params.id, 10);
-  if (!Number.isFinite(idInt)) return res.status(400).json({ error: "bad id" });
   const actx = currentAccount();
   const ix = getIndexesFor(actx).live;
   const cur = ix.byId.get(idInt);
@@ -9735,7 +9758,7 @@ app.get("/api/live/alternates/:id", (req, res) => {
     currentName: cur.name,
     candidates,
     health: (i) => liveRescue.scoreFor(liveHealth, liveHealthKey(actx, i), now),
-    deadState: liveDeadState,
+    deadState: isOwnerAccount(actx) ? liveDeadState : null,
   });
   const self = liveRescue.scoreFor(liveHealth, liveHealthKey(actx, idInt), now);
   if (req.query.reason) console.log(`[rescue] alternates live:${idInt} reason=${String(req.query.reason).slice(0, 24).replace(/[^a-z0-9_-]/gi, "")} copies=${ids.length} offered=${alternates.length}${alternates[0] ? ` best=${alternates[0].id}(${alternates[0].score})` : ""}`);
@@ -9754,13 +9777,8 @@ app.get("/api/live/alternates/:id", (req, res) => {
 // from GET /api/reminders `due`. Firing never opens a stream.
 const remindersLib = require("./lib/reminders");
 const remindersFile = path.join(DATA_DIR, "reminders.json");
-const reminderStore = (() => {
-  try {
-    const d = JSON.parse(fs.readFileSync(remindersFile, "utf8"));
-    if (d && Array.isArray(d.reminders)) return d;
-  } catch {}
-  return { reminders: [], seenEpgBuild: 0 };
-})();
+const reminderStore = loadJsonStore(remindersFile, "reminders", (d) => !!d && Array.isArray(d.reminders))
+  || { reminders: [], seenEpgBuild: 0 };
 let remindersSaveTimer = null;
 function scheduleRemindersSave() {
   if (remindersSaveTimer) return;
@@ -9781,19 +9799,19 @@ function flushRemindersSync() {
     fs.renameSync(remindersFile + ".tmp", remindersFile);
   } catch (e) { console.warn(`flush reminders failed: ${e.message}`); }
 }
-// HA push. HA_NOTIFY_PROFILES="Kunal=mobile_app_x,Shuchi=mobile_app_y" maps a
-// profile (nick or id, case-insensitive) to a notify service; anything else
-// falls back to HA_NOTIFY_SERVICE (the account owner's phone). No HA_URL /
-// HA_TOKEN: in-app banners only.
-function haNotifyServiceFor(profile) {
-  const map = String(process.env.HA_NOTIFY_PROFILES || "");
-  const names = [profile?.nick, profile?.id].filter(Boolean).map((s) => String(s).toLowerCase());
-  for (const pair of map.split(",")) {
-    const i = pair.indexOf("=");
-    if (i <= 0) continue;
-    if (names.includes(pair.slice(0, i).trim().toLowerCase())) return pair.slice(i + 1).trim() || null;
-  }
-  return String(process.env.HA_NOTIFY_SERVICE || "").trim() || null;
+// HA push, owner household only (see remindersLib.haServiceFor):
+// HA_NOTIFY_PROFILES="Kunal=mobile_app_x,Shuchi=mobile_app_y" maps one of the
+// owner user's profiles (nick or id, case-insensitive) to a notify service,
+// else HA_NOTIFY_SERVICE. Other users' and deleted profiles get the in-app
+// banner only. No HA_URL / HA_TOKEN: in-app banners only.
+function haNotifyServiceFor(r, profile) {
+  return remindersLib.haServiceFor({
+    reminder: r,
+    profile,
+    ownerUserId: ownerUser()?.id || null,
+    profilesMap: process.env.HA_NOTIFY_PROFILES,
+    fallback: process.env.HA_NOTIFY_SERVICE,
+  });
 }
 async function sendHaNotify(service, title, message, tag) {
   const base = String(process.env.HA_URL || "").replace(/\/+$/, "");
@@ -9805,6 +9823,7 @@ async function sendHaNotify(service, title, message, tag) {
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ title, message, data: { tag, group: "khouch-reminders" } }),
   });
+  if (!r.ok) console.warn(`[reminders] HA notify ${service} -> HTTP ${r.status}`);
   return r.ok;
 }
 // Guide programmes for a channel from the bulk XMLTV index (ms), or null when
@@ -9826,15 +9845,19 @@ function revalidateReminders() {
   const ix = getIndexesFor(ownerAccount).live;
   if (!ix.ready || !epgIndexBuiltAt) return;
   let changed = false;
+  let byKey = null;
+  const now = Date.now();
   for (const r of reminderStore.reminders) {
     if (r.status !== "pending" || !r.owner) continue;
     if (!ix.byId.has(parseInt(r.streamId, 10))) {
-      const want = r.groupKey;
-      const twin = want ? [...ix.byId.values()].find((s) => liveRescue.groupKeyOf(s) === want) : null;
-      if (twin) {
-        r.streamId = String(twin.id);
+      if (!byKey) byKey = liveGroupsFor(ix).byKey;
+      const twinId = r.groupKey ? (byKey.get(r.groupKey) || [])[0] : null;
+      if (twinId != null) {
+        console.log(`[reminders] ${r.id} Channel moved live:${r.streamId} -> live:${twinId}`);
+        r.streamId = String(twinId);
         r.note = "Channel moved";
       } else {
+        console.log(`[reminders] ${r.id} dropped: channel live:${r.streamId} left the catalog`);
         r.status = "dropped";
         r.note = "Channel no longer available";
         changed = true;
@@ -9846,6 +9869,9 @@ function revalidateReminders() {
     if (m.action === "move") {
       console.log(`[reminders] ${r.id} moved ${new Date(r.start).toISOString()} -> ${new Date(m.start).toISOString()}`);
       r.start = m.start; r.stop = m.stop; r.note = "Time changed";
+      // Moved earlier to a time already past the late-fire window: it can't
+      // fire any more, and "server was offline" would be wrong.
+      if (now > r.start + remindersLib.LATE_FIRE_MS) { r.status = "missed"; r.note = "Moved earlier in the guide; already started"; }
       changed = true;
     } else if (m.action === "drop") {
       console.log(`[reminders] ${r.id} dropped: ${m.note}`);
@@ -9870,7 +9896,7 @@ async function remindersTick() {
       r.status = "fired";
       r.firedAt = now;
       const profile = findProfile(r.profileId);
-      const svc = haNotifyServiceFor(profile);
+      const svc = haNotifyServiceFor(r, profile);
       const { title, message } = remindersLib.notifyText(r, profile?.nick, now);
       let pushed = false;
       try { pushed = await sendHaNotify(svc, title, message, `khouch-reminder-${r.id}`); }
@@ -9882,7 +9908,7 @@ async function remindersTick() {
     if (fire.length || miss.length || before !== reminderStore.reminders.length) scheduleRemindersSave();
   } finally { remindersTicking = false; }
 }
-setInterval(() => { remindersTick().catch(() => {}); }, 20_000).unref?.();
+setInterval(() => { remindersTick().catch((e) => console.warn(`[reminders] tick failed: ${e.message}`)); }, 20_000).unref?.();
 
 function remindersPayload(profileId) {
   const now = Date.now();
@@ -9912,9 +9938,9 @@ app.post("/api/reminders", express.json({ limit: "4kb" }), (req, res) => {
   }
   const dup = remindersLib.findDuplicate(reminderStore.reminders, req.profileId, v.streamId, v.start, v.title);
   if (!dup) {
-    if (remindersLib.countActive(reminderStore.reminders, req.profileId) >= remindersLib.MAX_PER_PROFILE) {
-      return res.status(429).json({ error: "too many reminders" });
-    }
+    const roomy = remindersLib.makeRoom(reminderStore.reminders, req.profileId);
+    if (!roomy) return res.status(429).json({ error: "too many reminders" });
+    reminderStore.reminders = roomy;
     reminderStore.reminders.push({
       id: crypto.randomBytes(6).toString("hex"),
       profileId: req.profileId,

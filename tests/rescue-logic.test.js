@@ -155,3 +155,20 @@ test("app wiring: script tag, alternates call, health post, test hook, reminders
   assert.ok(APP.includes("/api/reminders"));
   assert.ok(APP.includes("OK to undo, 10 s"));
 });
+
+test("limiter: the copy a switch left is excluded for the switch window", () => {
+  const L = R.createLimiter();
+  L.recordSwitch(1000, 7);
+  assert.equal(L.isExcluded("7", 2000), true);
+  assert.equal(L.isExcluded(8, 2000), false);
+  assert.equal(L.isExcluded(7, 1000 + R.SWITCH_WINDOW_MS), false);
+  L.recordSwitch(5000);
+  assert.equal(L.isExcluded("undefined", 5000), false);
+});
+
+test("pickAlternate skips excluded copies (no A -> B -> A)", () => {
+  const payload = { floor: 55, alternates: [{ id: 1, score: 90 }, { id: 2, score: 60 }, { id: 3, score: 50 }] };
+  assert.equal(R.pickAlternate(payload, (id) => id === 1).id, 2);
+  assert.equal(R.pickAlternate(payload, (id) => id !== 3), null, "remaining copy under the floor");
+  assert.equal(R.pickAlternate(payload).id, 1);
+});

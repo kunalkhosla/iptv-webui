@@ -4528,7 +4528,8 @@ function armStallWatch() {
   let lastT = -1, since = Date.now();
   _stallWatch = setInterval(() => {
     const v = el.video, p = state.playing;
-    if (!p || p.transcode || v.paused || v.ended || v.seeking) { since = Date.now(); lastT = v.currentTime; return; }
+    // _rescueBusy: a live rescue switch owns the player right now.
+    if (!p || p.transcode || v.paused || v.ended || v.seeking || _rescueBusy) { since = Date.now(); lastT = v.currentTime; return; }
     if (v.currentTime !== lastT) { lastT = v.currentTime; since = Date.now(); return; }
     if (v.readyState >= 3 /* HAVE_FUTURE_DATA */) { since = Date.now(); return; }
     if (Date.now() - since < STALL_MS) return;
@@ -4553,8 +4554,10 @@ function clearPlaybackExtras(p) {
 // One health session per live channel copy; on a struggle, switch to the
 // best-ranked copy of the same channel (always stop-then-tune: the account
 // allows one stream). Logic + numbers live in public/rescue-logic.js.
-const RESCUE_TEST = new URLSearchParams(location.search).has("rescueTest");
-const _rescueLimiter = KRescue.createLimiter();
+// rescue-logic.js missing (blocked / failed to load): rescue off, app runs.
+const RESCUE_ON = typeof window.KRescue === "object" && window.KRescue !== null;
+const RESCUE_TEST = RESCUE_ON && new URLSearchParams(location.search).has("rescueTest");
+const _rescueLimiter = RESCUE_ON ? KRescue.createLimiter() : null;
 let _liveSession = null;   // { s: KRescue session, item, lastT }
 let _rescueTicker = null;
 let _rescueBusy = false;
@@ -4566,14 +4569,27 @@ function liveChannelById(id) {
 
 // Called by play() for every request: starts a session, counts a re-play
 // of the same copy as a reconnect, and ends a live session for anything else.
-function liveSessionOnPlay(mode, item) {
+// A re-play that changes format or transcode (codec / stall fallback) is not a
+// reconnect: the new pipeline starts over (first frame, time to first frame).
+function liveSessionOnPlay(mode, item, prev, cur) {
+  if (!RESCUE_ON) return;
   if (_rescueUndo && (mode !== "live" || String(item.id) !== _rescueUndo.altId)) clearRescueUndo();
   if (mode !== "live" || state.castSession) { endLiveSession(); return; }
   const now = Date.now();
   if (_liveSession && _liveSession.s.id === String(item.id)) {
-    KRescue.onNotPlaying(_liveSession.s, now);
-    KRescue.onReconnect(_liveSession.s, now);
-    _liveSession.lastT = null;
+    const ls = _liveSession;
+    ls.item = item;
+    ls.lastT = null;
+    KRescue.onStallEnd(ls.s, now);
+    KRescue.onNotPlaying(ls.s, now);
+    const isFallback = !!prev && !!cur && prev.mode === "live" && String(prev.item.id) === String(item.id)
+      && (!!prev.transcode !== !!cur.transcode || prev.ext !== cur.ext);
+    if (isFallback) {
+      ls.s.firstFrameAt = null;
+      ls.s.playAt = now;
+    } else {
+      KRescue.onReconnect(ls.s, now);
+    }
     return;
   }
   endLiveSession();
@@ -4610,7 +4626,7 @@ el.video.addEventListener("timeupdate", () => {
 });
 el.video.addEventListener("playing", () => { if (_liveSession) KRescue.onPlaying(_liveSession.s, Date.now()); });
 el.video.addEventListener("waiting", () => {
-  if (_liveSession && !el.video.paused) KRescue.onStallStart(_liveSession.s, Date.now());
+  if (_liveSession && !el.video.paused && !el.video.seeking) KRescue.onStallStart(_liveSession.s, Date.now());
 });
 el.video.addEventListener("pause", () => {
   if (!_liveSession) return;
@@ -4642,25 +4658,42 @@ function stopLivePlayback(id) {
   return stopServerStreams({ mode: "live", id: String(id) });
 }
 
+// Still watching this live copy (not zapped, closed or casting)?
+function stillPlayingLive(id) {
+  return !!state.playing && state.playing.mode === "live" && !state.castSession
+    && String(state.playing.item.id) === String(id);
+}
+
 async function rescueSwitch(ls, reason) {
+  clearStallWatch();
   _rescueBusy = true;
   try {
     let data = null;
     try {
-      const r = await fetch(`/api/live/alternates/${encodeURIComponent(ls.s.id)}?reason=${reason}`);
+      const r = await fetch(`/api/live/alternates/${encodeURIComponent(ls.s.id)}?reason=${reason}`,
+        { signal: AbortSignal.timeout(5000) });
       if (r.ok) data = await r.json();
     } catch {}
     if (_liveSession !== ls || state.castSession) return;
-    const alt = KRescue.pickAlternate(data);
-    if (!alt) return;
     const now = Date.now();
+    const alt = KRescue.pickAlternate(data, (id) => _rescueLimiter.isExcluded(id, now));
+    if (!alt) return;
     if (!_rescueLimiter.canAutoSwitch(ls.s.id, now)) return;
-    _rescueLimiter.recordSwitch(now);
+    // Viewer zapped or closed while we asked: leave their choice alone.
+    if (!stillPlayingLive(ls.s.id)) return;
+    _rescueLimiter.recordSwitch(now, ls.s.id);
     const original = ls.item;
-    endLiveSession(reason);
-    await stopLivePlayback(original.id);
-    if (!state.playing || state.playing.item !== original) return; // viewer zapped or closed meanwhile
     const altItem = liveChannelById(alt.id) || { id: alt.id, name: alt.name || `Channel ${alt.id}` };
+    endLiveSession(reason);
+    if (RESCUE_TEST) {
+      // Test mode never touches a real stream: record what would be played.
+      window.__khouchRescueTest.switches.push({ from: String(original.id), to: String(altItem.id), reason });
+      testFakePlay(altItem);
+      showRescueUndo(original, altItem);
+      return;
+    }
+    await stopLivePlayback(original.id);
+    if (!stillPlayingLive(original.id)) return; // viewer zapped or closed meanwhile
     play("live", altItem);
     showRescueUndo(original, altItem);
   } finally {
@@ -4686,27 +4719,47 @@ async function undoRescue() {
   if (!u) return;
   clearRescueUndo();
   _rescueLimiter.recordUndo(u.original.id, Date.now());
+  if (!stillPlayingLive(u.altId)) return;
   endLiveSession();
+  if (RESCUE_TEST) {
+    window.__khouchRescueTest.undos.push({ from: u.altId, to: String(u.original.id) });
+    testFakePlay(u.original);
+    return;
+  }
   await stopLivePlayback(u.altId);
+  // Viewer zapped or closed during the stop: don't override them.
+  if (!stillPlayingLive(u.altId)) return;
   play("live", u.original);
 }
 el.rescueToastOk.addEventListener("click", (e) => { e.stopPropagation(); undoRescue(); });
 
 // ?rescueTest=1: feeds fake player events into the detector so the switch
-// path can be exercised without opening (or stalling) a real stream.
+// path can be exercised without opening (or stalling) a real stream. A rescue
+// switch or undo in this mode never calls play() or the stop endpoint; it is
+// recorded in __khouchRescueTest.switches / .undos and "plays" a fake session.
+function testFakePlay(item) {
+  endLiveSession();
+  // Detach any real player locally (no server call) so its retries can't
+  // reopen a stream under the fake session.
+  if (state.hls) { state.hls.destroy(); state.hls = null; }
+  clearStallWatch();
+  el.video.pause();
+  el.video.removeAttribute("src");
+  state.playing = { mode: "live", item, label: item.name, ext: "m3u8", transcode: false };
+  el.player.hidden = false;
+  setPlayerMode("mini");
+  el.playerTitle.textContent = item.name;
+  const now = Date.now();
+  _liveSession = { s: KRescue.createSession(item.id, now - 60_000), item, lastT: null };
+  KRescue.onFirstFrame(_liveSession.s, now - 58_000);
+  if (!_rescueTicker) _rescueTicker = setInterval(rescueTick, 1000);
+}
 if (RESCUE_TEST) {
   window.__khouchRescueTest = {
+    switches: [],
+    undos: [],
     fakePlay(id) {
-      const item = liveChannelById(id) || { id, name: `Channel ${id}` };
-      endLiveSession();
-      state.playing = { mode: "live", item, label: item.name, ext: "m3u8", transcode: false };
-      el.player.hidden = false;
-      setPlayerMode("mini");
-      el.playerTitle.textContent = item.name;
-      const now = Date.now();
-      _liveSession = { s: KRescue.createSession(item.id, now - 60_000), item, lastT: null };
-      KRescue.onFirstFrame(_liveSession.s, now - 58_000);
-      if (!_rescueTicker) _rescueTicker = setInterval(rescueTick, 1000);
+      testFakePlay(liveChannelById(id) || { id, name: `Channel ${id}` });
       return true;
     },
     stall(ms) {
@@ -4820,7 +4873,7 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
   // newer request's — that's what produced overlapping play/pause/load
   // calls and an uncaught AbortError. The newest click always wins.
   const myPlaying = state.playing;
-  liveSessionOnPlay(mode, item);
+  liveSessionOnPlay(mode, item, prevPlaying, state.playing);
   // Fire-and-forget — by the time the first second of video is
   // playing, this has almost certainly resolved. updateScrubBar
   // gracefully falls back to el.video.duration if it hasn't.
@@ -7883,7 +7936,11 @@ el.playerStillBack.addEventListener("click", (e) => { e.stopPropagation(); answe
 const MODIFIER_KEYS = new Set(["Shift", "Control", "Meta", "Alt", "AltGraph", "CapsLock", "Fn", "OS"]);
 document.addEventListener("keydown", (e) => {
   const inField = document.activeElement && /^(input|textarea|select)$/i.test(document.activeElement.tagName);
-  if (_rescueUndo && e.key === "Enter" && !inField && !e.metaKey && !e.ctrlKey && !e.altKey) {
+  // Enter = undo only when no other control has focus (the page, the player
+  // surface, or the toast itself).
+  const ae = document.activeElement;
+  const undoFocus = !ae || ae === document.body || ae === el.player || ae === el.video || el.rescueToast.contains(ae);
+  if (_rescueUndo && e.key === "Enter" && undoFocus && !e.metaKey && !e.ctrlKey && !e.altKey) {
     e.preventDefault();
     e.stopPropagation();
     undoRescue();

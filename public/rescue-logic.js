@@ -118,10 +118,13 @@
     };
   }
 
-  // Auto-switch budget (sliding window) + per-channel undo cooldown.
+  // Auto-switch budget (sliding window), per-channel undo cooldown, and the
+  // copies a switch just left (not offered again inside the switch window, so
+  // a struggling A -> B never bounces back B -> A).
   function createLimiter() {
     const switches = [];
     const cooldownUntil = new Map();
+    const leftUntil = new Map();
     return {
       canAutoSwitch(channelId, now) {
         const until = cooldownUntil.get(String(channelId));
@@ -132,17 +135,32 @@
         while (switches.length && now - switches[0] >= SWITCH_WINDOW_MS) switches.shift();
         return switches.length < MAX_AUTO_SWITCHES;
       },
-      recordSwitch(now) { switches.push(now); },
+      recordSwitch(now, fromId) {
+        switches.push(now);
+        if (fromId != null) leftUntil.set(String(fromId), now + SWITCH_WINDOW_MS);
+      },
+      isExcluded(channelId, now) {
+        const until = leftUntil.get(String(channelId));
+        if (until == null) return false;
+        if (now < until) return true;
+        leftUntil.delete(String(channelId));
+        return false;
+      },
       recordUndo(channelId, now) { cooldownUntil.set(String(channelId), now + UNDO_COOLDOWN_MS); },
     };
   }
 
-  // alternates[0] of a GET /api/live/alternates payload when it clears the floor.
-  function pickAlternate(payload) {
-    const alt = payload && Array.isArray(payload.alternates) ? payload.alternates[0] : null;
-    if (!alt || alt.id == null) return null;
-    const floor = Number.isFinite(payload.floor) ? payload.floor : 55;
-    return Number(alt.score) >= floor ? alt : null;
+  // The best-ranked alternate of a GET /api/live/alternates payload that clears
+  // the floor and isn't excluded (isExcluded(id) -> true skips it).
+  function pickAlternate(payload, isExcluded) {
+    const list = payload && Array.isArray(payload.alternates) ? payload.alternates : [];
+    const floor = Number.isFinite(payload && payload.floor) ? payload.floor : 55;
+    for (const alt of list) {
+      if (!alt || alt.id == null) continue;
+      if (isExcluded && isExcluded(alt.id)) continue;
+      if (Number(alt.score) >= floor) return alt;
+    }
+    return null;
   }
 
   const api = {

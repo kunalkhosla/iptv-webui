@@ -101,3 +101,19 @@ test("rankAlternates: excludes current, dead and below-floor copies; lighter pre
   assert.equal(out[0].quality, "HD");
   assert.ok(!out.some((a) => a.id === 1 || a.id === 4 || a.id === 5));
 });
+
+test("pruneHealth drops faded records and keeps live ones", () => {
+  const now = 1_790_000_000_000;
+  const store = {};
+  L.recordReport(store, "old", { watchedSec: 60, stalls: 0, stallSec: 0, reconnects: 0, ttffMs: 900, failed: false }, now - 200 * 24 * 3600e3, 3);
+  L.recordReport(store, "new", { watchedSec: 60, stalls: 0, stallSec: 0, reconnects: 0, ttffMs: 900, failed: false }, now - 3600e3, 3);
+  store.bad = { ts: now };
+  assert.equal(L.pruneHealth(store, now), 2);
+  assert.deepEqual(Object.keys(store), ["new"]);
+});
+
+test("buildGroups byKey keeps single copies", () => {
+  const g = L.buildGroups([{ id: 1, name: "IN: ZEE TV HD" }, { id: 2, name: "IN: ZEE TV" }, { id: 3, name: "UK: SKY ONE" }]);
+  assert.deepEqual(g.byKey.get(L.groupKeyOf({ name: "UK: SKY ONE" })), [3]);
+  assert.equal(g.groups.has(L.groupKeyOf({ name: "UK: SKY ONE" })), false);
+});

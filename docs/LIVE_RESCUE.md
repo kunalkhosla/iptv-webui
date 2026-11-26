@@ -68,11 +68,21 @@ the session counters, the struggle rules and the switch / undo limits;
 ended by `playing`) and from reconnects (a re-play of the same copy, or an
 in-place hls.js recovery of a fatal live error, at most 5 per session). The
 report goes out on zap, close, rescue and `pagehide` (`sendBeacon`). Casting and
-VOD never run it. Undo: the toast's OK button or Enter.
+VOD never run it. A re-play of the same copy that changes format or transcode
+(codec / stall fallback) is not a reconnect: the session's first-frame clock
+restarts instead. `waiting` during a seek is not a stall. The copy a switch
+left is not offered again for the 10-minute switch window (no A -> B -> A).
+Undo: the toast's OK button, or Enter while focus is on the page, the player
+or the toast (not another control); if the viewer zapped meanwhile, undo does
+nothing. If `rescue-logic.js` fails to load, the rescue is off and the app
+still runs.
 
 Test hook: open the page with `?rescueTest=1` to get
 `window.__khouchRescueTest` (`fakePlay(id)`, `stall(ms)`, `reconnect()`,
-`noFrame()`), which drives the detector without a real stream.
+`noFrame()`), which drives the detector with no real stream. In this mode a
+rescue switch or undo never calls `play()` or the stop endpoint: it is recorded
+in `__khouchRescueTest.switches` / `.undos` and continues on a fake session.
+The alternates query is the only request it makes (metadata, no stream).
 
 ## Catch-up flags
 

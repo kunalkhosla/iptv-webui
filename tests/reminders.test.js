@@ -64,3 +64,38 @@ test("notify text", () => {
   assert.equal(t.message, "Kunal: Show starts on ZEE TV in 2 min.");
   assert.equal(R.publicView(mk({}), NOW).starts_in_secs, 1800);
 });
+
+test("stop is clamped to start + 12 h (also on rematch)", () => {
+  const v = R.validateCreate({ stream_id: "1", title: "a", start_ts: NOW / 1000 + 600, stop_ts: NOW / 1000 + 600 + 48 * 3600 }, NOW);
+  assert.equal(v.stop, v.start + 12 * 3600e3);
+  const r = mk({});
+  const m = R.rematch(r, [{ title: "Show", start: r.start + 10 * M, stop: r.start + 10 * M + 30 * 3600e3 }]);
+  assert.equal(m.action, "move");
+  assert.equal(m.stop, m.start + 12 * 3600e3);
+});
+
+test("makeRoom: pending cap, total cap prunes oldest finished first", () => {
+  const pend = Array.from({ length: R.MAX_PER_PROFILE }, (_, i) => mk({ id: `p${i}` }));
+  assert.equal(R.makeRoom(pend, "p1"), null, "pending cap");
+  assert.equal(R.makeRoom(pend, "p2"), pend, "other profile unaffected");
+  const done = Array.from({ length: R.MAX_TOTAL_PER_PROFILE }, (_, i) => mk({ id: `d${i}`, status: "missed", start: NOW + i * M }));
+  const out = R.makeRoom(done, "p1");
+  assert.equal(out.length, R.MAX_TOTAL_PER_PROFILE - 1);
+  assert.ok(!out.some((r) => r.id === "d0"), "oldest dropped");
+  const few = [mk({ status: "fired" })];
+  assert.equal(R.makeRoom(few, "p1"), few);
+});
+
+test("haServiceFor: owner user's profiles on the owner account only", () => {
+  const owner = { id: "p1", nick: "Kunal", ownerUserId: "u1" };
+  const base = { reminder: mk({ owner: true }), profile: owner, ownerUserId: "u1", profilesMap: "kunal=mobile_app_k, Vir=mobile_app_v", fallback: "mobile_app_owner" };
+  assert.equal(R.haServiceFor(base), "mobile_app_k");
+  assert.equal(R.haServiceFor({ ...base, profilesMap: "" }), "mobile_app_owner", "owner profile falls back");
+  assert.equal(R.haServiceFor({ ...base, profilesMap: "p1=mobile_app_id" }), "mobile_app_id", "match on id");
+  assert.equal(R.haServiceFor({ ...base, profile: null }), null, "deleted profile never pushes");
+  // Another user's profile named like a mapped nick: no push, no fallback.
+  assert.equal(R.haServiceFor({ ...base, profile: { id: "p1", nick: "Kunal", ownerUserId: "u2" } }), null);
+  assert.equal(R.haServiceFor({ ...base, reminder: mk({ owner: false }) }), null, "non-owner account");
+  assert.equal(R.haServiceFor({ ...base, reminder: mk({ owner: true, profileId: "p9" }) }), null, "profile mismatch");
+  assert.equal(R.haServiceFor({ ...base, ownerUserId: null }), null);
+});
