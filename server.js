@@ -4680,7 +4680,7 @@ function streamingNowViewers60s() {
   return false;
 }
 function preemptDiskDownloadsForViewer(reason) {
-  diskDownloadLastViewerAt = Date.now();
+  if (reason !== "queue") diskDownloadLastViewerAt = Date.now(); // "queue" = a phone download, not a viewer
   let n = 0;
   for (const [k, v] of streams) {
     if (!diskDlSchedule.isDiskDownloadOwner(k) || v.displaced) continue;

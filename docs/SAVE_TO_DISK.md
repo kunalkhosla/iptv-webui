@@ -39,7 +39,8 @@ time and only while nobody is watching:
   sidecar, and is excluded from `GET /api/streams` `active` (listed with
   `background: true`; top-level `background` = their count).
 - **Other users of the connection.** A phone download (`/api/download`
-  prepare) takes the slot from a transfer the same way a viewer does. Catalog
+  prepare, owner panel account) also takes the slot from a transfer; the job
+  shows `waiting_for: "queue"` and resumes when that fetch ends. Catalog
   rebuilds, the provider xmltv fetch and the 4K quality prewarm also stop a
   running transfer and hold jobs off while they run (+90 s); the job shows
   `waiting_for: "queue"`. The surround crawler and detail prewarm still yield
