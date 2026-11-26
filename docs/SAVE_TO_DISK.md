@@ -41,7 +41,7 @@ time and only while nobody is watching:
 - **Other users of the connection.** A phone download (`/api/download`
   prepare) takes the slot from a transfer the same way a viewer does. Catalog
   rebuilds, the provider xmltv fetch and the 4K quality prewarm also stop a
-  running transfer and hold jobs off while they run (+30 s); the job shows
+  running transfer and hold jobs off while they run (+90 s); the job shows
   `waiting_for: "queue"`. The surround crawler and detail prewarm still yield
   to a transfer.
 

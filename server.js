@@ -3912,13 +3912,14 @@ async function fetchCategoriesResilient(mode, m, actx) {
 // each panel call, wait while any viewer is active (stream seen within the
 // idle grace and not displaced). `streams` is declared further down; only
 // read inside functions that run after startup.
-// viewersOnly: ignore Save-to-Disk / phone-download transfers.
+// viewersOnly: ignore Save-to-Disk transfers (a phone download still counts:
+// a person is waiting for it).
 function streamingNow(actx, { viewersOnly = false } = {}) {
   const now = Date.now();
   const key = actx ? accountKeyOf(actx) : null;
   for (const [owner, v] of streams) {
     if (v.displaced || now - v.lastSeen >= LIVE_IDLE_GRACE_MS) continue;
-    if (viewersOnly && diskDlSchedule.isBackgroundOwner(owner)) continue;
+    if (viewersOnly && diskDlSchedule.isDiskDownloadOwner(owner)) continue;
     if (key && v.accountKey !== key) continue; // the 1-connection cap is per panel account
     if (v.mode === "disk") continue; // local files never touch the panel
     return true;
@@ -3936,7 +3937,7 @@ async function yieldToViewers(label, actx) {
   if (paused) console.log(`[index] ${label}: resumed after ${Math.round((Date.now() - t0) / 1000)}s`);
   // Catalog / EPG refreshes outrank a Save-to-Disk transfer: claim the
   // provider connection (the job waits while the claim is fresh).
-  if (claimPanelFromDiskDownloads(label)) await new Promise((r) => setTimeout(r, 1500));
+  if ((!actx || isOwnerAccount(actx)) && claimPanelFromDiskDownloads(label)) await new Promise((r) => setTimeout(r, 1500));
 }
 
 async function buildIndex(mode, actx = currentAccount(), { noYield = false } = {}) {
@@ -4649,21 +4650,25 @@ function diskDownloadGate(selfOwner = null) {
 // waiting for the grace.
 // Background panel work (catalog rebuild, EPG) wants the connection: hold
 // jobs back for DISK_DOWNLOAD_PANEL_CLAIM_MS after the latest claim (each
-// rebuild step re-claims) and stop a running transfer. True if one stopped.
-const DISK_DOWNLOAD_PANEL_CLAIM_MS = 30_000;
+// rebuild step re-claims) and stop a running transfer. True while a transfer's
+// entry is still present (it is deleted once its connection has aborted), so
+// every concurrent caller waits for the close, not just the first.
+const DISK_DOWNLOAD_PANEL_CLAIM_MS = 90_000; // >= the longest single panel call (60 s list timeout)
 let diskDownloadPanelClaimAt = 0;
 let diskDownloadPanelBusy = 0; // a long provider request (xmltv) in flight
 function claimPanelFromDiskDownloads(label) {
   diskDownloadPanelClaimAt = Date.now();
-  let n = 0;
+  let n = 0, present = 0;
   for (const [k, v] of streams) {
-    if (!diskDlSchedule.isDiskDownloadOwner(k) || v.displaced) continue;
+    if (!diskDlSchedule.isDiskDownloadOwner(k)) continue;
+    present++;
+    if (v.displaced) continue;
     v.displaced = true;
     for (const kill of v.killers) { try { kill("queue"); } catch {} }
     n++;
   }
   if (n) console.log(`[disk-download] yielding to panel work (${label})`);
-  return n > 0;
+  return present > 0;
 }
 // Trailers come from YouTube, not the panel: only real viewers matter.
 function streamingNowViewers60s() {
@@ -5548,7 +5553,7 @@ async function runDownloadJob(job) {
     // waiting for it) takes the slot from it.
     const slotHeld = [...streams.entries()].some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced && !diskDlSchedule.isDiskDownloadOwner(k));
     if (slotHeld) { await waitForViewer(); continue; }
-    preemptDiskDownloadsForViewer("phone download");
+    if (accountKey === accountKeyOf(ownerAccount)) preemptDiskDownloadsForViewer("queue");
     const ac = new AbortController();
     const killer = () => ac.abort();
     const admission = admitStream(owner, mode, id, killer, accountKey);
