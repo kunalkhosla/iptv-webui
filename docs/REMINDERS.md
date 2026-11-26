@@ -49,3 +49,8 @@ Poll `GET /api/reminders` every 30 s in the foreground and on resume; show each
 `due` id once per client: "<title> starts on <channel> in N min" with OK (ack,
 then tune to `stream_id`) and Dismiss (ack). Guide programmes with a pending
 reminder show a bell; a "My reminders" list shows status and notes.
+
+Web: a bell on every future programme block in the TV Guide (filled when a
+pending or fired reminder covers it), a "Reminders" button in the guide toolbar
+for the list (status, note, delete), and banners in the top right. Kid profiles
+work the same way.

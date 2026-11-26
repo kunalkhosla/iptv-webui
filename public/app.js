@@ -323,6 +323,15 @@ const el = {
   refineClose: document.getElementById("refine-close"),
   refineCancel: document.getElementById("refine-cancel"),
   refineSave: document.getElementById("refine-save"),
+  remindersBtn: document.getElementById("guide-reminders-btn"),
+  remindersCount: document.getElementById("guide-reminders-count"),
+  remindersModal: document.getElementById("reminders-modal"),
+  remindersBody: document.getElementById("reminders-body"),
+  remindersClose: document.getElementById("reminders-close"),
+  reminderBanners: document.getElementById("reminder-banners"),
+  rescueToast: document.getElementById("rescue-toast"),
+  rescueToastText: document.getElementById("rescue-toast-text"),
+  rescueToastOk: document.getElementById("rescue-toast-ok"),
 };
 
 function ms() { return state.modes[state.mode]; }
@@ -2772,6 +2781,11 @@ function paintEpgIntoRow(streamId, programs) {
       const ch = flatStreams().find(c => String(c.id) === String(streamId));
       if (ch) play("live", ch);
     };
+    if (s > nowMs) {
+      const bell = reminderBell(streamId, p);
+      block.appendChild(bell);
+      syncBell(bell);
+    }
     track.appendChild(block);
   }
   // The track was just emptied + repopulated; re-stamp the now-line
@@ -2809,6 +2823,199 @@ function drawNowLine() {
     line.style.left = `${offset}px`;
     track.appendChild(line);
   }
+}
+
+// --- Programme reminders (docs/REMINDERS.md) ---------------------------
+// Stored per profile on the server. A due reminder shows a banner; only the
+// viewer's OK ever tunes the channel.
+let _reminders = { reminders: [], due: [] };
+const _reminderBannersShown = new Set();
+let _reminderPoll = null;
+const BELL_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22zm7-6V11a7 7 0 0 0-5.5-6.84V3.5a1.5 1.5 0 0 0-3 0v.66A7 7 0 0 0 5 11v5l-2 2v1h18v-1z"/></svg>';
+
+async function reminderApi(method, url, body) {
+  const r = await fetch(url, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) {
+    let msg = "";
+    try { msg = (await r.json()).error || ""; } catch {}
+    throw new Error(msg || `HTTP ${r.status}`);
+  }
+  return r.json();
+}
+
+function applyReminders(d) {
+  _reminders = { reminders: Array.isArray(d?.reminders) ? d.reminders : [], due: Array.isArray(d?.due) ? d.due : [] };
+  refreshGuideBells();
+  renderReminderBanners();
+  const pending = _reminders.reminders.filter(r => r.status === "pending").length;
+  el.remindersCount.hidden = !pending;
+  el.remindersCount.textContent = String(pending);
+  if (!el.remindersModal.hidden) renderRemindersList();
+}
+
+async function pollReminders() {
+  if (document.hidden) return;
+  try { applyReminders(await reminderApi("GET", "/api/reminders")); } catch {}
+}
+
+function startReminderPolling() {
+  clearInterval(_reminderPoll);
+  _reminderPoll = setInterval(pollReminders, 30_000);
+  pollReminders();
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden && _reminderPoll) pollReminders(); });
+
+// The reminder covering this guide programme: same channel and start, or the
+// same title inside the slot (the server snaps times to the bulk guide).
+function reminderFor(streamId, startTs, stopTs, title) {
+  return _reminders.reminders.find(r => String(r.stream_id) === String(streamId)
+    && (r.status === "pending" || r.status === "fired")
+    && (r.start_ts === startTs || (r.title === title && r.start_ts >= startTs && r.start_ts < stopTs))) || null;
+}
+
+function reminderBell(streamId, p) {
+  const bell = document.createElement("button");
+  bell.type = "button";
+  bell.className = "gp-bell";
+  bell.dataset.sid = String(streamId);
+  bell.dataset.start = String(p.start_ts);
+  bell.dataset.stop = String(p.stop_ts);
+  bell.dataset.title = (p.title || "").trim();
+  bell.innerHTML = BELL_SVG;
+  bell.onclick = (e) => { e.stopPropagation(); toggleReminder(bell); };
+  return bell;
+}
+
+function syncBell(bell) {
+  const r = reminderFor(bell.dataset.sid, Number(bell.dataset.start), Number(bell.dataset.stop), bell.dataset.title);
+  bell.classList.toggle("on", !!r);
+  bell.closest(".guide-program")?.classList.toggle("has-reminder", !!r);
+  bell.setAttribute("aria-pressed", r ? "true" : "false");
+  bell.title = r ? "Reminder set (click to cancel)" : "Remind me";
+  bell.setAttribute("aria-label", bell.title);
+}
+
+function refreshGuideBells() {
+  if (!el.guideRows) return;
+  for (const bell of el.guideRows.querySelectorAll(".gp-bell")) syncBell(bell);
+}
+
+async function toggleReminder(bell) {
+  if (bell.disabled) return;
+  const sid = bell.dataset.sid, title = bell.dataset.title;
+  const r = reminderFor(sid, Number(bell.dataset.start), Number(bell.dataset.stop), title);
+  bell.disabled = true;
+  try {
+    if (r) {
+      applyReminders(await reminderApi("DELETE", `/api/reminders/${encodeURIComponent(r.id)}`));
+      toast(`Reminder removed: ${r.title}`, 2500);
+    } else {
+      if (!title) { toast("This programme has no title to remind you about.", 3000); return; }
+      applyReminders(await reminderApi("POST", "/api/reminders", {
+        stream_id: Number(sid), title, start_ts: Number(bell.dataset.start), stop_ts: Number(bell.dataset.stop),
+      }));
+      toast(`Reminder set: ${title}`, 2500);
+    }
+  } catch (e) {
+    toast(`Couldn't update the reminder: ${e.message}`, 4000);
+  } finally {
+    bell.disabled = false;
+  }
+}
+
+function reminderWhen(r) {
+  const d = new Date(r.start_ts * 1000);
+  const sameDay = d.toDateString() === new Date().toDateString();
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return sameDay ? `Today ${time}` : `${d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })} ${time}`;
+}
+
+const REMINDER_STATUS = { pending: "Upcoming", fired: "Starting", missed: "Missed", dropped: "Cancelled" };
+
+function renderRemindersList() {
+  const list = _reminders.reminders;
+  el.remindersBody.innerHTML = "";
+  if (!list.length) {
+    const empty = document.createElement("p");
+    empty.className = "rem-empty";
+    empty.textContent = "No reminders. Use the bell on a future programme in the TV Guide.";
+    el.remindersBody.appendChild(empty);
+    return;
+  }
+  for (const r of list) {
+    const row = document.createElement("div");
+    row.className = `rem-row rem-${r.status}`;
+    const status = REMINDER_STATUS[r.status] || r.status;
+    row.innerHTML = `
+      <div class="rem-main">
+        <div class="rem-title">${escapeHtml(r.title)}</div>
+        <div class="rem-sub">${escapeHtml(r.channel || "")} · ${escapeHtml(reminderWhen(r))}</div>
+        <div class="rem-status">${escapeHtml(status)}${r.note ? ` · ${escapeHtml(r.note)}` : ""}</div>
+      </div>
+      <button type="button" class="rem-delete">Delete</button>
+    `;
+    row.querySelector(".rem-delete").onclick = async (e) => {
+      e.target.disabled = true;
+      try { applyReminders(await reminderApi("DELETE", `/api/reminders/${encodeURIComponent(r.id)}`)); }
+      catch (err) { e.target.disabled = false; toast(`Couldn't delete: ${err.message}`, 3500); }
+    };
+    el.remindersBody.appendChild(row);
+  }
+}
+
+function openRemindersModal() {
+  renderRemindersList();
+  el.remindersModal.hidden = false;
+  pollReminders();
+}
+function closeRemindersModal() { el.remindersModal.hidden = true; }
+el.remindersBtn.addEventListener("click", openRemindersModal);
+el.remindersClose.addEventListener("click", closeRemindersModal);
+el.remindersModal.addEventListener("click", (e) => { if (e.target === el.remindersModal) closeRemindersModal(); });
+
+function reminderBannerText(r) {
+  const secs = Number(r.starts_in_secs);
+  const when = !Number.isFinite(secs) || secs <= 0 ? "now" : `in ${Math.max(1, Math.round(secs / 60))} min`;
+  return `${r.title} starts on ${r.channel} ${when}`;
+}
+
+function renderReminderBanners() {
+  const dueIds = new Set(_reminders.due.map(r => r.id));
+  for (const b of el.reminderBanners.querySelectorAll(".rem-banner")) {
+    if (!dueIds.has(b.dataset.id)) b.remove();
+  }
+  for (const r of _reminders.due) {
+    const existing = el.reminderBanners.querySelector(`.rem-banner[data-id="${CSS.escape(r.id)}"]`);
+    if (existing) { existing.querySelector(".rem-banner-text").textContent = reminderBannerText(r); continue; }
+    if (_reminderBannersShown.has(r.id)) continue;
+    _reminderBannersShown.add(r.id);
+    const b = document.createElement("div");
+    b.className = "rem-banner";
+    b.dataset.id = r.id;
+    b.setAttribute("role", "alert");
+    b.innerHTML = `
+      <span class="rem-banner-icon">${BELL_SVG}</span>
+      <span class="rem-banner-text"></span>
+      <button type="button" class="rem-banner-ok">OK</button>
+      <button type="button" class="rem-banner-dismiss">Dismiss</button>
+    `;
+    b.querySelector(".rem-banner-text").textContent = reminderBannerText(r);
+    b.querySelector(".rem-banner-ok").onclick = () => answerReminder(r, b, true);
+    b.querySelector(".rem-banner-dismiss").onclick = () => answerReminder(r, b, false);
+    el.reminderBanners.appendChild(b);
+  }
+}
+
+async function answerReminder(r, banner, tune) {
+  banner.remove();
+  try { applyReminders(await reminderApi("POST", `/api/reminders/${encodeURIComponent(r.id)}/ack`)); } catch {}
+  if (!tune) return;
+  const ch = liveChannelById(r.stream_id) || await fetchSingleItem("live", r.stream_id) || { id: r.stream_id, name: r.channel };
+  play("live", ch);
 }
 
 // --- Live remote (channel zapper) --------------------------------------
@@ -4342,6 +4549,195 @@ function clearPlaybackExtras(p) {
   refreshSkipButton(null);
 }
 
+// --- Live buffering rescue (docs/LIVE_RESCUE.md) -------------------------
+// One health session per live channel copy; on a struggle, switch to the
+// best-ranked copy of the same channel (always stop-then-tune: the account
+// allows one stream). Logic + numbers live in public/rescue-logic.js.
+const RESCUE_TEST = new URLSearchParams(location.search).has("rescueTest");
+const _rescueLimiter = KRescue.createLimiter();
+let _liveSession = null;   // { s: KRescue session, item, lastT }
+let _rescueTicker = null;
+let _rescueBusy = false;
+let _rescueUndo = null;    // { original, altId, timer }
+
+function liveChannelById(id) {
+  return flatStreams().find(c => String(c.id) === String(id)) || null;
+}
+
+// Called by play() for every request: starts a session, counts a re-play
+// of the same copy as a reconnect, and ends a live session for anything else.
+function liveSessionOnPlay(mode, item) {
+  if (_rescueUndo && (mode !== "live" || String(item.id) !== _rescueUndo.altId)) clearRescueUndo();
+  if (mode !== "live" || state.castSession) { endLiveSession(); return; }
+  const now = Date.now();
+  if (_liveSession && _liveSession.s.id === String(item.id)) {
+    KRescue.onNotPlaying(_liveSession.s, now);
+    KRescue.onReconnect(_liveSession.s, now);
+    _liveSession.lastT = null;
+    return;
+  }
+  endLiveSession();
+  _liveSession = { s: KRescue.createSession(item.id, now), item, lastT: null };
+  if (!_rescueTicker) _rescueTicker = setInterval(rescueTick, 1000);
+}
+
+function endLiveSession(reason, error, beacon) {
+  const ls = _liveSession;
+  if (!ls) return;
+  _liveSession = null;
+  if (_rescueTicker) { clearInterval(_rescueTicker); _rescueTicker = null; }
+  const now = Date.now();
+  KRescue.onNotPlaying(ls.s, now);
+  const report = KRescue.buildReport(ls.s, now, reason, error);
+  if (report) postLiveHealth(ls.s.id, report, beacon);
+}
+
+function postLiveHealth(id, report, beacon) {
+  const url = `/api/live/health/${encodeURIComponent(id)}`;
+  const body = JSON.stringify(report);
+  if (beacon && navigator.sendBeacon) {
+    try { if (navigator.sendBeacon(url, new Blob([body], { type: "application/json" }))) return; } catch {}
+  }
+  fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true }).catch(() => {});
+}
+
+el.video.addEventListener("timeupdate", () => {
+  const ls = _liveSession;
+  if (!ls || ls.s.firstFrameAt != null) return;
+  const t = el.video.currentTime;
+  if (ls.lastT != null && t > ls.lastT && !el.video.paused) KRescue.onFirstFrame(ls.s, Date.now());
+  ls.lastT = t;
+});
+el.video.addEventListener("playing", () => { if (_liveSession) KRescue.onPlaying(_liveSession.s, Date.now()); });
+el.video.addEventListener("waiting", () => {
+  if (_liveSession && !el.video.paused) KRescue.onStallStart(_liveSession.s, Date.now());
+});
+el.video.addEventListener("pause", () => {
+  if (!_liveSession) return;
+  KRescue.onStallEnd(_liveSession.s, Date.now());
+  KRescue.onNotPlaying(_liveSession.s, Date.now());
+});
+window.addEventListener("pagehide", () => endLiveSession(null, false, true));
+
+function rescueTick() {
+  const ls = _liveSession;
+  if (!ls || _rescueBusy || state.castSession) return;
+  if (!state.playing || state.playing.mode !== "live" || String(state.playing.item.id) !== ls.s.id) return;
+  const now = Date.now();
+  const reason = KRescue.struggleReason(ls.s, now);
+  if (!reason || !KRescue.mayQuery(ls.s, now) || !_rescueLimiter.canAutoSwitch(ls.s.id, now)) return;
+  ls.s.lastQueryAt = now;
+  rescueSwitch(ls, reason);
+}
+
+// Full local + server stop of the current live copy, before anything new is
+// opened (one-stream cap).
+function stopLivePlayback(id) {
+  if (state.hls) { state.hls.destroy(); state.hls = null; }
+  clearTimeout(state._noAudioTimer);
+  state._noAudioTimer = null;
+  el.video.pause();
+  el.video.removeAttribute("src");
+  el.video.load();
+  return stopServerStreams({ mode: "live", id: String(id) });
+}
+
+async function rescueSwitch(ls, reason) {
+  _rescueBusy = true;
+  try {
+    let data = null;
+    try {
+      const r = await fetch(`/api/live/alternates/${encodeURIComponent(ls.s.id)}?reason=${reason}`);
+      if (r.ok) data = await r.json();
+    } catch {}
+    if (_liveSession !== ls || state.castSession) return;
+    const alt = KRescue.pickAlternate(data);
+    if (!alt) return;
+    const now = Date.now();
+    if (!_rescueLimiter.canAutoSwitch(ls.s.id, now)) return;
+    _rescueLimiter.recordSwitch(now);
+    const original = ls.item;
+    endLiveSession(reason);
+    await stopLivePlayback(original.id);
+    if (!state.playing || state.playing.item !== original) return; // viewer zapped or closed meanwhile
+    const altItem = liveChannelById(alt.id) || { id: alt.id, name: alt.name || `Channel ${alt.id}` };
+    play("live", altItem);
+    showRescueUndo(original, altItem);
+  } finally {
+    _rescueBusy = false;
+  }
+}
+
+function showRescueUndo(original, altItem) {
+  clearRescueUndo();
+  el.rescueToastText.textContent = `Switched to ${altItem.name} (OK to undo, 10 s)`;
+  el.rescueToast.hidden = false;
+  _rescueUndo = { original, altId: String(altItem.id), timer: setTimeout(clearRescueUndo, KRescue.UNDO_WINDOW_MS) };
+}
+
+function clearRescueUndo() {
+  if (_rescueUndo) clearTimeout(_rescueUndo.timer);
+  _rescueUndo = null;
+  el.rescueToast.hidden = true;
+}
+
+async function undoRescue() {
+  const u = _rescueUndo;
+  if (!u) return;
+  clearRescueUndo();
+  _rescueLimiter.recordUndo(u.original.id, Date.now());
+  endLiveSession();
+  await stopLivePlayback(u.altId);
+  play("live", u.original);
+}
+el.rescueToastOk.addEventListener("click", (e) => { e.stopPropagation(); undoRescue(); });
+
+// ?rescueTest=1: feeds fake player events into the detector so the switch
+// path can be exercised without opening (or stalling) a real stream.
+if (RESCUE_TEST) {
+  window.__khouchRescueTest = {
+    fakePlay(id) {
+      const item = liveChannelById(id) || { id, name: `Channel ${id}` };
+      endLiveSession();
+      state.playing = { mode: "live", item, label: item.name, ext: "m3u8", transcode: false };
+      el.player.hidden = false;
+      setPlayerMode("mini");
+      el.playerTitle.textContent = item.name;
+      const now = Date.now();
+      _liveSession = { s: KRescue.createSession(item.id, now - 60_000), item, lastT: null };
+      KRescue.onFirstFrame(_liveSession.s, now - 58_000);
+      if (!_rescueTicker) _rescueTicker = setInterval(rescueTick, 1000);
+      return true;
+    },
+    stall(ms) {
+      const ls = _liveSession;
+      if (!ls) return false;
+      const now = Date.now();
+      KRescue.onStallStart(ls.s, now - ms);
+      if (ms < KRescue.LONG_STALL_MS) KRescue.onPlaying(ls.s, now);
+      rescueTick();
+      return true;
+    },
+    reconnect() {
+      if (!_liveSession) return false;
+      KRescue.onReconnect(_liveSession.s, Date.now());
+      rescueTick();
+      return true;
+    },
+    noFrame() {
+      const ls = _liveSession;
+      if (!ls) return false;
+      ls.s.firstFrameAt = null;
+      ls.s.playingSince = null;
+      ls.s.playAt = Date.now() - KRescue.NO_FRAME_MS;
+      rescueTick();
+      return true;
+    },
+    session() { return _liveSession ? { id: _liveSession.s.id, stalls: _liveSession.s.stalls, reconnects: _liveSession.s.reconnectsAt.length } : null; },
+    undoVisible() { return !!_rescueUndo; },
+  };
+}
+
 async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTrack) {
   saveScroll();
   clearStallWatch();
@@ -4424,6 +4820,7 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
   // newer request's — that's what produced overlapping play/pause/load
   // calls and an uncaught AbortError. The newest click always wins.
   const myPlaying = state.playing;
+  liveSessionOnPlay(mode, item);
   // Fire-and-forget — by the time the first second of video is
   // playing, this has almost certainly resolved. updateScrubBar
   // gracefully falls back to el.video.duration if it hasn't.
@@ -4509,6 +4906,7 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
     // toast, no console message a user would ever see, spinner stuck
     // forever. Surface it and put the UI back in a clean state.
     if (el.spinner) el.spinner.hidden = true;
+    if (mode === "live" && state.playing === myPlaying) endLiveSession(null, true);
     toast(
       e && e.channelUnavailable
         ? (e.userMessage || "This channel isn't available right now.")
@@ -4702,6 +5100,14 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
           _manifestRetries.delete(id);
           toast(cur && cur.mode === "live" ? "Channel offline or unreachable." : "This title is unavailable right now.", 4000);
         }
+      } else if (state.hls === hls && state.playing && state.playing.mode === "live" && _liveSession
+          && _liveSession.s.id === String(state.playing.item.id) && _liveSession.s.reconnectsAt.length < 5
+          && (data.type === Hls.ErrorTypes.NETWORK_ERROR || data.type === Hls.ErrorTypes.MEDIA_ERROR)) {
+        // Live: recover in place on the same copy; repeated recoveries are
+        // what the rescue's reconnect rule watches.
+        KRescue.onReconnect(_liveSession.s, Date.now());
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+        else hls.startLoad();
       } else {
         toast(`Stream error: ${data.details}`, 4000);
       }
@@ -4994,6 +5400,7 @@ function tryAlternateFormat() {
 
 function closePlayer() {
   if (_stillResolve) _stillResolve(false);
+  endLiveSession();
   clearPlaybackExtras(state.playing);
   hideUpNext();
   sendProgress();
@@ -6375,6 +6782,7 @@ function initCast() {
         toast(`Cast connected: ${device}`, 2500);
         // Stop local playback so the laptop isn't playing the same stream
         // alongside the cast device.
+        endLiveSession();
         el.video.pause();
         if (state.hls) { state.hls.destroy(); state.hls = null; }
         el.video.removeAttribute("src");
@@ -7475,6 +7883,12 @@ el.playerStillBack.addEventListener("click", (e) => { e.stopPropagation(); answe
 const MODIFIER_KEYS = new Set(["Shift", "Control", "Meta", "Alt", "AltGraph", "CapsLock", "Fn", "OS"]);
 document.addEventListener("keydown", (e) => {
   const inField = document.activeElement && /^(input|textarea|select)$/i.test(document.activeElement.tagName);
+  if (_rescueUndo && e.key === "Enter" && !inField && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    e.preventDefault();
+    e.stopPropagation();
+    undoRescue();
+    return;
+  }
   if (_stillResolve) {
     // Modifiers / shortcuts (Cmd-Tab, Ctrl-C, ...) and typing in a field are not an answer.
     if (inField || MODIFIER_KEYS.has(e.key) || e.metaKey || e.ctrlKey || e.altKey) return;
@@ -8199,6 +8613,7 @@ document.addEventListener("keydown", (e) => {
     el.search.select();
   } else if (e.key === "Escape") {
     if (!el.refineModal.hidden) closeRefineModal();
+    else if (!el.remindersModal.hidden) closeRemindersModal();
     else if (!el.filterModal.hidden && !el.filterClose.hidden) closeFilterModal();
     else if (!el.liveRemote.hidden) closeLiveRemote();
     else if (document.activeElement === el.search) {
@@ -8232,4 +8647,7 @@ if (location.hash.startsWith("#/")) {
 }
 
 initCast();
-bootstrap().then(() => { if (location.pathname.length > 1) applyPath(); });
+bootstrap().then(() => {
+  if (location.pathname.length > 1) applyPath();
+  startReminderPolling();
+});

@@ -18,6 +18,7 @@
 <script defer src="https://cdn.jsdelivr.net/npm/hls.js@1.5.18/dist/hls.min.js"></script>
 <script defer src="/theatre-portraits.js"></script>
 <script defer src="/nf-helpers.js"></script>
+<script defer src="/rescue-logic.js"></script>
 <script defer src="/app.js"></script>
 </head>
 <body>
@@ -182,6 +183,7 @@
       <div class="guide-toolbar">
         <h2>TV Guide</h2>
         <span class="guide-meta" id="guide-meta"></span>
+        <button id="guide-reminders-btn" type="button" title="My reminders">Reminders<span id="guide-reminders-count" class="rem-count" hidden></span></button>
         <button id="guide-top-btn" type="button" title="Scroll to top">↑ Top</button>
       </div>
       <div class="guide-tabs" id="guide-tabs" role="tablist"></div>
@@ -466,8 +468,24 @@
   </div>
 </div>
 
+<div id="reminders-modal" hidden>
+  <div class="filter-card">
+    <div class="filter-head">
+      <h2>My reminders</h2>
+      <p>Programmes you asked to be reminded about. Two minutes before start you get a banner here (and a phone notification if set up). Nothing starts playing until you press OK.</p>
+      <button id="reminders-close" aria-label="Close">✕</button>
+    </div>
+    <div id="reminders-body"></div>
+  </div>
+</div>
+
 <div id="scrim"></div>
 <div id="toast" hidden></div>
+<div id="rescue-toast" role="status" hidden>
+  <span id="rescue-toast-text"></span>
+  <button id="rescue-toast-ok" type="button">OK</button>
+</div>
+<div id="reminder-banners" aria-live="polite"></div>
 <button id="live-remote-toggle" class="lr-toggle" type="button" hidden aria-label="Open channel remote">📺</button>
 <div id="live-remote" hidden></div>
 </body>

@@ -59,6 +59,21 @@ Logs: `[rescue] health ...`, `[rescue] alternates ...` (with `reason`).
   undo, 10 s)". OK within 10 s goes back to the original copy and turns
   automatic switching off for that channel for 10 minutes.
 
+### Web
+
+`public/rescue-logic.js` (pure, tested in `tests/rescue-logic.test.js`) holds
+the session counters, the struggle rules and the switch / undo limits;
+`public/app.js` feeds it from the `<video>` element (first frame = first
+`timeupdate` with `currentTime` advancing; `waiting` while not paused = stall,
+ended by `playing`) and from reconnects (a re-play of the same copy, or an
+in-place hls.js recovery of a fatal live error, at most 5 per session). The
+report goes out on zap, close, rescue and `pagehide` (`sendBeacon`). Casting and
+VOD never run it. Undo: the toast's OK button or Enter.
+
+Test hook: open the page with `?rescueTest=1` to get
+`window.__khouchRescueTest` (`fakePlay(id)`, `stall(ms)`, `reconnect()`,
+`noFrame()`), which drives the detector without a real stream.
+
 ## Catch-up flags
 
 Live index streams carry `tv_archive` and `tv_archive_duration` (0 on this

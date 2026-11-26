@@ -3519,3 +3519,178 @@ body.filter-open #scrim { opacity: 1; pointer-events: auto; }
   #player-upnext:not(.credits) #player-upnext-play { margin-left: auto; }
   #player-still h2 { font-size: 32px; }
 }
+
+/* Programme reminders: guide bell, toolbar button, list modal, due banners. */
+.guide-program .gp-bell {
+  position: absolute;
+  top: 4px; right: 4px;
+  width: 22px; height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--fg-dim);
+  display: grid; place-items: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, color 0.12s, background 0.12s;
+}
+.guide-program .gp-bell svg { width: 14px; height: 14px; fill: currentColor; }
+.guide-program:hover .gp-bell,
+.guide-program .gp-bell:focus-visible { opacity: 1; }
+.guide-program .gp-bell:hover { color: var(--fg); background: var(--bg-2); }
+.guide-program .gp-bell.on { opacity: 1; color: var(--accent); }
+.guide-program.has-reminder { border-color: rgba(var(--accent-rgb), 0.55); }
+.guide-program.has-reminder .gp-title { padding-right: 20px; }
+
+#guide-reminders-btn {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 14px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+#guide-reminders-btn:hover { color: var(--accent); border-color: var(--accent); }
+.rem-count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10.5px;
+  line-height: 18px;
+  text-align: center;
+  box-sizing: border-box;
+}
+
+#reminders-modal {
+  position: fixed; inset: 0;
+  z-index: 30;
+  display: grid; place-items: center;
+  padding: 20px;
+}
+#reminders-modal[hidden] { display: none; }
+#reminders-modal::before {
+  content: "";
+  position: absolute; inset: 0;
+  background: rgba(0,0,0,0.65);
+  pointer-events: none;
+}
+#reminders-close {
+  position: absolute;
+  top: 14px; right: 14px;
+  width: 30px; height: 30px;
+  border-radius: 50%;
+  font-size: 14px;
+  display: grid; place-items: center;
+  padding: 0;
+}
+#reminders-body {
+  overflow-y: auto;
+  padding: 8px 0;
+}
+.rem-empty {
+  margin: 0;
+  padding: 24px 22px;
+  color: var(--fg-dim);
+  font-size: 13px;
+}
+.rem-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 22px;
+  border-bottom: 1px solid var(--line);
+}
+.rem-row:last-child { border-bottom: 0; }
+.rem-main { flex: 1; min-width: 0; }
+.rem-title {
+  font-weight: 600;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rem-sub, .rem-status {
+  font-size: 12px;
+  color: var(--fg-dim);
+  margin-top: 2px;
+}
+.rem-pending .rem-status { color: var(--accent); }
+.rem-missed .rem-status,
+.rem-dropped .rem-status { color: var(--danger); }
+.rem-delete {
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 14px;
+  font-size: 12px;
+}
+.rem-delete:hover { color: var(--danger); border-color: var(--danger); }
+
+#reminder-banners {
+  position: fixed;
+  top: calc(var(--header-h) + 12px);
+  right: 16px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(440px, calc(100vw - 32px));
+}
+.rem-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--bg-3);
+  border: 1px solid rgba(var(--accent-rgb), 0.6);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  font-size: 13.5px;
+}
+.rem-banner-icon { display: grid; place-items: center; color: var(--accent); flex-shrink: 0; }
+.rem-banner-icon svg { width: 18px; height: 18px; fill: currentColor; }
+.rem-banner-text { flex: 1; min-width: 0; }
+.rem-banner button {
+  flex-shrink: 0;
+  height: 30px;
+  padding: 0 14px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.rem-banner .rem-banner-ok { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* Live rescue: "Switched to <copy> (OK to undo, 10 s)". */
+#rescue-toast {
+  position: fixed;
+  bottom: 64px; left: 50%;
+  transform: translateX(-50%);
+  z-index: 45;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  padding: 8px 8px 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  box-shadow: var(--shadow);
+  max-width: calc(100vw - 32px);
+}
+#rescue-toast[hidden] { display: none; }
+#rescue-toast-ok {
+  height: 28px;
+  padding: 0 14px;
+  border-radius: 6px;
+  font-weight: 600;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
