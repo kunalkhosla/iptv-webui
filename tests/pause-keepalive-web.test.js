@@ -97,6 +97,8 @@ test("server refusal ends it: kept:false, 410, 400", async () => {
     [{ status: 200, body: { ok: true, kept: false, reason: "cap" } }, "cap"],
     [{ status: 410, body: {} }, "displaced"],
     [{ status: 400, body: {} }, "rejected"],
+    [{ status: 401, body: {} }, "rejected"],
+    [{ status: 404, body: {} }, "rejected"],
   ]) {
     const h = harness(() => r);
     h.ka.paused("movie", 1);
@@ -163,6 +165,7 @@ test("app.js wiring: pause/play/close/cast/visibility and script order", () => {
   assert.match(HTML, /<script defer src="\/pause-keepalive\.js"><\/script>/);
   assert.ok(HTML.indexOf("/pause-keepalive.js") < HTML.indexOf("/app.js"));
   assert.match(APP, /KPauseKeepalive\.create\(/);
+  assert.match(APP, /typeof KPauseKeepalive === "undefined"/);
   assert.match(APP, /"\/api\/stream\/heartbeat"/);
   assert.match(APP, /function closePlayer\(\) \{\n  _pauseKA\.stop\("close"\);/);
   assert.match(APP, /state\.castSession = ctx\.getCurrentSession\(\);\n\s+_pauseKA\.stop\("cast"\);/);

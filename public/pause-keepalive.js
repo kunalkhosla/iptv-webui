@@ -45,7 +45,8 @@
           const body = (r && r.body) || {};
           if (status === 410) { stop("displaced"); return; }
           if (status === 200 && body.kept === false) { stop(body.reason || "not-kept"); return; }
-          if (status === 400) { stop("rejected"); }
+          // 400 bad body; 401/403 signed out; 404/405 a server without the endpoint.
+          if (status === 400 || status === 401 || status === 403 || status === 404 || status === 405) { stop("rejected"); }
         }, () => { /* network blip: keep trying on the next interval */ });
       if (myGen === gen && target) {
         const left = maxMs - (deps.now() - pausedAt);

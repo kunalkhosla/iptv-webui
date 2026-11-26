@@ -7611,7 +7611,11 @@ el.video.addEventListener("pause", () => { elPlayPause.textContent = "▶"; keep
 // frees the session after ~3 min and the resume fails. Heartbeats only while
 // paused locally (never live, never while casting), up to 60 min; stops on
 // play, close, tab hidden, cast handoff and end of title.
-const _pauseKA = KPauseKeepalive.create({
+// A missing pause-keepalive.js (stale cache mid-deploy) must not take the rest
+// of app.js down with it: fall back to a no-op.
+const _pauseKA = typeof KPauseKeepalive === "undefined"
+  ? { paused() {}, stop() {}, resumeAfterBackground() {}, pausedAt: null }
+  : KPauseKeepalive.create({
   post: (t) => fetch("/api/stream/heartbeat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -7648,7 +7652,11 @@ document.addEventListener("visibilitychange", () => {
   const at = _pauseKABackgroundedAt;
   _pauseKABackgroundedAt = null;
   const t = pauseKeepaliveTarget();
-  if (t && at != null) _pauseKA.resumeAfterBackground(t.mode, t.id, at);
+  if (!t) return;
+  // Same pause: continue inside its budget. Paused while hidden (media key,
+  // PiP): a fresh pause starts now.
+  if (at != null) _pauseKA.resumeAfterBackground(t.mode, t.id, at);
+  else _pauseKA.paused(t.mode, t.id);
 });
 
 // Loading spinner driver. `playing` fires when frames actually start

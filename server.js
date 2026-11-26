@@ -5040,7 +5040,7 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/seg_:n.ts", (req, res)
   const diskSel = diskSelFromQuery(req.params.mode, req.query);
   const t = transcoders.get(transcoderKey(req.params.mode, req.params.id, quality, offsetSecs, audio, diskSel, audioTrack));
   if (!t) return res.status(404).end();
-  t.lastAccess = Date.now();
+  t.lastAccess = t.mediaAccess = Date.now();
   noteOwner(t, owner);
   const segPath = path.join(t.dir, `seg_${req.params.n}.ts`);
   if (!fs.existsSync(segPath)) return res.status(404).end();
@@ -13965,7 +13965,7 @@ async function startOrTouchTranscoder(mode, id, quality, offsetSecs = 0, audio =
     // respawning: an ffmpeg is being replaced under this same key — treat the
     // entry as live so a manifest poll mid-respawn doesn't race a second spawn
     // into the dir.
-    existing.lastAccess = Date.now();
+    existing.lastAccess = existing.mediaAccess = Date.now();
     return existing;
   }
   // Single-flight: if a spawn for this key is already underway, await
@@ -14279,7 +14279,9 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
   // Reuse the entry across respawns so lastAccess, restart history, and the
   // transcoders-map slot survive an ffmpeg replacement.
   const entry = respawn ? respawn.entry : {
-    proc: ffmpeg, key, lastAccess: Date.now(), dir, sourceUrl, mode, id, quality,
+    // mediaAccess: last manifest/segment request (a pause heartbeat bumps
+    // lastAccess only, and only on the transcoder with the newest mediaAccess).
+    proc: ffmpeg, key, lastAccess: Date.now(), mediaAccess: Date.now(), dir, sourceUrl, mode, id, quality,
     audio, preset, offsetSecs, diskSel, restarts: [], stopping: false, respawning: false,
     discontinuities: new Set(),
     // Media sidecar (trick-play / markers) reads this transcode's segments;
@@ -14430,6 +14432,9 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
       const end = vodReachedEnd({
         offsetSecs, elapsedSecs: playlistElapsedSecs(dir),
         durationSecs: panelDurationSecsCached(mode, id), runtimeMin: knownRuntimeMin,
+        // Stream copy seeks to the keyframe before each respawn's -ss, so the
+        // appended playlist overstates the position (vod-end.js).
+        copySeeks: preset?.copy ? (entry.respawnCount || 0) + (offsetSecs > 0 ? 1 : 0) : 0,
       });
       if (end.done) {
         const via = end.by === "duration" ? "panel duration" : `known runtime (${knownRuntimeMin}min)`;
@@ -14553,6 +14558,7 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
       return;
     }
     entry.restarts.push(now);
+    entry.respawnCount = (entry.respawnCount || 0) + 1; // lifetime (restarts is windowed)
     if (slotHeldRetry) entry.slotRetries = (entry.slotRetries || 0) + 1;
     entry.respawning = true;
     const nextStart = liveSegStats(dir).nextNumber;

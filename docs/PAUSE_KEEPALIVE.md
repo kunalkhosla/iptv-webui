@@ -22,9 +22,17 @@ Server (`lib/pause-keepalive.js`):
   to the caller: the caller's own owner key (web: session cookie), or an
   `ip:` owner from the caller's IP (Android players fetch media without
   cookies, so their owner is `ip:<ip>:<player UA hash>`).
-- Bumps the entry's `lastSeen` and `lastAccess` on that title's transcoders
-  whose owners include the matched owner. Never creates a session, never
-  spawns ffmpeg, never touches the upstream.
+- Bumps the entry's `lastSeen` and the current transcoder's `lastAccess`.
+  Never creates a session, never spawns ffmpeg, makes no upstream request
+  itself.
+- Refreshes only the transcoder the player was actually reading (newest
+  manifest/segment access); older variants of the title (a previous seek
+  anchor, quality or audio track) keep aging out.
+- The caller's cookie-owned session wins; `ip:` owners from the caller's IP are
+  matched only when the caller has no session of its own for that title.
+- A kept transcode whose ffmpeg was still encoding ahead keeps doing so (it
+  already held the household slot); a provider drop during the pause
+  self-heals exactly as during playback (one connection replaces the dead one).
 - Bounded: ignored once the session has had no real media request for
   `PAUSE_KEEPALIVE_MAX_MS` (default 65 min; the clients' own cap is 60 min).
 
@@ -46,7 +54,12 @@ Same rules on web (`public/pause-keepalive.js`), phone and TV
   `ON_STOP`, web tab hidden) and cast hand-off.
 - Foregrounded again while still paused: continue inside the original pause's
   60-min budget.
-- Network errors: keep trying on the next interval.
+- Paused while backgrounded / hidden (focus loss, media key, notification):
+  coming back while still paused starts a fresh keep-alive.
+- Network errors: keep trying on the next interval. 401/403/404/405 stop it
+  (signed out, or a server without the endpoint).
+- Web treats a hidden tab as backgrounded (owner rule: background stops the
+  keep-alive), so a paused tab left hidden for > 3 min is reaped as before.
 
 Test-only overrides: server `PAUSE_KEEPALIVE_MAX_MS`; web
 `window.__khouchPauseKeepaliveMaxMs` / `__khouchPauseKeepaliveIntervalMs`

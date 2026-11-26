@@ -61,8 +61,31 @@ test("heartbeat keeps the caller's paused session and its transcoders", () => {
   assert.equal(entry.lastSeen, now);
   assert.equal(entry.mediaSeen, 0, "heartbeat never counts as media");
   assert.equal(t.lastAccess, now);
+  assert.equal(r.body.transcoders, 1);
   assert.equal(other.lastAccess, 0, "someone else's transcoder untouched");
   assert.equal(transcoders.get("movie-779-med-0").lastAccess, 0, "id prefix must not bleed into 779");
+});
+
+test("heartbeat touches only the transcoder with the newest real media access", () => {
+  const owner = "ip:192.168.0.214:abcd1234";
+  const entry = { mode: "movie", id: "77", since: 0, lastSeen: 0, mediaSeen: 0, displaced: false };
+  const old = { lastAccess: 0, mediaAccess: 10, owners: new Set([owner]) };   // previous seek anchor
+  const cur = { lastAccess: 0, mediaAccess: 500, owners: new Set([owner]) };  // what the player reads
+  const transcoders = new Map([["movie-77-med-0", old], ["movie-77-med-t3600", cur]]);
+  const r = handleHeartbeat({ mode: "movie", id: "77" }, { streams: new Map([[owner, entry]]), transcoders, callerOwner: "s:tok", callerIp: "192.168.0.214", now: 1000, maxMs: 60 * MIN });
+  assert.equal(r.body.transcoders, 1);
+  assert.equal(cur.lastAccess, 1000);
+  assert.equal(old.lastAccess, 0);
+});
+
+test("the caller's own cookie session wins over same-IP ip: owners", () => {
+  const mine = { mode: "movie", id: "77", since: 0, lastSeen: 0, mediaSeen: 0, displaced: false };
+  const other = { mode: "movie", id: "77", since: 0, lastSeen: 0, mediaSeen: 0, displaced: false };
+  const streams = new Map([["s:tok", mine], ["ip:1.1.1.1:aaaa0000", other]]);
+  const r = handleHeartbeat({ mode: "movie", id: 77 }, { streams, transcoders: new Map(), callerOwner: "s:tok", callerIp: "1.1.1.1", now: 5, maxMs: MIN });
+  assert.equal(r.body.sessions, 1);
+  assert.equal(mine.lastSeen, 5);
+  assert.equal(other.lastSeen, 0);
 });
 
 test("heartbeat never creates or touches a different title / other caller", () => {
@@ -112,6 +135,15 @@ test("vodReachedEnd: exact panel duration wins, with a small tolerance", () => {
   assert.equal(vodReachedEnd({ offsetSecs: 0, elapsedSecs: 100, durationSecs: 0, runtimeMin: null }).done, false);
   assert.equal(vodReachedEnd({ offsetSecs: NaN, elapsedSecs: 100, durationSecs: "x", runtimeMin: -3 }).done, false);
   assert.equal(vodReachedEnd().done, false);
+});
+
+test("vodReachedEnd: panel duration distrusted when TMDB disagrees; copy seeks raise the bar", () => {
+  // Panel says 100 min, TMDB 150 min: different cut, ignore the panel value.
+  assert.equal(vodReachedEnd({ offsetSecs: 0, elapsedSecs: 6000, durationSecs: 6000, runtimeMin: 150 }).done, false);
+  assert.equal(vodReachedEnd({ offsetSecs: 0, elapsedSecs: 6000, durationSecs: 6000, runtimeMin: 99 }).by, "duration");
+  // Stream copy, resumed + 2 respawns: each seek may add a GOP.
+  assert.equal(vodReachedEnd({ offsetSecs: 600, elapsedSecs: 5396, durationSecs: 6000, copySeeks: 3 }).done, false);
+  assert.equal(vodReachedEnd({ offsetSecs: 600, elapsedSecs: 5426, durationSecs: 6000, copySeeks: 3 }).done, true);
 });
 
 test("noPacketsLabel: past end of file only right after a clean exit", () => {
