@@ -6438,7 +6438,10 @@ async function triggerDiskDownload(payload) {
     const d = await r.json();
     if (!r.ok || !d.ok) { toast(`Download failed to queue: ${d.error || r.status}`, 4000); return; }
     const n = (d.jobIds || []).length;
-    toast(n > 1 ? `Queued ${n} downloads — runs overnight, check Disk tomorrow` : "Queued — downloads overnight, will show up in Disk", 3500);
+    // Starts now unless the owner opted into an overnight window that is closed.
+    const later = d.window && d.window.enabled && !d.window.open;
+    const when = later ? "runs overnight" : "Starts now (pauses while someone's watching)";
+    toast(n > 1 ? `Queued ${n} downloads. ${when}` : `Queued. ${when}`, 3500);
   } catch (e) {
     toast(`Download request failed: ${e.message}`, 4000);
   }

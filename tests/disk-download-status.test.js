@@ -89,3 +89,10 @@ test("select: mode without ids falls back to the default list", () => {
   const jobs = [{ jobId: "a", mode: "movie", id: 1, status: "done", createdAt: 1 }, { jobId: "b", mode: "series", id: 2, status: "queued", createdAt: 2 }];
   assert.deepStrictEqual(selectDiskJobs(jobs, { mode: "movie", ids: null }).map((j) => j.jobId), ["b", "a"]);
 });
+
+test("waiting_for: a queued job that is next waits for a viewer (no window configured = always open)", () => {
+  assert.strictEqual(diskJobWaitingFor({ status: "queued" }, true, false, true), "viewer");
+  assert.strictEqual(diskJobWaitingFor({ status: "queued" }, true, true, true), "queue");
+  assert.strictEqual(diskJobWaitingFor({ status: "queued" }, true, false, false), null);
+  assert.strictEqual(projectDiskDownloadJob({ ...base }, { windowOpen: true, viewerWaiting: true }).waiting_for, "viewer");
+});

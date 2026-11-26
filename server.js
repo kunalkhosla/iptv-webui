@@ -4437,16 +4437,12 @@ async function buildDiskIndex(actx, rootPath) {
 // highest available quality: a stream COPY (no re-encode, no downscale —
 // unlike /api/download's client-facing 720p CRF22 re-encode meant for a
 // phone's limited storage). Runs as a background job queue, ONE AT A
-// TIME, gated to an overnight window (isDiskDownloadWindowOpen) so it
-// never competes with live viewing at all in practice. As a backstop for
-// the rare case someone's up during the window, it also participates in
-// the SAME admitStream() concurrency slot a real viewer uses, via a
-// synthetic owner key — but ONLY after confirming the slot isn't already
-// held by someone else (admitStream()'s own "newest wins" rule would
-// otherwise let the download evict an ALREADY-WATCHING viewer, not the
-// reverse — see the slotHeld check in runDiskDownloadJob for why). Disk
-// is owner-only (see userDiskPath), so this whole subsystem only ever
-// targets the owner's disk root.
+// TIME, only while nobody is watching: the household has ONE provider
+// connection, so a job takes the SAME admitStream() slot a viewer uses (via
+// a synthetic "disk-download:" owner key), only when the slot is free, and
+// gives it up the moment a viewer asks to play (see diskDownloadGate /
+// preemptDiskDownloadsForViewer). Disk is owner-only (see userDiskPath), so
+// this whole subsystem only ever targets the owner's disk root.
 // ===========================================================================
 
 const DISK_DOWNLOAD_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB headroom
@@ -4455,8 +4451,7 @@ const DISK_DOWNLOAD_MAX_ERROR_RETRIES = 8;
 
 // Persisted the same way as diskProbeCache above — a plain in-memory Map
 // used to be the whole store, so a container restart (a deploy, a crash)
-// silently dropped every queued/paused job with zero trace, and the
-// overnight window that follows just never had anything to run. Loaded
+// silently dropped every queued/paused job with zero trace. Loaded
 // once at boot; "downloading"/"paused" entries are demoted back to
 // "queued" since whatever admitStream/ffmpeg state they held is gone
 // with the old process — the job itself resumes cleanly via the existing
@@ -4585,28 +4580,31 @@ function enqueueDiskDownload(job) {
   return jobId;
 }
 
-// Downloads only run overnight (default 1–6 AM) rather than competing
-// with live viewing at all — Kunal's call, simpler and safer than
-// relying solely on the admitStream() displacement dance below to sort
-// it out in real time (that mechanism stays in place as a backstop for
-// the rare case someone's up during the window, not the primary guard).
-// Hours are computed in the household's actual timezone (America/
-// New_York), not server-local — the container runs in UTC (confirmed
-// on hestia), so a naive Date().getHours() would silently pick the
-// wrong 5-hour block.
-// Number(badString) is NaN, and every comparison against NaN is false —
-// a typo'd env value (e.g. "1am" instead of "1") would otherwise make
-// isDiskDownloadWindowOpen() return false forever with zero error
-// surfaced anywhere; jobs would just sit "queued" indefinitely. Falls
-// back to the same default a missing/empty value would use.
-function diskDownloadWindowHour(envVal, fallback) {
-  const n = Number(envVal);
-  return Number.isFinite(n) && n >= 0 && n <= 23 ? n : fallback;
+// When a job may move bytes: lib/disk-download-schedule.js (pure). By default
+// there is NO window: a job starts as soon as nobody is watching, yields the
+// moment a viewer asks for a stream (preemptDiskDownloadsForViewer from
+// /api/stream, plus admitStream's oldest-evicted rule as the backstop), and
+// resumes via HTTP Range once no viewer has been seen for
+// DISK_DOWNLOAD_RESUME_GRACE_MS. The overnight window is opt-in: only when
+// BOTH DISK_DOWNLOAD_WINDOW_START_HOUR and _END_HOUR are set. Hours are in the
+// household's timezone (the container runs in UTC).
+const diskDlSchedule = require("./lib/disk-download-schedule");
+const DISK_DOWNLOAD_WINDOW = diskDlSchedule.parseWindowEnv(
+  process.env.DISK_DOWNLOAD_WINDOW_START_HOUR, process.env.DISK_DOWNLOAD_WINDOW_END_HOUR);
+if (DISK_DOWNLOAD_WINDOW.invalid) {
+  console.warn("[disk-download] DISK_DOWNLOAD_WINDOW_START_HOUR/END_HOUR need both set to different hours 0-23; ignoring them (no window)");
 }
-const DISK_DOWNLOAD_WINDOW_START_HOUR = diskDownloadWindowHour(process.env.DISK_DOWNLOAD_WINDOW_START_HOUR, 1);
-const DISK_DOWNLOAD_WINDOW_END_HOUR = diskDownloadWindowHour(process.env.DISK_DOWNLOAD_WINDOW_END_HOUR, 6);
 const DISK_DOWNLOAD_WINDOW_TZ = process.env.DISK_DOWNLOAD_WINDOW_TZ || "America/New_York";
 const DISK_DOWNLOAD_WINDOW_POLL_MS = 5 * 60_000;
+const DISK_DOWNLOAD_POLL_MS = 10_000;
+const DISK_DOWNLOAD_RESUME_GRACE_MS = diskDlSchedule.graceMsFrom(process.env.DISK_DOWNLOAD_RESUME_GRACE_MS);
+// Newest viewer activity seen (admission, media request, a pause heartbeat's
+// lastSeen bump, a play request). Starts at boot time so a deploy restart
+// gives the players that were watching a grace to reconnect first.
+let diskDownloadLastViewerAt = Date.now();
+function noteViewerActivity(owner) {
+  if (!diskDlSchedule.isBackgroundOwner(owner)) diskDownloadLastViewerAt = Date.now();
+}
 
 function currentHourInDiskDownloadWindow() {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -4614,11 +4612,41 @@ function currentHourInDiskDownloadWindow() {
   }).formatToParts(new Date());
   return Number(parts.find((p) => p.type === "hour").value) % 24;
 }
+// Always open when no window is configured.
 function isDiskDownloadWindowOpen() {
-  const h = currentHourInDiskDownloadWindow();
-  return DISK_DOWNLOAD_WINDOW_START_HOUR <= DISK_DOWNLOAD_WINDOW_END_HOUR
-    ? h >= DISK_DOWNLOAD_WINDOW_START_HOUR && h < DISK_DOWNLOAD_WINDOW_END_HOUR
-    : h >= DISK_DOWNLOAD_WINDOW_START_HOUR || h < DISK_DOWNLOAD_WINDOW_END_HOUR; // window wraps midnight
+  if (!DISK_DOWNLOAD_WINDOW.enabled) return true;
+  return diskDlSchedule.hourInWindow(currentHourInDiskDownloadWindow(),
+    DISK_DOWNLOAD_WINDOW.startHour, DISK_DOWNLOAD_WINDOW.endHour);
+}
+// { run, waitingFor } for a job right now. `selfOwner`: the job's own streams key.
+function diskDownloadGate(selfOwner = null) {
+  diskDownloadLastViewerAt = diskDlSchedule.latestViewerSeen(streams, diskDownloadLastViewerAt);
+  return diskDlSchedule.decideDiskDownload({
+    now: Date.now(),
+    windowEnabled: DISK_DOWNLOAD_WINDOW.enabled,
+    windowOpen: isDiskDownloadWindowOpen(),
+    holder: diskDlSchedule.slotHolder(streams, selfOwner, accountKeyOf(ownerAccount)),
+    lastViewerAt: diskDownloadLastViewerAt,
+    graceMs: DISK_DOWNLOAD_RESUME_GRACE_MS,
+  });
+}
+// A viewer asked to play (GET /api/stream): stop any Save-to-Disk transfer NOW,
+// synchronously, so its upstream connection is already closing before the
+// player's first manifest/segment request reaches the provider. The entry is
+// tagged displaced (as admitStream would) so it never counts against the
+// viewer's admission; the job's own abort path deletes it and goes back to
+// waiting for the grace.
+function preemptDiskDownloadsForViewer(reason) {
+  diskDownloadLastViewerAt = Date.now();
+  let n = 0;
+  for (const [k, v] of streams) {
+    if (!diskDlSchedule.isDiskDownloadOwner(k) || v.displaced) continue;
+    v.displaced = true;
+    for (const kill of v.killers) { try { kill(reason); } catch {} }
+    n++;
+  }
+  if (n) console.log(`[disk-download] yielding to a viewer (${reason})`);
+  return n;
 }
 
 async function processDiskDownloadQueue() {
@@ -4628,8 +4656,9 @@ async function processDiskDownloadQueue() {
     while (true) {
       const job = [...diskDownloadJobs.values()].find((j) => j.status === "queued");
       if (!job) break;
-      if (!isDiskDownloadWindowOpen()) {
-        await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_WINDOW_POLL_MS));
+      const gate = diskDownloadGate();
+      if (!gate.run) {
+        await new Promise((r) => setTimeout(r, gate.waitingFor === "window" ? DISK_DOWNLOAD_WINDOW_POLL_MS : DISK_DOWNLOAD_POLL_MS));
         continue;
       }
       await runDiskDownloadJob(job);
@@ -4658,72 +4687,63 @@ async function runDiskDownloadJob(job) {
     return;
   }
 
-  job.status = "downloading";
-  const { sourceUrl, ext, error: probeErr } = await resolveDownloadSourceUrl(job.mode, job.id, ownerAccount);
-  if (!sourceUrl) {
-    job.status = "failed";
-    job.error = `source unavailable: ${redactAllUrls(probeErr)}`;
-    saveDiskDownloadJobs();
-    return;
-  }
-  job.ext = ext;
-  const destPath = diskDownloadDestPath(rootPath, job);
-  const tmpPath = `${destPath}.part`;
-
   const owner = `disk-download:${job.jobId}`;
+  let sourceUrl = null;
+  let destPath = null;
+  let tmpPath = null;
+  const setStatus = (status) => {
+    if (job.status === status) return;
+    job.status = status;
+    saveDiskDownloadJobs();
+  };
 
   while (true) {
-    // Recomputed fresh every iteration (not hoisted above the loop) so a
-    // panel failover mid-download (pickPanel switching ownerAccount.host)
-    // self-heals within one retry cycle — real viewer traffic recomputes
-    // this per-request too (see /api/proxy, /api/transcode), so a stale
-    // cached accountKey here would silently split the download and a
-    // real viewer into two independent cap=1 budgets after a failover.
-    const accountKey = accountKeyOf(ownerAccount);
-    // admitStream()'s eviction rule is "newest wins, oldest gets evicted"
-    // — correct for two real viewers (whoever just pressed play should
-    // win over a stale session), but WRONG for this job: if a real
-    // viewer is already occupying the slot when the download tries to
-    // (re)admit, admitStream would treat the download as "newest" and
-    // evict the VIEWER instead of the reverse — the exact harm this
-    // whole mechanism exists to prevent. So: never call admitStream()
-    // while the slot is already held by someone else. Only registering
-    // when the slot is free means the ONLY way this job ever loses it
-    // afterward is a real viewer arriving LATER (registering newer),
-    // which correctly evicts the download via the same "oldest evicted"
-    // rule — that direction is the intended one. Synchronous check
-    // immediately followed by admitStream(), no await between them, so
-    // there's no event-loop window for a real request to interleave.
-    const slotHeld = [...streams.entries()]
-      .some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced);
-    if (slotHeld) {
-      job.status = "paused";
-      job.pausedReason = "slot-held";
-      saveDiskDownloadJobs();
-      await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS));
+    // Never call admitStream() while anyone else holds the slot: its "newest
+    // wins" rule would evict an ALREADY-WATCHING viewer for this job. The gate
+    // also waits out the resume grace after the last viewer activity, and the
+    // check is synchronous with the admitStream() below (no await between), so
+    // a real request cannot interleave. Once admitted, the only way this job
+    // loses the slot is a viewer arriving later (preempt / oldest-evicted).
+    const gate = diskDownloadGate(owner);
+    if (!gate.run) {
+      job.pausedReason = gate.waitingFor;
+      setStatus("paused");
+      await new Promise((r) => setTimeout(r, gate.waitingFor === "window" ? DISK_DOWNLOAD_WINDOW_POLL_MS : DISK_DOWNLOAD_POLL_MS));
       continue;
     }
-    let ac = new AbortController();
+    // Recomputed every pass (a panel failover switches ownerAccount.host).
+    const accountKey = accountKeyOf(ownerAccount);
+    const ac = new AbortController();
     const killer = (reason) => {
       job.pausedReason = reason;
       ac.abort();
     };
     const admission = admitStream(owner, job.mode, job.id, killer, accountKey);
     if (!admission.ok) {
-      // Our own prior registration is still tagged displaced (the
-      // streams-map reaper hasn't cleared it yet) — same "waiting for
-      // the slot" state as slotHeld above, not actively downloading.
-      job.status = "paused";
-      saveDiskDownloadJobs();
-      await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS));
+      // Our own prior registration is still tagged displaced.
+      streams.delete(owner);
+      setStatus("paused");
+      await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_POLL_MS));
       continue;
     }
-    job.status = "downloading";
-
-    let startByte = 0;
-    try { startByte = fs.statSync(tmpPath).size; } catch {}
+    job.pausedReason = null;
+    setStatus("downloading");
 
     try {
+      if (!sourceUrl) {
+        // A real (tiny) provider request, so it runs under the admission too.
+        const r = await resolveDownloadSourceUrl(job.mode, job.id, ownerAccount, ac.signal);
+        if (ac.signal.aborted) throw new Error("aborted");
+        if (!r.sourceUrl) throw new Error(`source unavailable: ${redactAllUrls(r.error)}`);
+        sourceUrl = r.sourceUrl;
+        job.ext = r.ext;
+        destPath = diskDownloadDestPath(rootPath, job);
+        tmpPath = `${destPath}.part`;
+      }
+
+      let startByte = 0;
+      try { startByte = fs.statSync(tmpPath).size; } catch {}
+
       const resp = await fetch(sourceUrl, {
         method: "GET",
         headers: {
@@ -4733,56 +4753,77 @@ async function runDiskDownloadJob(job) {
         redirect: "follow",
         signal: ac.signal,
       });
-      if (!resp.ok && resp.status !== 206) throw new Error(`HTTP ${resp.status}`);
-      const resumed = resp.status === 206;
-      const out = fs.createWriteStream(tmpPath, { flags: resumed ? "a" : "w" });
-      // Resync to the .part file's real size, not the in-memory value —
-      // bytesWritten is only persisted on status transitions (not per
-      // chunk), so a job resuming after a restart would otherwise keep
-      // incrementing from a stale/zero baseline forever. Within a single
-      // process's lifetime this was already correct (a same-process pause/
-      // resume never touched bytesWritten), so this is a no-op there.
-      job.bytesWritten = resumed ? startByte : 0;
-      // Expected total size, for verifying the transfer actually completed
-      // rather than silently truncating — the same CDN-drop failure mode
-      // /api/download had (closes the connection cleanly mid-transfer;
-      // pipeline() sees a normal stream end, not an error). A 206's
-      // Content-Range carries the total after the "/"; a fresh 200's
-      // Content-Length IS the total. Missing/malformed header (some CDN
-      // responses omit it) → can't verify, proceed on trust same as
-      // /api/download does today.
-      const expectedTotal = resumed
-        ? Number(resp.headers.get("content-range")?.split("/")?.[1]) || null
-        : Number(resp.headers.get("content-length")) || null;
-      // Shown as "Saving N%" (GET /api/disk-download/jobs). Kept from an
-      // earlier attempt when this one's response omits the size.
-      if (expectedTotal != null) job.totalBytes = expectedTotal;
-      const source = Readable.fromWeb(resp.body);
-      // touchStream keeps streams' lastSeen fresh for the whole transfer —
-      // without it, admitStream() is only called once per pause/resume
-      // cycle (job start / after a displacement), so lastSeen goes stale
-      // the moment bytes start flowing and the idle reaper (which reaps
-      // ANY entry — not just displaced ones — after LIVE_IDLE_GRACE_MS
-      // with no touch) would kill a perfectly healthy, actively-writing
-      // download as if it were an abandoned viewer.
-      source.on("data", (chunk) => { job.bytesWritten += chunk.length; touchStream(owner); });
-      await pipeline(source, out);
-
-      if (expectedTotal != null) {
-        const actual = fs.statSync(tmpPath).size;
-        if (actual < expectedTotal) {
-          throw new Error(`truncated transfer: got ${actual} of ${expectedTotal} bytes`);
+      let complete = false;
+      let expectedTotal = null;
+      if (resp.status === 416 && startByte > 0) {
+        // Nothing past what we have: complete if the source size is exactly
+        // the .part size (e.g. a restart between the last byte and the rename).
+        const total = Number(/\/(\d+)\s*$/.exec(resp.headers.get("content-range") || "")?.[1]);
+        try { await resp.body?.cancel(); } catch {}
+        if (total !== startByte) {
+          fs.rmSync(tmpPath, { force: true });
+          throw new Error("resume rejected (416); restarting from zero");
+        }
+        complete = true;
+      } else {
+        if (!resp.ok && resp.status !== 206) throw new Error(`HTTP ${resp.status}`);
+        if (/^text\//i.test(resp.headers.get("content-type") || "")) {
+          try { await resp.body?.cancel(); } catch {}
+          throw new Error("provider returned an error page instead of video");
+        }
+        const resumed = resp.status === 206;
+        if (resumed) {
+          const crStart = Number(/bytes\s+(\d+)-/.exec(resp.headers.get("content-range") || "")?.[1]);
+          if (crStart !== startByte) {
+            try { await resp.body?.cancel(); } catch {}
+            fs.rmSync(tmpPath, { force: true });
+            throw new Error(`resume offset mismatch (asked ${startByte}, got ${crStart}); restarting from zero`);
+          }
+        } else if (startByte > 0) {
+          console.log(`[disk-download] ${job.jobId} source ignored Range; restarting from zero`);
+        }
+        // Expected total, to catch a CDN that closes cleanly mid-transfer: a
+        // 206's Content-Range total, or a 200's Content-Length. Missing ->
+        // proceed on trust.
+        expectedTotal = resumed
+          ? Number(resp.headers.get("content-range")?.split("/")?.[1]) || null
+          : Number(resp.headers.get("content-length")) || null;
+        if (expectedTotal != null) {
+          job.totalBytes = expectedTotal;
+          const freeNow = diskDownloadFreeBytes(rootPath);
+          const need = expectedTotal - (resumed ? startByte : 0) + DISK_DOWNLOAD_MIN_FREE_BYTES;
+          if (freeNow != null && freeNow < need) {
+            try { await resp.body?.cancel(); } catch {}
+            throw Object.assign(new Error(`disk almost full (${(freeNow / 1024 / 1024 / 1024).toFixed(1)} GB free, this title needs ${(need / 1024 / 1024 / 1024).toFixed(1)} GB incl. headroom)`), { fatal: true });
+          }
+        }
+        // Resync to the .part file's real size (bytesWritten is only persisted
+        // on status transitions).
+        job.bytesWritten = resumed ? startByte : 0;
+        const out = fs.createWriteStream(tmpPath, { flags: resumed ? "a" : "w" });
+        const source = Readable.fromWeb(resp.body);
+        // touchStream keeps the entry's lastSeen fresh so the idle reaper
+        // never mistakes a healthy transfer for an abandoned viewer.
+        source.on("data", (chunk) => { job.bytesWritten += chunk.length; touchStream(owner); });
+        await pipeline(source, out);
+        if (expectedTotal != null) {
+          const actual = fs.statSync(tmpPath).size;
+          if (actual < expectedTotal) {
+            throw new Error(`truncated transfer: got ${actual} of ${expectedTotal} bytes`);
+          }
         }
       }
 
       // Completed without abort, size verified — success.
       fs.renameSync(tmpPath, destPath);
+      try { job.bytesWritten = fs.statSync(destPath).size; } catch {}
       job.status = "done";
       job.finishedAt = Date.now();
+      job.pausedReason = null;
       saveDiskDownloadJobs();
       dropStreamKiller(owner, killer);
       streams.delete(owner);
-      console.log(`[disk-download] ${job.jobId} done → ${destPath} (${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB)`);
+      console.log(`[disk-download] ${job.jobId} done → ${destPath} (${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB${complete ? ", already complete" : ""})`);
       try {
         await buildDiskIndex(ownerAccount, rootPath);
         prewarmTmdbCache("disk", ownerAccount).catch(() => {});
@@ -4791,34 +4832,31 @@ async function runDiskDownloadJob(job) {
       }
       return;
     } catch (e) {
+      dropStreamKiller(owner, killer);
+      streams.delete(owner);
       if (ac.signal.aborted) {
-        // Displaced by a real viewer — this is expected, not an error.
-        // Loop back: re-admit once the slot frees (streams' idle reaper
-        // or the viewer's own session ending clears it), resuming via
-        // Range from whatever this attempt already wrote.
+        // A viewer took the slot (or the reaper freed a stalled transfer).
+        // Expected, not an error: back to the gate, then resume via Range.
         console.log(`[disk-download] ${job.jobId} paused (${job.pausedReason || "displaced"}) at ${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB — will resume`);
-        job.status = "paused";
-        saveDiskDownloadJobs();
-        // Matches the other exit paths (success, error-retry) — a
-        // displaced entry is functionally inert (excluded from every
-        // admitStream/slotHeld check by its own `displaced` flag) but
-        // leaving it around until the idle reaper gets to it is a
-        // needless stale entry for anyone reading `streams` to debug.
-        streams.delete(owner);
-        await new Promise((r) => setTimeout(r, DISK_DOWNLOAD_DISPLACED_RETRY_MS));
+        setStatus("paused");
         continue;
       }
-      job.retries += 1;
       job.error = redactAllUrls(e.message);
-      streams.delete(owner);
-      if (job.retries > DISK_DOWNLOAD_MAX_ERROR_RETRIES) {
+      if (e.fatal) {
         job.status = "failed";
-        console.warn(`[disk-download] ${job.jobId} gave up after ${job.retries} attempts: ${e.message}`);
-        try { fs.rmSync(tmpPath, { force: true }); } catch {}
+        console.warn(`[disk-download] ${job.jobId} failed: ${job.error}`);
         saveDiskDownloadJobs();
         return;
       }
-      console.warn(`[disk-download] ${job.jobId} retry ${job.retries}/${DISK_DOWNLOAD_MAX_ERROR_RETRIES}: ${e.message}`);
+      job.retries += 1;
+      if (job.retries > DISK_DOWNLOAD_MAX_ERROR_RETRIES) {
+        job.status = "failed";
+        console.warn(`[disk-download] ${job.jobId} gave up after ${job.retries} attempts: ${job.error}`);
+        if (tmpPath) { try { fs.rmSync(tmpPath, { force: true }); } catch {} }
+        saveDiskDownloadJobs();
+        return;
+      }
+      console.warn(`[disk-download] ${job.jobId} retry ${job.retries}/${DISK_DOWNLOAD_MAX_ERROR_RETRIES}: ${job.error}`);
       await new Promise((r) => setTimeout(r, Math.min(5000 * job.retries, 60_000)));
     }
   }
@@ -5281,7 +5319,7 @@ app.get("/api/transcode/:mode(live|movie|series|disk)/:id/seg_:n.ts", (req, res)
 // (currentAccount() happens to resolve to ownerAccount outside a
 // request today, but that's implicit; explicit matches the rest of the
 // job's actx-threading — see buildDiskIndex/prewarmTmdbCache calls).
-async function resolveDownloadSourceUrl(mode, id, actx = currentAccount()) {
+async function resolveDownloadSourceUrl(mode, id, actx = currentAccount(), signal = null) {
   const indexExt = (mode === "movie"
     ? getIndexesFor(actx).movie.byId.get(parseInt(id, 10))?.container
     : null);
@@ -5305,7 +5343,7 @@ async function resolveDownloadSourceUrl(mode, id, actx = currentAccount()) {
           "Range": "bytes=0-1024",
         },
         redirect: "follow",
-        signal: AbortSignal.timeout(4000),
+        signal: signal ? AbortSignal.any([AbortSignal.timeout(4000), signal]) : AbortSignal.timeout(4000),
       });
       const ct = probe.headers.get("content-type") || "";
       const buf = Buffer.from(await probe.arrayBuffer());
@@ -12108,8 +12146,9 @@ function makeAssistantTools(req) {
       // so compare against that, not accountKeyOf(currentAccount()) which
       // would never match for a member account and always report idle.
       const accountKey = currentAccountKey();
-      for (const [, v] of streams) {
+      for (const [owner, v] of streams) {
         if (v.accountKey !== accountKey || v.displaced) continue;
+        if (diskDlSchedule.isBackgroundOwner(owner)) continue; // a download, not someone watching
         // "Still watching?" window matches the idle reaper: one grace for
         // all modes (a buffering cast OR a VOD player playing out a deep
         // forward buffer stops fetching but is still wanted).
@@ -13319,13 +13358,16 @@ app.get("/api/disk/series/:id", (req, res) => {
 // Client-safe projection of jobs (pct / waiting_for / selection: lib/disk-download-status.js).
 const diskJobStatus = require("./lib/disk-download-status");
 function projectDiskDownloadJobs(list) {
-  return diskJobStatus.projectDiskJobs(list, diskDownloadJobs.values(), { windowOpen: isDiskDownloadWindowOpen() });
+  const viewerWaiting = diskDownloadGate().waitingFor === "viewer";
+  return diskJobStatus.projectDiskJobs(list, diskDownloadJobs.values(), { windowOpen: isDiskDownloadWindowOpen(), viewerWaiting });
 }
+// enabled false (the default): no window, `open` always true, hours null.
 function diskDownloadWindowInfo() {
   return {
+    enabled: DISK_DOWNLOAD_WINDOW.enabled,
     open: isDiskDownloadWindowOpen(),
-    startHour: DISK_DOWNLOAD_WINDOW_START_HOUR,
-    endHour: DISK_DOWNLOAD_WINDOW_END_HOUR,
+    startHour: DISK_DOWNLOAD_WINDOW.startHour,
+    endHour: DISK_DOWNLOAD_WINDOW.endHour,
     tz: DISK_DOWNLOAD_WINDOW_TZ,
   };
 }
@@ -13919,6 +13961,7 @@ function parseStreamFromPanelUrl(panelUrl) {
 //   { ok: false, reason: "displaced" } — owner was already displaced
 function admitStream(owner, mode, id, killer, accountKey) {
   const existing = streams.get(owner);
+  noteViewerActivity(owner); // Save-to-Disk waits a grace after any viewer activity
   if (existing && existing.displaced) {
     // The previous request from this owner was displaced; the client
     // hasn't yet learned. Reject so it surfaces.
@@ -13982,6 +14025,7 @@ function touchStream(owner) {
   if (!entry) return true; // no record = first request for this owner
   if (entry.displaced) return false;
   entry.lastSeen = entry.mediaSeen = Date.now();
+  noteViewerActivity(owner);
   return true;
 }
 
@@ -14915,7 +14959,7 @@ function sidecarGroupFor(mode, id) {
 // Anyone watching anything (panel or disk) within the last minute.
 function sidecarViewerActive() {
   const now = Date.now();
-  for (const v of streams.values()) if (!v.displaced && now - v.lastSeen < 60_000) return true;
+  for (const [k, v] of streams) if (!v.displaced && now - v.lastSeen < 60_000 && !diskDlSchedule.isBackgroundOwner(k)) return true;
   for (const t of transcoders.values()) if (now - t.lastAccess < 60_000) return true;
   return diskfileActive > 0 || now - diskfileLastSeen < 120_000;
 }
@@ -15096,6 +15140,10 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
       });
     }
   }
+  // A play request: a running Save-to-Disk transfer gives up the household's
+  // one provider connection right now, before this player reaches the
+  // provider (Disk titles are local files and never need it).
+  if (req.params.mode !== "disk") preemptDiskDownloadsForViewer(`play ${req.params.mode}`);
 
   // --- Disk (local) media. Decide direct-play vs transcode from the probed
   // codec metadata (no network probe). Return signed same-origin URLs; the
@@ -15543,6 +15591,9 @@ app.get("/api/streams", (_req, res) => {
   for (const [owner, v] of streams) {
     list.push({
       owner_hash: crypto.createHash("sha1").update(owner).digest("hex").slice(0, 10),
+      // A Save-to-Disk transfer: holds the provider slot but is not a viewer
+      // (it yields to any play request and resumes after a restart).
+      background: diskDlSchedule.isDiskDownloadOwner(owner),
       account_hash: crypto.createHash("sha1").update(v.accountKey || "").digest("hex").slice(0, 10),
       mode: v.mode, id: v.id,
       since_ms: Date.now() - v.since,
@@ -15552,7 +15603,8 @@ app.get("/api/streams", (_req, res) => {
   }
   res.json({
     cap_per_account: MAX_CONCURRENT_STREAMS,
-    active: list.length,
+    active: list.filter((x) => !x.background).length, // viewers (and phone-download fetches)
+    background: list.filter((x) => x.background).length,
     streams: list,
   });
 });
