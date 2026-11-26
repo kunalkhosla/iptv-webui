@@ -172,6 +172,45 @@ series-group id, owner only). `Cache-Control: no-store`.
 - Panel down: served from the last good series info on disk; none at all ->
   `503 {"error":"info_unavailable"}`.
 
+### Richer episode info (additive)
+
+Each season object may add `name`, `overview` (TMDB season overview),
+`poster` (TMDB w342) and `air_date`. Each episode may add (omitted when
+unknown):
+
+- `runtime_mins` (TMDB episode runtime), `rating` (TMDB vote average, only
+  with >= 3 votes), `still_large` (TMDB w780; `still` stays w400),
+  `directors`, `writers` (up to 3 names each), `guest_stars` (top 3 by billing:
+  `{ name, character|null, profile|null }`, profile = TMDB w185).
+- `plot` is chosen per episode from: TMDB (en-US), TMDB in the series'
+  original language (only hi/pa/ur/bn/mr/gu/ta/te/kn/ml, and only when the
+  en-US season has a gap), then the panel plot. The first one that is >= 25
+  characters and not repeated by another episode of the season wins; else the
+  first non-empty one. Logic: `lib/episode-info.js`.
+- TMDB seasons are fetched per season through the shared `tmdb()` cache
+  (24 h, single-flight, 429 back-off), all under the existing 6 s deadline.
+
+Measured 2026-11-26 on prod (40 panel series + 4 Disk series, 1174 episodes):
+the panel plot is empty for ~65% of episodes and never better than TMDB; with
+TMDB, plots were missing for 4% of Indian-group episodes and 65% of the
+"other" sample (mostly Pakistani/Indian TV dramas TMDB doesn't describe or
+can't match). TMDB occasionally repeats one overview across a season.
+
+Clients: the row shows the still, `display_title` (TMDB episode name, or the
+panel title without its "Series - S01E01 -" prefix; fall back to `title`),
+runtime + rating, a 2-3 line synopsis and the progress bar; an expanded row
+adds the full synopsis, air date, guest stars and director/writers. The
+season `overview` sits under the season picker.
+
+### Web player keys
+
+Right / Left = +/- 10 s (same step as TV and phone; repeated presses add up,
+a target outside the encoded transcode window re-anchors once after the
+presses stop), Up / Down = volume +/- 10 % (live with the channel remote on:
+channel zap, unchanged), space = play/pause, m = mute, f = fullscreen. They
+work whichever player control or the page has focus, never while typing in a
+field, and not in the mini player. Regression: `scripts/e2e/player_keys.py`.
+
 ## 7. Posters
 
 Every VOD tile `poster` (home rails + hero, search, similar, person credits,

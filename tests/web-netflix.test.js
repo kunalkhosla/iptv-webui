@@ -132,3 +132,50 @@ test("web wiring: endpoints and no initials tiles", () => {
   // Auto-advance paths count toward the prompt.
   assert.match(APP, /_stillWatching\.noteAutoAdvance\(\);\n  playNextEpisode\(\);/);
 });
+
+// ---- Player keyboard shortcuts (owner report: Right arrow did not seek) ----
+test("playerKeyAction: arrows seek 10 s, Up/Down volume, m/f, never while typing", () => {
+  const ctx = { playerOpen: true };
+  assert.deepEqual(NF.playerKeyAction("ArrowRight", ctx), { kind: "seek", delta: 10 });
+  assert.deepEqual(NF.playerKeyAction("ArrowLeft", ctx), { kind: "seek", delta: -10 });
+  assert.deepEqual(NF.playerKeyAction("ArrowUp", ctx), { kind: "volume", delta: 0.1 });
+  assert.deepEqual(NF.playerKeyAction("ArrowDown", ctx), { kind: "volume", delta: -0.1 });
+  assert.deepEqual(NF.playerKeyAction("m", ctx), { kind: "mute" });
+  assert.deepEqual(NF.playerKeyAction("F", ctx), { kind: "fullscreen" });
+  assert.equal(NF.playerKeyAction(" ", ctx), null); // space has its own handler
+  for (const off of [{ inField: true }, { modifier: true }, { mini: true }, { menuOpen: true }, { playerOpen: false }]) {
+    assert.equal(NF.playerKeyAction("ArrowRight", { ...ctx, ...off }), null, JSON.stringify(off));
+  }
+  assert.equal(NF.playerKeyAction("ArrowRight", { ...ctx, live: true }), null);
+  assert.deepEqual(NF.playerKeyAction("ArrowUp", { ...ctx, live: true }), { kind: "volume", delta: 0.1 });
+  assert.equal(NF.playerKeyAction("ArrowLeft", { ...ctx, casting: true }), null);
+});
+test("keySeekTarget: builds on the pending target, clamps to the title", () => {
+  assert.equal(NF.keySeekTarget(100, 10, 3000, NaN), 110);
+  assert.equal(NF.keySeekTarget(100, 10, 3000, 130), 140);
+  assert.equal(NF.keySeekTarget(5, -10, 3000, NaN), 0);
+  assert.equal(NF.keySeekTarget(2995, 10, 3000, NaN), 2999);
+  assert.equal(NF.keySeekTarget(50, 10, 0, NaN), 60); // unknown duration: no upper clamp
+});
+test("web wiring: player keys reach the player whatever has focus; hero yields", () => {
+  assert.match(APP, /KNf\.playerKeyAction\(e\.key, playerKeyContext\(e, inField\)\)/);
+  assert.match(APP, /el\.hero\.addEventListener\("keydown"[\s\S]{0,200}if \(playerOpenFull\(\)\) return;/);
+});
+
+// ---- Richer episode rows ----
+test("episodeRuntime + episodeCredits", () => {
+  assert.equal(NF.episodeRuntime({ runtime_mins: 52 }), "52m");
+  assert.equal(NF.episodeRuntime({ runtime_mins: 65 }), "1h 5m");
+  assert.equal(NF.episodeRuntime({ duration_secs: 2673 }), "45m");
+  assert.equal(NF.episodeRuntime({}), "");
+  assert.deepEqual(NF.episodeCredits({
+    guest_stars: [{ name: "A", character: "Cop" }, { name: "B" }, { name: "C" }, { name: "D" }],
+    directors: ["X"], writers: ["Y", "Z"],
+  }), { guests: "A (Cop), B, C", crew: "Directed by X · Written by Y, Z" });
+  assert.deepEqual(NF.episodeCredits({}), { guests: "", crew: "" });
+});
+test("web wiring: season overview + episode expander", () => {
+  assert.match(HTML, /id="series-season-overview"/);
+  assert.match(APP, /applyEpisodeInfo\(node, ep\)/);
+  assert.match(APP, /map\.seasonInfo\.set\(/);
+});

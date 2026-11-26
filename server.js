@@ -1786,6 +1786,7 @@ function projectTmdbDetail(mode, detail, baseTitle) {
 // icon is a logo, not a poster). A VOD title with no TMDB entry at all is
 // queued for a background TMDB lookup so its poster shows up next time.
 const { posterUrl } = require("./lib/poster");
+const episodeInfoLib = require("./lib/episode-info");
 const posterFillTried = new Map(); // "<mode>:<id>" -> ms
 let posterFillQueue = null;        // created lazily (createPrewarmQueue is defined later)
 function tilePoster(mode, s, t) {
@@ -10788,24 +10789,56 @@ app.get("/api/poster/series/:id/season/:n", async (req, res, next) => {
 //     last_episode: { episode_id, season, episode_num } | null }
 // All seasons fetched in parallel (tmdb() is memory-cached 24 h and
 // single-flight), under ONE overall deadline; late seasons get no stills.
-async function tmdbSeasonsEpisodes(tmdbId, seasonNums, timeoutMs = 6000) {
+// Each season -> { eps: Map<episode_number, tmdbEpisode>, alt: Map (original-
+// language copy, lib/episode-info FALLBACK_LANGS only), season: seasonExtras }.
+async function tmdbSeasonsEpisodes(tmdbId, seasonNums, timeoutMs = 6000, originalLanguage = null) {
   const out = new Map();
   if (!TMDB_API_KEY || !tmdbId) return out;
   const nums = [...new Set(seasonNums.filter(Number.isFinite))].slice(0, 60);
   let timer;
-  const done = Promise.all(nums.map(async (n) => { out.set(n, await tmdbSeasonEpisodes(tmdbId, n)); }));
+  const done = Promise.all(nums.map(async (n) => { out.set(n, await tmdbSeasonEpisodes(tmdbId, n, originalLanguage)); }));
   await Promise.race([done, new Promise((r) => { timer = setTimeout(r, timeoutMs); })]);
   clearTimeout(timer);
   return new Map(out); // snapshot: late seasons don't land after the deadline
 }
-async function tmdbSeasonEpisodes(tmdbId, seasonNum) {
-  if (!TMDB_API_KEY || !tmdbId || !Number.isFinite(seasonNum)) return new Map();
-  const d = await tmdb(`/tv/${tmdbId}/season/${seasonNum}`).catch(() => null);
+const EMPTY_TMDB_SEASON = Object.freeze({ eps: new Map(), alt: new Map(), season: {} });
+function tmdbEpisodeMap(d) {
   const out = new Map();
   for (const e of (d && Array.isArray(d.episodes) ? d.episodes : [])) {
-    if (Number.isFinite(e.episode_number)) out.set(e.episode_number, e);
+    if (e && Number.isFinite(e.episode_number)) out.set(e.episode_number, e);
   }
   return out;
+}
+async function tmdbSeasonEpisodes(tmdbId, seasonNum, originalLanguage = null) {
+  if (!TMDB_API_KEY || !tmdbId || !Number.isFinite(seasonNum)) return EMPTY_TMDB_SEASON;
+  // tmdb() caches each URL in memory for 24 h and single-flights it, so this
+  // is one TMDB call per season per day (two with the language fallback).
+  const d = await tmdb(`/tv/${tmdbId}/season/${seasonNum}`).catch(() => null);
+  const alt = episodeInfoLib.needsLangFallback(d, originalLanguage)
+    ? await tmdb(`/tv/${tmdbId}/season/${seasonNum}`, { language: originalLanguage }).catch(() => null)
+    : null;
+  return { eps: tmdbEpisodeMap(d), alt: tmdbEpisodeMap(alt), season: episodeInfoLib.seasonExtras(d, alt) };
+}
+// Overview for one episode: TMDB (default language), TMDB original language,
+// then the panel plot; repeated/short texts lose (lib/episode-info.js).
+function episodePlot(te, ta, panelPlot, repeats) {
+  const p = episodeInfoLib.pickOverview([
+    { text: te?.overview, source: "tmdb" },
+    { text: ta?.overview, source: "tmdb_alt" },
+    { text: panelPlot, source: "panel" },
+  ], repeats);
+  return p ? p.text : null;
+}
+function episodeDisplayTitle(panelTitle, tmdbName) {
+  const d = episodeInfoLib.displayTitle(panelTitle, tmdbName);
+  return d ? { display_title: d } : {};
+}
+function seasonRepeats(tm, panelPlots) {
+  return {
+    tmdb: episodeInfoLib.repeatedTexts([...tm.eps.values()].map((e) => e.overview)),
+    tmdb_alt: episodeInfoLib.repeatedTexts([...tm.alt.values()].map((e) => e.overview)),
+    panel: episodeInfoLib.repeatedTexts(panelPlots),
+  };
 }
 // watchedSet: Set of String(userState.watched) — holds bare episode ids (web
 // client) and/or "mode:id" keys.
@@ -10827,6 +10860,7 @@ app.get("/api/episodes/:mode(series|disk)/:id(\\d{1,17})", async (req, res, next
     const watchedSet = new Set((Array.isArray(userState.watched) ? userState.watched : []).map(String));
     const seasonsOut = [];
     let tmdbId = null;
+    let origLang = null;
     let lastEpisode = null;
     if (mode === "disk") {
       if (!requireOwner(req, res)) return;
@@ -10835,25 +10869,29 @@ app.get("/api/episodes/:mode(series|disk)/:id(\\d{1,17})", async (req, res, next
       const info = ix?.meta?.get(numId);
       if (!info || !info.isSeriesGroup) return res.status(404).json({ error: "not a series group" });
       const t = tmdbCache[`disk:${numId}`];
-      if (t && t.source === "tmdb" && t.tmdb_id && t.tmdb_kind === "series") tmdbId = t.tmdb_id;
+      if (t && t.source === "tmdb" && t.tmdb_id && t.tmdb_kind === "series") { tmdbId = t.tmdb_id; origLang = t.original_language || null; }
       const bySeason = new Map();
       for (const ep of info.episodes) {
         if (!bySeason.has(ep.season)) bySeason.set(ep.season, []);
         bySeason.get(ep.season).push(ep);
       }
-      const tmAll = await tmdbSeasonsEpisodes(tmdbId, [...bySeason.keys()]);
+      const tmAll = await tmdbSeasonsEpisodes(tmdbId, [...bySeason.keys()], 6000, origLang);
       for (const [season, eps] of [...bySeason.entries()].sort((a, b) => a[0] - b[0])) {
-        const tm = tmAll.get(season) || new Map();
+        const tm = tmAll.get(season) || EMPTY_TMDB_SEASON;
+        const repeats = seasonRepeats(tm, []);
         seasonsOut.push({
           season,
+          ...tm.season,
           episodes: eps.map((ep) => {
-            const te = tm.get(ep.episodeNum);
+            const te = tm.eps.get(ep.episodeNum);
             return {
               id: ep.id, episode_num: ep.episodeNum,
               title: ep.title || te?.name || `Episode ${ep.episodeNum}`,
-              plot: te?.overview || null, air_date: te?.air_date || null,
+              ...episodeDisplayTitle(ep.title, te?.name),
+              plot: episodePlot(te, tm.alt.get(ep.episodeNum), null, repeats), air_date: te?.air_date || null,
               duration_secs: ep.durationSecs || null, container: ep.container || null,
               still: te?.still_path ? `${TMDB_IMG_BASE}/w400${te.still_path}` : null,
+              ...episodeInfoLib.episodeExtras(te),
               ...episodeAudioFields(ep.audio_channels ? { channels: ep.audio_channels, codec: ep.audio_codec || null, atmos: !!ep.audio_atmos } : null),
               ...episodeProgressFor(userState, "disk", ep.id, watchedSet),
             };
@@ -10881,18 +10919,19 @@ app.get("/api/episodes/:mode(series|disk)/:id(\\d{1,17})", async (req, res, next
         ensureTmdbForItem("series", id, { name: item.name, year: item.year, lang: isoLangForItem(item) }).catch(() => null),
         new Promise((r) => setTimeout(() => r(null), 4000)),
       ]) : null;
-      if (t && t.source === "tmdb" && t.tmdb_id) tmdbId = t.tmdb_id;
+      if (t && t.source === "tmdb" && t.tmdb_id) { tmdbId = t.tmdb_id; origLang = t.original_language || null; }
       const seasons = Object.entries(info.episodes)
         .filter(([, list]) => Array.isArray(list))
         .map(([sn, list]) => [Number(sn), list])
         .sort((a, b) => a[0] - b[0]);
-      const tmAll = await tmdbSeasonsEpisodes(tmdbId, seasons.map(([n]) => n));
+      const tmAll = await tmdbSeasonsEpisodes(tmdbId, seasons.map(([n]) => n), 6000, origLang);
       for (const [season, list] of seasons) {
-        const tm = tmAll.get(season) || new Map();
+        const tm = tmAll.get(season) || EMPTY_TMDB_SEASON;
+        const repeats = seasonRepeats(tm, list.map((ep) => ep?.info?.plot));
         const stills = {};
         const episodes = list.map((ep) => {
           const num = Number(ep.episode_num);
-          const te = tm.get(num);
+          const te = tm.eps.get(num);
           const tStill = te?.still_path ? `${TMDB_IMG_BASE}/w400${te.still_path}` : null;
           if (tStill) stills[String(ep.id)] = tStill;
           // The panel's own episode image, if https and not a portrait
@@ -10902,11 +10941,13 @@ app.get("/api/episodes/:mode(series|disk)/:id(\\d{1,17})", async (req, res, next
           return {
             id: ep.id, episode_num: Number.isFinite(num) ? num : null,
             title: ep.title || te?.name || null,
-            plot: te?.overview || ep.info?.plot || null,
+            ...episodeDisplayTitle(ep.title, te?.name),
+            plot: episodePlot(te, tm.alt.get(num), typeof ep.info?.plot === "string" ? ep.info.plot : null, repeats),
             air_date: te?.air_date || ep.info?.releasedate || ep.info?.air_date || null,
             duration_secs: Number(ep.info?.duration_secs) || null,
             container: ep.container_extension || null,
             still: tStill || panelStill,
+            ...episodeInfoLib.episodeExtras(te),
             ...episodeAudioFields((isOwnerAccount(actx) ? learnedTrackSummary("series", ep.id) : null) || surroundLib.fromPanelAudio(ep.info?.audio)),
             ...episodeProgressFor(userState, "series", ep.id, watchedSet),
           };
@@ -10916,7 +10957,7 @@ app.get("/api/episodes/:mode(series|disk)/:id(\\d{1,17})", async (req, res, next
           const k = `series-season:${id}:${season}`;
           if (!tmdbCache[k] || Date.now() - (tmdbCache[k].fetched_at || 0) > TMDB_TTL_MS) { tmdbCache[k] = { fetched_at: Date.now(), stills }; scheduleTmdbCacheSave(); }
         }
-        seasonsOut.push({ season, episodes });
+        seasonsOut.push({ season, ...tm.season, episodes });
       }
       const le = userState.lastEpisode?.[id] || userState.lastEpisode?.[String(parseInt(id, 10))];
       if (le?.episode_id) lastEpisode = { episode_id: String(le.episode_id), season: le.season ?? null, episode_num: le.episode_num ?? null };

@@ -2693,6 +2693,56 @@ body.player-theater #search-all-view { display: none; }
   font-size: 12px;
   font-weight: 700;
 }
+#series-season-overview {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+  max-width: 900px;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.episode .ep-plot { -webkit-line-clamp: 3; }
+/* Netflix-style row: number, still and title/runtime on top, the synopsis
+   (and the expander's details) full width underneath, so a narrow episodes
+   pane doesn't squeeze the text into a one-word column. */
+#series-episodes .episode {
+  grid-template-columns: 40px minmax(120px, 200px) 1fr;
+  grid-template-areas: "num thumb head" "body body body";
+  align-items: start;
+  row-gap: 10px;
+  column-gap: 16px;
+}
+#series-episodes .episode .ep-num { grid-area: num; align-self: center; }
+#series-episodes .episode .ep-thumb { grid-area: thumb; width: 100%; }
+#series-episodes .episode .ep-body { display: contents; }
+#series-episodes .episode .ep-head { grid-area: head; align-self: center; flex-direction: column; align-items: flex-start; gap: 4px; position: relative; padding-right: 32px; }
+#series-episodes .episode .ep-head .ep-expand { position: absolute; top: 0; right: 0; margin: 0; }
+#series-episodes .episode .ep-plot,
+#series-episodes .episode .ep-resume,
+#series-episodes .episode .ep-more { grid-column: 1 / -1; }
+.episode .ep-expand {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-dim);
+  border-radius: 50%;
+  width: 26px; height: 26px;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  flex: none;
+  transition: transform 0.15s, border-color 0.12s, color 0.12s;
+}
+.episode .ep-expand:hover,
+.episode .ep-expand:focus-visible { border-color: var(--accent); color: var(--fg); }
+.episode.expanded .ep-expand { transform: rotate(180deg); }
+.episode .ep-more { display: none; font-size: 12.5px; line-height: 1.5; color: var(--fg-dim); }
+.episode .ep-more > div + div { margin-top: 2px; }
+.episode.expanded .ep-more { display: block; }
+.episode.expanded .ep-plot { -webkit-line-clamp: unset; display: block; }
 .episode.playing { background: rgba(var(--accent-rgb), 0.08); }
 .episode.playing .ep-title { color: var(--accent); }
 
@@ -3313,6 +3363,8 @@ body.filter-open #scrim { opacity: 1; pointer-events: auto; }
   }
   .episode .ep-num { font-size: 16px; }
   .episode .ep-thumb { width: 130px; }
+  #series-episodes .episode { grid-template-columns: 28px 140px 1fr; column-gap: 10px; }
+  #series-episodes .episode .ep-thumb { width: 100%; }
   .episode .ep-title { font-size: 13.5px; }
   .episode .ep-plot { -webkit-line-clamp: 2; font-size: 12px; }
 }

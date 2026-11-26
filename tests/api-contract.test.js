@@ -336,6 +336,16 @@ test("contract: /api/episodes/:mode/:id carries stills + per-episode progress", 
   assert.ok(prog);
   expectFields("episode progress", prog[0], ["progress", "watched", "position", "duration", "pct", "updated_at"]);
 });
+test("contract: /api/episodes richer episode + season info (additive)", () => {
+  const src = require("fs").readFileSync(require("path").join(__dirname, "..", "server.js"), "utf8");
+  const h = handlerFor(/app\.get\("\/api\/episodes\//);
+  for (const bit of ["episodeInfoLib.episodeExtras(te)", "...tm.season", "episodePlot("]) assert.ok(h.includes(bit), `episodes handler lost ${bit}`);
+  const lib = require("fs").readFileSync(require("path").join(__dirname, "..", "lib", "episode-info.js"), "utf8");
+  for (const f of ["runtime_mins", "rating", "still_large", "directors", "writers", "guest_stars", "overview", "poster", "air_date"]) {
+    assert.match(lib, new RegExp(`out\\.${f}\\s*=`), `episode-info lost ${f} (clients read it)`);
+  }
+  expectFields("guest star", lib, ["name", "character", "profile"]);
+});
 test("contract: trailer preview route + detail trailer fields", () => {
   assert.ok(handlerFor(/app\.get\("\/api\/trailer\/:key\/preview\.mp4"/), "preview route missing");
   const src = require("fs").readFileSync(require("path").join(__dirname, "..", "server.js"), "utf8");

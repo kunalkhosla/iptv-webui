@@ -1487,6 +1487,9 @@ function attachHeroNavigation() {
   el.hero.tabIndex = 0;
   el.hero.addEventListener("keydown", (e) => {
     if (e.target.matches("input, textarea")) return;
+    // The player covers the hero: its arrows seek (document keydown), they
+    // must not flip the hero slide underneath it.
+    if (playerOpenFull()) return;
     if (e.key === "ArrowLeft")  { e.preventDefault(); jump(-1); }
     if (e.key === "ArrowRight") { e.preventDefault(); jump(1); }
   });
@@ -6716,9 +6719,11 @@ function renderSeriesEpisodes(seriesItem, info, sn, onPlay = playEpisode) {
   // progress / watched. Fetched once per detail open (openSeries /
   // openDiskSeriesGroup), applied to whichever season is rendered.
   const extrasP = state.openEpisodesExtras;
+  setSeasonOverview("");
   if (extrasP) extrasP.then((map) => {
     if (!map || state.openEpisodesExtras !== extrasP) return;
     applyEpisodeExtras(map);
+    if (el.seriesSeasonSelect.value === String(sn) || !el.seriesSeasonSelect.value) setSeasonOverview(map.seasonInfo?.get(String(sn))?.overview || "");
   });
 
   // Upgrade thumbnails to TMDB stills when available. Single fetch
@@ -6748,7 +6753,9 @@ async function fetchEpisodesExtras(mode, id) {
     if (!r.ok) return null;
     const d = await r.json();
     const map = new Map();
+    map.seasonInfo = new Map(); // season number (string) -> { name, overview, poster }
     for (const season of d?.seasons || []) {
+      if (season && season.season != null) map.seasonInfo.set(String(season.season), season);
       for (const ep of season?.episodes || []) if (ep && ep.id != null) map.set(String(ep.id), ep);
     }
     return map;
@@ -6768,6 +6775,7 @@ function applyEpisodeExtras(map) {
       img.src = url;
     }
     if (ep.watched) node.classList.add("watched");
+    applyEpisodeInfo(node, ep);
     const pr = ep.progress;
     const pct = pr && Number.isFinite(pr.pct) ? Math.min(99, Math.max(2, Math.round(pr.pct))) : null;
     if (pct != null && thumbEl) {
@@ -6789,6 +6797,63 @@ function applyEpisodeExtras(map) {
       if (resume) resume.textContent = `Resume at ${pct}%`;
     }
   }
+}
+
+function setSeasonOverview(text) {
+  const box = document.getElementById("series-season-overview");
+  if (!box) return;
+  box.textContent = text || "";
+  box.hidden = !text;
+}
+// Richer row from /api/episodes: "52m · ★ 8.4", the server's chosen synopsis
+// (2-3 lines), and an expander with the full synopsis, guest stars and crew.
+function applyEpisodeInfo(node, ep) {
+  const head = node.querySelector(".ep-head");
+  const body = node.querySelector(".ep-body");
+  if (!head || !body) return;
+  const titleEl = head.querySelector(".ep-title");
+  if (titleEl && typeof ep.display_title === "string" && ep.display_title.trim()) {
+    titleEl.title = titleEl.textContent; // full panel title on hover
+    titleEl.textContent = ep.display_title.trim();
+  }
+  const runtime = KNf.episodeRuntime(ep);
+  const rating = Number.isFinite(ep.rating) ? `\u2605 ${ep.rating.toFixed(1)}` : "";
+  const metaText = [runtime, rating].filter(Boolean).join(" \u00b7 ");
+  if (metaText) {
+    let meta = head.querySelector(".ep-meta");
+    if (!meta) { meta = document.createElement("span"); meta.className = "ep-meta"; head.appendChild(meta); }
+    meta.textContent = metaText;
+  }
+  const plotText = typeof ep.plot === "string" ? ep.plot.trim() : "";
+  let plot = body.querySelector(".ep-plot");
+  if (plotText) {
+    if (!plot) { plot = document.createElement("div"); plot.className = "ep-plot"; head.after(plot); }
+    plot.textContent = plotText;
+  }
+  const cr = KNf.episodeCredits(ep);
+  const air = /^\d{4}-\d{2}-\d{2}$/.test(ep.air_date || "") ? ep.air_date : "";
+  const hasMore = cr.guests || cr.crew || (plotText.length > 140);
+  node.querySelector(".ep-more")?.remove();
+  node.querySelector(".ep-expand")?.remove();
+  if (!hasMore) return;
+  const more = document.createElement("div");
+  more.className = "ep-more";
+  if (air) { const d = document.createElement("div"); d.className = "ep-air"; d.textContent = `Aired ${air}`; more.appendChild(d); }
+  if (cr.guests) { const d = document.createElement("div"); d.className = "ep-guests"; d.textContent = `Guest stars: ${cr.guests}`; more.appendChild(d); }
+  if (cr.crew) { const d = document.createElement("div"); d.className = "ep-crew"; d.textContent = cr.crew; more.appendChild(d); }
+  body.appendChild(more);
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "ep-expand";
+  btn.setAttribute("aria-expanded", "false");
+  btn.setAttribute("aria-label", "More about this episode");
+  btn.textContent = "\u25be";
+  btn.onclick = (e) => {
+    e.stopPropagation(); // the row itself plays the episode
+    const open = node.classList.toggle("expanded");
+    btn.setAttribute("aria-expanded", String(open));
+  };
+  head.appendChild(btn);
 }
 
 function closeSeries() {
@@ -8731,6 +8796,65 @@ el.castHere.onclick = () => {
   });
 };
 
+function playerOpenFull() {
+  return !!state.playing && !el.player.hidden && el.player.getAttribute("data-mode") !== "mini";
+}
+function playerKeyContext(e, inField) {
+  const ae = document.activeElement;
+  return {
+    playerOpen: playerOpenFull(),
+    mini: el.player.getAttribute("data-mode") === "mini",
+    inField: inField || !!(ae && ae.isContentEditable),
+    modifier: e.metaKey || e.ctrlKey || e.altKey,
+    menuOpen: !!(el.playerTracksMenu && !el.playerTracksMenu.hidden) || !el.liveRemote.hidden,
+    live: state.playing && state.playing.mode === "live",
+    casting: !!state.castSession,
+  };
+}
+// Repeated arrow presses build on the pending target (1.2 s window). A target
+// inside what is already playable seeks at once; one that needs the transcode
+// re-anchored waits until the presses stop, so holding the key restarts
+// ffmpeg once, not once per repeat.
+let _keySeek = null; // { target, at, timer }
+function runPlayerKeyAction(act) {
+  showControls();
+  if (act.kind === "seek") {
+    const p = state.playing;
+    if (!p) return;
+    const now = performance.now();
+    const pos = ((p.transcodeAnchorSecs) || 0) + el.video.currentTime;
+    const pending = _keySeek && now - _keySeek.at < 1200 ? _keySeek.target : NaN;
+    const target = KNf.keySeekTarget(pos, act.delta, scrubDurationSecs(), pending);
+    if (_keySeek && _keySeek.timer) clearTimeout(_keySeek.timer);
+    _keySeek = { target, at: now, timer: null };
+    const inPlaylist = target - ((p.transcodeAnchorSecs) || 0);
+    const pd = el.video.duration;
+    if (!p.transcode || (inPlaylist >= 0 && Number.isFinite(pd) && inPlaylist < pd)) {
+      seekToSecs(target);
+    } else {
+      setScrubVisual(scrubDurationSecs() > 0 ? target / scrubDurationSecs() : 0);
+      _keySeek.timer = setTimeout(() => { if (state.playing === p) seekToSecs(target); }, 600);
+    }
+    return;
+  }
+  if (act.kind === "volume") {
+    if (el.video.muted && act.delta > 0) el.video.muted = false;
+    el.video.volume = Math.max(0, Math.min(1, Math.round((el.video.volume + act.delta) * 10) / 10));
+    toast(`Volume ${Math.round(el.video.volume * 100)}%`, 900);
+    return;
+  }
+  if (act.kind === "mute") {
+    el.video.muted = !el.video.muted;
+    toast(el.video.muted ? "Muted" : "Sound on", 900);
+    return;
+  }
+  if (act.kind === "fullscreen") {
+    const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+    if (fsEl) (document.exitFullscreen || document.webkitExitFullscreen).call(document)?.catch?.(() => {});
+    else setPlayerMode("fullscreen");
+  }
+}
+
 document.addEventListener("keydown", (e) => {
   // Live remote channel-zap shortcuts. Only fire when a live stream is
   // playing AND focus isn't in a text input (so search / number-entry
@@ -8752,6 +8876,15 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     if (el.video.paused) el.video.play();
     else el.video.pause();
+    return;
+  }
+  // Right/Left seek, Up/Down volume, m mute, f fullscreen (KNf.playerKeyAction).
+  // Works whichever player control (or the page) has focus; never while typing.
+  const keyAct = KNf.playerKeyAction(e.key, playerKeyContext(e, inField));
+  if (keyAct) {
+    e.preventDefault();
+    e.stopPropagation();
+    runPlayerKeyAction(keyAct);
     return;
   }
   if (e.key === "/" && document.activeElement !== el.search) {

@@ -190,6 +190,57 @@
     return typeof key === "string" && /^[A-Za-z0-9_-]{6,20}$/.test(key) ? `/api/trailer/${key}/preview.mp4` : null;
   }
 
+  // ---- Player keyboard shortcuts -----------------------------------------
+  // Right / Left = +/- 10 s (same step as the TV and phone players), Up /
+  // Down = volume +/- 10 %, m = mute, f = fullscreen. Space is handled by its
+  // own play/pause shortcut. null = not a player key here (typing in a field,
+  // a modifier held, the player minimised or hidden, a menu open, or casting).
+  // Live has no seek; Up / Down there belong to the channel remote when it is
+  // on (the caller handles that first).
+  const SEEK_STEP_SEC = 10;
+  const VOLUME_STEP = 0.1;
+  function playerKeyAction(key, ctx) {
+    const c = ctx || {};
+    if (!c.playerOpen || c.mini || c.inField || c.modifier || c.menuOpen) return null;
+    switch (key) {
+      case "ArrowRight": return c.live || c.casting ? null : { kind: "seek", delta: SEEK_STEP_SEC };
+      case "ArrowLeft": return c.live || c.casting ? null : { kind: "seek", delta: -SEEK_STEP_SEC };
+      case "ArrowUp": return c.casting ? null : { kind: "volume", delta: VOLUME_STEP };
+      case "ArrowDown": return c.casting ? null : { kind: "volume", delta: -VOLUME_STEP };
+      case "m": case "M": return c.casting ? null : { kind: "mute" };
+      case "f": case "F": return { kind: "fullscreen" };
+      default: return null;
+    }
+  }
+  // Target of a key seek, from the pending target when keys repeat (so 3
+  // quick presses add 30 s even while the first seek is still landing),
+  // clamped to [0, duration - 1].
+  function keySeekTarget(pos, delta, duration, pending) {
+    const base = Number.isFinite(pending) ? pending : pos;
+    let t = (Number.isFinite(base) ? base : 0) + delta;
+    if (Number.isFinite(duration) && duration > 0) t = Math.min(t, Math.max(0, duration - 1));
+    return Math.max(0, t);
+  }
+
+  // ---- Richer episode rows (/api/episodes, docs/NETFLIX_FEATURES.md #6) ---
+  // "52m" (or "1h 5m"), from runtime_mins, else duration_secs.
+  function episodeRuntime(ep) {
+    let m = ep && Number.isFinite(ep.runtime_mins) && ep.runtime_mins > 0 ? Math.round(ep.runtime_mins) : null;
+    if (m == null && ep && Number.isFinite(ep.duration_secs) && ep.duration_secs > 0) m = Math.round(ep.duration_secs / 60);
+    if (!m) return "";
+    return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`;
+  }
+  // Expanded-row credit lines; empty strings when unknown.
+  function episodeCredits(ep) {
+    const names = (a) => (Array.isArray(a) ? a.filter((x) => typeof x === "string" && x.trim()).slice(0, 3) : []);
+    const guests = (Array.isArray(ep && ep.guest_stars) ? ep.guest_stars : [])
+      .filter((g) => g && typeof g.name === "string" && g.name.trim()).slice(0, 3)
+      .map((g) => (g.character ? `${g.name} (${g.character})` : g.name));
+    const dir = names(ep && ep.directors), wr = names(ep && ep.writers);
+    const crew = [dir.length ? `Directed by ${dir.join(", ")}` : "", wr.length ? `Written by ${wr.join(", ")}` : ""].filter(Boolean).join(" · ");
+    return { guests: guests.join(", "), crew };
+  }
+
   const api = {
     TRICKPLAY_REFRESH_MS, frameFor, frameUrl, previewLeft, trickplaySupported,
     CREDITS_COUNTDOWN_SEC, MARKERS_REFETCH_AFTER_MS, markersSupported, skipAction, inCredits,
@@ -197,6 +248,8 @@
     createStillWatching,
     TITLE_CARD_PALETTE, displayTitle, paletteIndex, titleCardColors, javaHash,
     PREVIEW_FAIL_RETRY_MS, previewAllowed, previewUrlFor,
+    SEEK_STEP_SEC, VOLUME_STEP, playerKeyAction, keySeekTarget,
+    episodeRuntime, episodeCredits,
   };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.KNf = api;
