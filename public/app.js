@@ -1121,6 +1121,7 @@ function showSearchAll() {
 // sub-toggle swaps which collection payload renders. Reuses the home
 // chip strip + renderRail so tiles play/open exactly like the home rails.
 function enterCollection(subMode, opts = {}) {
+  stopAllPreviews();
   if (state.playing && el.player.dataset.mode === "theater") setPlayerMode("mini");
   state.view = "collection";
   if (subMode === "movie" || subMode === "series") state.collectionMode = subMode;
@@ -1621,10 +1622,29 @@ function previewKeyUsable(key) {
 // Only start a preview the server can answer at once: /api/poster's
 // `trailer.cached` (an uncached key answers 404, which the browser logs).
 // Resolves to the preview URL, or null.
+const _trailerRecheckAt = new Map(); // `${mode}:${id}` -> last uncached re-check
 async function cachedPreviewUrl(mode, id, key) {
   if (!mode || mode === "live" || id == null) return null;
   const d = await posterFor(mode, id);
-  const t = d && d.trailer;
+  let t = d && d.trailer;
+  // posterFor is memoised for the session; a trailer downloaded since
+  // then is re-checked (at most once a minute per title).
+  if (t && !t.cached) {
+    const k = `${mode}:${id}`;
+    if (Date.now() - (_trailerRecheckAt.get(k) || 0) > 60_000) {
+      _trailerRecheckAt.set(k, Date.now());
+      try {
+        const r = await fetch(`/api/poster/${mode}/${encodeURIComponent(id)}`);
+        if (r.ok) {
+          const fresh = await r.json();
+          if (fresh && fresh.trailer) {
+            t = fresh.trailer;
+            if (_posterMem.get(k)) _posterMem.get(k).trailer = fresh.trailer;
+          }
+        }
+      } catch {}
+    }
+  }
   if (!t || !t.cached || (key && t.key && t.key !== key)) return null;
   return typeof t.preview === "string" ? t.preview : KNf.previewUrlFor(t.key);
 }
@@ -1688,6 +1708,8 @@ function scheduleHeroPreview(pick) {
     });
     const fade = el.hero.querySelector(".hero-fade");
     if (fade) el.hero.insertBefore(hp.video, fade); else el.hero.appendChild(hp.video);
+    // A stalled clip (no error, no end) must not freeze the rotation.
+    hp.timer = setTimeout(() => { if (_heroPreview === hp) { stopHeroPreview(); if (_heroItems.length > 1) advanceHero(); } }, 45_000);
   }, HERO_PREVIEW_DELAY_MS);
 }
 function resumeHeroPreview() {
@@ -1755,8 +1777,10 @@ document.addEventListener("mouseout", (e) => {
 });
 document.addEventListener("focusin", (e) => {
   const card = e.target.closest && e.target.closest(".channel[data-trailer-key]");
-  if (card) startTilePreview(card);
-  else if (_tilePreview) endTilePreview();
+  let kb = false;
+  try { kb = e.target.matches(":focus-visible"); } catch {}
+  if (card && kb) startTilePreview(card);
+  else if (_tilePreview && !card) endTilePreview();
 });
 // A rail scrolled under a still pointer moves the tile away from it.
 document.addEventListener("scroll", () => { if (_tilePreview) endTilePreview(); }, { capture: true, passive: true });
@@ -1766,6 +1790,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function renderRails() {
+  stopTilePreview();
   el.rails.innerHTML = "";
   const mode = state.mode;
 
@@ -1809,8 +1834,12 @@ function renderRails() {
     const colls = (mode === "movie" && (!picks || picks.size === 0) && Array.isArray(serverHome.collections?.items))
       ? serverHome.collections.items : [];
     let railsShown = 0;
+    let collsInserted = false;
     const maybeCollections = () => {
-      if (colls.length && railsShown === COLLECTIONS_SLOT) el.rails.appendChild(renderCollectionsRail(serverHome.collections));
+      if (colls.length && !collsInserted && railsShown === COLLECTIONS_SLOT) {
+        el.rails.appendChild(renderCollectionsRail(serverHome.collections));
+        collsInserted = true;
+      }
     };
     for (const r of serverHome.rails) {
       let items = gate(r.items || []);
@@ -1838,8 +1867,8 @@ function renderRails() {
       }));
       railsShown++;
     }
-    // Fewer rails than the slot: collections go last.
-    if (colls.length && railsShown < COLLECTIONS_SLOT) el.rails.appendChild(renderCollectionsRail(serverHome.collections));
+    // Not more rails than the slot: collections go last.
+    if (colls.length && !collsInserted) el.rails.appendChild(renderCollectionsRail(serverHome.collections));
     return;
   }
 
@@ -4024,9 +4053,7 @@ function getPosterObserver() {
       _posterObserver.unobserve(card);
       const logo = card.querySelector(".logo");
       if (!logo) continue;
-      // Art in order: the server-resolved poster, else the panel icon. An
-      // http: icon on an https page is mixed content (blocked or noisy):
-      // skip it and keep the title card.
+      // Art in order: the server-resolved poster, else the panel icon.
       const loadArt = (url, onFail) => {
         const img = new Image();
         img.referrerPolicy = "no-referrer";
@@ -4039,10 +4066,12 @@ function getPosterObserver() {
         if (onFail) img.onerror = onFail;
         img.src = url;
       };
-      const icon = card.dataset.icon;
-      const iconOk = icon && !(location.protocol === "https:" && /^http:/i.test(icon));
-      if (card.dataset.poster) loadArt(card.dataset.poster, iconOk ? () => loadArt(icon) : null);
-      else if (iconOk) loadArt(icon);
+      // An http: icon on an https page: ask for its https twin (what Chrome's
+      // mixed-content upgrade did); a failure keeps the title card.
+      let icon = card.dataset.icon;
+      if (icon && location.protocol === "https:" && /^http:/i.test(icon)) icon = icon.replace(/^http:/i, "https:");
+      if (card.dataset.poster) loadArt(card.dataset.poster, icon ? () => loadArt(icon) : null);
+      else if (icon) loadArt(icon);
       const mode = card.dataset.posterMode;
       const id = card.dataset.posterId;
       if (!mode || !id) continue;
@@ -6067,9 +6096,29 @@ function refreshNextEpisode() {
 
 // Play whatever state.playing.nextEpisode points at. Used by both the
 // Up-Next "Play now" button and autoplay-on-end.
+// Leaving an episode for the next one from its credits: save it as
+// finished (the credits can start before the 95 % / last-30-s rule), so it
+// doesn't linger in Continue Watching at "Resume at 94%".
+function markPlayingFinished() {
+  const p = state.playing;
+  const key = _progressKey;
+  if (!p || !key || p.mode === "live") return;
+  const dur = scrubDurationSecs();
+  if (!(dur > 0)) return;
+  clearProgressTracking();
+  delete state.progress[key];
+  const i = key.indexOf(":");
+  fetch(`/api/progress/${key.slice(0, i)}/${encodeURIComponent(key.slice(i + 1))}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ position: dur, duration: dur }),
+    keepalive: true,
+  }).catch(() => {});
+}
 function playNextEpisode() {
   const next = state.playing && state.playing.nextEpisode;
   if (!next || !next._pick) return;
+  markPlayingFinished();
   const { seriesItem, ep, sn, data } = next._pick;
   hideUpNext();
   if (state.playing.mode === "disk") playDiskEpisode(seriesItem, ep, sn, data);
@@ -6184,7 +6233,7 @@ function renderSeriesEpisodes(seriesItem, info, sn, onPlay = playEpisode) {
       const node = el.seriesEpisodes.querySelector(`.episode[data-ep-id="${CSS.escape(epId)}"]`);
       if (!node) continue;
       const thumbEl = node.querySelector(".ep-thumb");
-      if (!thumbEl) continue;
+      if (!thumbEl || thumbEl.dataset.still) continue; // /api/episodes still already applied
       const img = new Image();
       img.referrerPolicy = "no-referrer";
       img.onload = () => { thumbEl.style.backgroundImage = `url("${stills[epId]}")`; };
@@ -6214,6 +6263,7 @@ function applyEpisodeExtras(map) {
       const url = ep.still;
       const img = new Image();
       img.referrerPolicy = "no-referrer";
+      thumbEl.dataset.still = "1";
       img.onload = () => { thumbEl.style.backgroundImage = `url("${url}")`; };
       img.src = url;
     }
@@ -7136,14 +7186,14 @@ function updateScrubBar() {
   if (act && act.kind === "credits" && !p.creditsDismissed) {
     // Counts only while actually playing; the card replaces Up Next.
     const now = performance.now();
-    if (!el.video.paused && p._creditsTick) p.creditsPlayedMs = (p.creditsPlayedMs || 0) + Math.min(1000, now - p._creditsTick);
+    if (!el.video.paused && el.video.readyState >= 3 && p._creditsTick) p.creditsPlayedMs = (p.creditsPlayedMs || 0) + Math.min(1000, now - p._creditsTick);
     p._creditsTick = el.video.paused ? 0 : now;
     const left = KNf.countdownLeft(p.creditsPlayedMs || 0);
     if (left <= 0) { autoAdvanceToNext(); return; }
     showUpNext(left);
     return;
   }
-  if (p) p._creditsTick = 0;
+  if (p) { p._creditsTick = 0; if (!act || act.kind !== "credits") p.creditsPlayedMs = 0; }
   // Up-Next card: surface in the last ~20s of an episode that has a next
   // episode (when no credits marker is known, or the viewer chose to watch
   // the credits). denom is the authoritative full duration (handles the
@@ -7256,15 +7306,21 @@ elScrubTrack.addEventListener("pointerdown", (e) => {
     lastPct = pctFromEvent(ev);
     setScrubVisual(lastPct);
   };
-  const onUp = (ev) => {
+  const cleanup = () => {
     _scrubDragging = false;
-    seekToPct(lastPct);
     elScrubTrack.removeEventListener("pointermove", onMove);
+    elScrubTrack.removeEventListener("pointerup", onUp);
+    elScrubTrack.removeEventListener("pointercancel", onCancel);
+  };
+  const onUp = (ev) => {
+    cleanup();
+    seekToPct(lastPct);
     if (ev.pointerType !== "mouse") hideTrickplay();
   };
+  const onCancel = () => { cleanup(); hideTrickplay(); };
   elScrubTrack.addEventListener("pointermove", onMove);
-  elScrubTrack.addEventListener("pointerup", onUp, { once: true });
-  elScrubTrack.addEventListener("pointercancel", () => { _scrubDragging = false; hideTrickplay(); }, { once: true });
+  elScrubTrack.addEventListener("pointerup", onUp);
+  elScrubTrack.addEventListener("pointercancel", onCancel);
 });
 // Scrub-thumbnail preview (#1): follows the pointer over the bar (mouse
 // hover or a drag); hidden when there are no frames near that time.
@@ -7297,6 +7353,7 @@ async function loadTrickplay(p) {
     const info = await r.json();
     if (state.playing !== p) return;
     p.trickplay = info && Array.isArray(info.frames) && info.frames.length ? info : null;
+    if (info && info.complete && p._trickplayTimer) { clearInterval(p._trickplayTimer); p._trickplayTimer = null; }
     if (!p._trickplayTimer && p.transcode && !(info && info.complete)) {
       p._trickplayTimer = setInterval(() => {
         if (state.playing !== p) { clearInterval(p._trickplayTimer); return; }
@@ -7410,16 +7467,20 @@ function answerStillWatching(ok) {
 el.playerStillContinue.addEventListener("click", (e) => { e.stopPropagation(); answerStillWatching(true); });
 el.playerStillBack.addEventListener("click", (e) => { e.stopPropagation(); answerStillWatching(false); });
 // Capture phase so the prompt sees keys before the global shortcuts.
+const MODIFIER_KEYS = new Set(["Shift", "Control", "Meta", "Alt", "AltGraph", "CapsLock", "Fn", "OS"]);
 document.addEventListener("keydown", (e) => {
+  const inField = document.activeElement && /^(input|textarea|select)$/i.test(document.activeElement.tagName);
   if (_stillResolve) {
+    // Modifiers / shortcuts (Cmd-Tab, Ctrl-C, ...) and typing in a field are not an answer.
+    if (inField || MODIFIER_KEYS.has(e.key) || e.metaKey || e.ctrlKey || e.altKey) return;
     if (e.key === "Tab") return; // keep keyboard focus moves between the two buttons
-    if ((e.key === "Enter" || e.key === " ") && document.activeElement === el.playerStillBack) return; // let the button's own click run
     e.preventDefault();
     e.stopPropagation();
-    answerStillWatching(e.key !== "Escape");
+    const onBack = document.activeElement === el.playerStillBack && (e.key === "Enter" || e.key === " ");
+    answerStillWatching(!onBack && e.key !== "Escape");
     return;
   }
-  if (state.playing && !el.player.hidden) _stillWatching.onUserInteraction();
+  if (state.playing && !el.player.hidden && !inField && !MODIFIER_KEYS.has(e.key)) _stillWatching.onUserInteraction();
 }, true);
 el.player.addEventListener("pointerdown", () => _stillWatching.onUserInteraction(), true);
 el.player.addEventListener("wheel", () => _stillWatching.onUserInteraction(), { capture: true, passive: true });

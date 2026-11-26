@@ -1765,6 +1765,7 @@ body.player-theater #search-all-view { display: none; }
   z-index: 1;
 }
 #player-scrub-track {
+  touch-action: none;
   flex: 1;
   height: 4px;
   background: rgba(255,255,255,.25);
