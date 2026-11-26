@@ -71,8 +71,9 @@ test("owner key classification", () => {
 
 test("grace env", () => {
   assert.strictEqual(s.graceMsFrom(undefined), 120_000);
-  assert.strictEqual(s.graceMsFrom("5000"), 5000);
-  assert.strictEqual(s.graceMsFrom("0"), 0);
+  assert.strictEqual(s.graceMsFrom("60000"), 60000);
+  assert.strictEqual(s.graceMsFrom("5000"), 15000);
+  assert.strictEqual(s.graceMsFrom("0"), 15000);
   assert.strictEqual(s.graceMsFrom("abc"), 120_000);
   assert.strictEqual(s.graceMsFrom(String(31 * 60_000)), 120_000);
 });

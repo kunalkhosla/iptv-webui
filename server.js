@@ -2607,7 +2607,10 @@ async function prewarmEpgInner(actx) {
     await yieldToViewers("xmltv", actx);
     const url = `${actx.host}/xmltv.php?username=${encodeURIComponent(actx.user)}&password=${encodeURIComponent(actx.pass)}`;
     console.log(`[epg] fetching provider xmltv.php …`);
-    const text = await fetchXmltvText(url, EPG_XMLTV_TIMEOUT_MS);
+    // One long provider request: hold Save-to-Disk jobs off for all of it.
+    diskDownloadPanelBusy++;
+    let text;
+    try { text = await fetchXmltvText(url, EPG_XMLTV_TIMEOUT_MS); } finally { diskDownloadPanelBusy--; }
     const parsed = parseXmltv(text);
     if (!parsed.progs.size) console.warn(`[epg] provider xmltv parsed 0 programmes from ${(text.length / 1024).toFixed(0)} KB; head: ${text.slice(0, 200).replace(/\s+/g, " ")}`);
     mergeIn("provider", parsed);
@@ -3909,11 +3912,13 @@ async function fetchCategoriesResilient(mode, m, actx) {
 // each panel call, wait while any viewer is active (stream seen within the
 // idle grace and not displaced). `streams` is declared further down; only
 // read inside functions that run after startup.
-function streamingNow(actx) {
+// viewersOnly: ignore Save-to-Disk / phone-download transfers.
+function streamingNow(actx, { viewersOnly = false } = {}) {
   const now = Date.now();
   const key = actx ? accountKeyOf(actx) : null;
-  for (const v of streams.values()) {
+  for (const [owner, v] of streams) {
     if (v.displaced || now - v.lastSeen >= LIVE_IDLE_GRACE_MS) continue;
+    if (viewersOnly && diskDlSchedule.isBackgroundOwner(owner)) continue;
     if (key && v.accountKey !== key) continue; // the 1-connection cap is per panel account
     if (v.mode === "disk") continue; // local files never touch the panel
     return true;
@@ -3923,12 +3928,15 @@ function streamingNow(actx) {
 async function yieldToViewers(label, actx) {
   const t0 = Date.now();
   let paused = false;
-  while (streamingNow(actx)) {
+  while (streamingNow(actx, { viewersOnly: true })) {
     if (!paused) console.log(`[index] ${label}: viewer active — pausing panel calls until the stream ends`);
     paused = true;
     await new Promise((r) => setTimeout(r, 15_000));
   }
   if (paused) console.log(`[index] ${label}: resumed after ${Math.round((Date.now() - t0) / 1000)}s`);
+  // Catalog / EPG refreshes outrank a Save-to-Disk transfer: claim the
+  // provider connection (the job waits while the claim is fresh).
+  if (claimPanelFromDiskDownloads(label)) await new Promise((r) => setTimeout(r, 1500));
 }
 
 async function buildIndex(mode, actx = currentAccount(), { noYield = false } = {}) {
@@ -4621,7 +4629,7 @@ function isDiskDownloadWindowOpen() {
 // { run, waitingFor } for a job right now. `selfOwner`: the job's own streams key.
 function diskDownloadGate(selfOwner = null) {
   diskDownloadLastViewerAt = diskDlSchedule.latestViewerSeen(streams, diskDownloadLastViewerAt);
-  return diskDlSchedule.decideDiskDownload({
+  const d = diskDlSchedule.decideDiskDownload({
     now: Date.now(),
     windowEnabled: DISK_DOWNLOAD_WINDOW.enabled,
     windowOpen: isDiskDownloadWindowOpen(),
@@ -4629,6 +4637,9 @@ function diskDownloadGate(selfOwner = null) {
     lastViewerAt: diskDownloadLastViewerAt,
     graceMs: DISK_DOWNLOAD_RESUME_GRACE_MS,
   });
+  // A catalog / EPG refresh claimed the connection recently.
+  if (d.run && (diskDownloadPanelBusy > 0 || Date.now() - diskDownloadPanelClaimAt < DISK_DOWNLOAD_PANEL_CLAIM_MS)) return { run: false, waitingFor: "queue" };
+  return d;
 }
 // A viewer asked to play (GET /api/stream): stop any Save-to-Disk transfer NOW,
 // synchronously, so its upstream connection is already closing before the
@@ -4636,6 +4647,33 @@ function diskDownloadGate(selfOwner = null) {
 // tagged displaced (as admitStream would) so it never counts against the
 // viewer's admission; the job's own abort path deletes it and goes back to
 // waiting for the grace.
+// Background panel work (catalog rebuild, EPG) wants the connection: hold
+// jobs back for DISK_DOWNLOAD_PANEL_CLAIM_MS after the latest claim (each
+// rebuild step re-claims) and stop a running transfer. True if one stopped.
+const DISK_DOWNLOAD_PANEL_CLAIM_MS = 30_000;
+let diskDownloadPanelClaimAt = 0;
+let diskDownloadPanelBusy = 0; // a long provider request (xmltv) in flight
+function claimPanelFromDiskDownloads(label) {
+  diskDownloadPanelClaimAt = Date.now();
+  let n = 0;
+  for (const [k, v] of streams) {
+    if (!diskDlSchedule.isDiskDownloadOwner(k) || v.displaced) continue;
+    v.displaced = true;
+    for (const kill of v.killers) { try { kill("queue"); } catch {} }
+    n++;
+  }
+  if (n) console.log(`[disk-download] yielding to panel work (${label})`);
+  return n > 0;
+}
+// Trailers come from YouTube, not the panel: only real viewers matter.
+function streamingNowViewers60s() {
+  const now = Date.now();
+  for (const [owner, v] of streams) {
+    if (v.displaced || now - v.lastSeen >= 60_000 || v.mode === "disk") continue;
+    if (!diskDlSchedule.isBackgroundOwner(owner)) return true;
+  }
+  return false;
+}
 function preemptDiskDownloadsForViewer(reason) {
   diskDownloadLastViewerAt = Date.now();
   let n = 0;
@@ -4736,9 +4774,11 @@ async function runDiskDownloadJob(job) {
         if (ac.signal.aborted) throw new Error("aborted");
         if (!r.sourceUrl) throw new Error(`source unavailable: ${redactAllUrls(r.error)}`);
         sourceUrl = r.sourceUrl;
-        job.ext = r.ext;
-        destPath = diskDownloadDestPath(rootPath, job);
-        tmpPath = `${destPath}.part`;
+        if (!destPath) {
+          job.ext = r.ext;
+          destPath = diskDownloadDestPath(rootPath, job);
+          tmpPath = `${destPath}.part`;
+        }
       }
 
       let startByte = 0;
@@ -4838,6 +4878,7 @@ async function runDiskDownloadJob(job) {
         // A viewer took the slot (or the reaper freed a stalled transfer).
         // Expected, not an error: back to the gate, then resume via Range.
         console.log(`[disk-download] ${job.jobId} paused (${job.pausedReason || "displaced"}) at ${(job.bytesWritten / 1024 / 1024).toFixed(0)} MB — will resume`);
+        sourceUrl = null; // re-resolve on resume (a panel failover may have moved hosts)
         setStatus("paused");
         continue;
       }
@@ -5503,8 +5544,11 @@ async function runDownloadJob(job) {
     if (Date.now() - job.createdAt > DL_MAX_QUEUE_AGE_MS) { job.state = "failed"; job.stage = "failed"; job.error = "timed out: download pending for over 3 days"; return; }
     if (Date.now() - job.startedAt > DL_MAX_JOB_AGE_MS) { job.state = "failed"; job.stage = "failed"; job.error = "timed out waiting for the provider connection"; return; }
     // Never touch the provider while someone else holds the slot (newest-wins would evict the viewer).
-    const slotHeld = [...streams.entries()].some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced);
+    // A Save-to-Disk transfer is not "someone": a phone download (a person
+    // waiting for it) takes the slot from it.
+    const slotHeld = [...streams.entries()].some(([k, v]) => k !== owner && v.accountKey === accountKey && !v.displaced && !diskDlSchedule.isDiskDownloadOwner(k));
     if (slotHeld) { await waitForViewer(); continue; }
+    preemptDiskDownloadsForViewer("phone download");
     const ac = new AbortController();
     const killer = () => ac.abort();
     const admission = admitStream(owner, mode, id, killer, accountKey);
@@ -6982,7 +7026,7 @@ const trailerPrefetch = createPrewarmQueue({
     if (!f) throw new Error("unavailable");
   },
   isCached: (e) => trailerCache.has(e.trailerKey) || trailerCache.isNegative(e.trailerKey),
-  shouldYield: () => trailerCache.busy() || streamingRecentlyIn(streams, null, 60_000),
+  shouldYield: () => trailerCache.busy() || streamingNowViewers60s(),
   gapMs: 5_000,
   yieldMs: 30_000,
   cap: 40,

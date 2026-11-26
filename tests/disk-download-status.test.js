@@ -96,3 +96,9 @@ test("waiting_for: a queued job that is next waits for a viewer (no window confi
   assert.strictEqual(diskJobWaitingFor({ status: "queued" }, true, false, false), null);
   assert.strictEqual(projectDiskDownloadJob({ ...base }, { windowOpen: true, viewerWaiting: true }).waiting_for, "viewer");
 });
+
+test("waiting_for: a job paused for a phone download / panel work says queue", () => {
+  assert.strictEqual(diskJobWaitingFor({ status: "paused", pausedReason: "queue" }, true), "queue");
+  assert.strictEqual(diskJobWaitingFor({ status: "paused", pausedReason: "viewer" }, true), "viewer");
+  assert.strictEqual(diskJobWaitingFor({ status: "paused", pausedReason: "play movie" }, true), "viewer");
+});

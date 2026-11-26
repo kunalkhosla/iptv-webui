@@ -23,7 +23,7 @@ time and only while nobody is watching:
   the transfer through admitStream's oldest-evicted rule.
 - **Resumes on its own** (HTTP Range from the `.part` file, never from zero)
   once the slot is free and no viewer activity was seen for
-  `DISK_DOWNLOAD_RESUME_GRACE_MS` (default 120000). A viewer's slot is held
+  `DISK_DOWNLOAD_RESUME_GRACE_MS` (default 120000, min 15000). A viewer's slot is held
   while it is playing, buffering, or paused with keep-alive heartbeats
   (`docs/PAUSE_KEEPALIVE.md`), and freed by the idle reaper
   (`LIVE_IDLE_GRACE_MS`, 180 s on hestia), so in practice a job resumes about
@@ -37,9 +37,13 @@ time and only while nobody is watching:
 - **Background, not a viewer.** A transfer never makes the idle reaper touch a
   viewer, never counts as "watching" for TARS `now_streaming` or the media
   sidecar, and is excluded from `GET /api/streams` `active` (listed with
-  `background: true`; top-level `background` = their count). Background panel
-  work (catalog rebuild, surround crawl, detail prewarm) still yields to it,
-  since it holds the provider connection.
+  `background: true`; top-level `background` = their count).
+- **Other users of the connection.** A phone download (`/api/download`
+  prepare) takes the slot from a transfer the same way a viewer does. Catalog
+  rebuilds, the provider xmltv fetch and the 4K quality prewarm also stop a
+  running transfer and hold jobs off while they run (+30 s); the job shows
+  `waiting_for: "queue"`. The surround crawler and detail prewarm still yield
+  to a transfer.
 
 **Optional overnight window (opt-in).** Set BOTH
 `DISK_DOWNLOAD_WINDOW_START_HOUR` and `DISK_DOWNLOAD_WINDOW_END_HOUR` (0-23,
