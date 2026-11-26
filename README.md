@@ -137,6 +137,17 @@ TMDB title-logo art is cached per title and exposed as `logo` (full w500 PNG URL
 
 Multi-audio panel VOD: the track list is learned from the transcoder's own ffmpeg (no extra provider connection on a cap=1 account) or an idle-time ffprobe, and a fresh play defaults to the title's original language, then the profile's `audioLangPrefs` (default `hin`, `eng`), then the file default; `&at=N` overrides. See [docs/AUDIO_TRACKS.md](docs/AUDIO_TRACKS.md).
 
+## Scrub thumbnails, skip intro / credits, collections, episode progress
+
+`/api/trickplay/:mode/:id` (seek-bar preview frames), `/api/markers/:mode/:id`
+(intro / credits times from audio fingerprints), `/api/trailer/:key/preview.mp4`
+(muted 30 s preview), `/api/collections` + `/api/collections/:id` (TMDB
+collections in release order, also `collections` on the movie home payload),
+`/api/episodes/:mode/:id` (episode stills + per-profile progress). Built only
+from transcodes a viewer is already running and from Disk-library files, never
+from an extra panel stream, so coverage is partial. Contract:
+[docs/NETFLIX_FEATURES.md](docs/NETFLIX_FEATURES.md).
+
 ## Native trailers (`/api/trailer/:key.mp4`)
 
 Trailers play inside the apps instead of opening YouTube. Details and the

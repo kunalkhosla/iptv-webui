@@ -309,3 +309,37 @@ test("contract: userState carries a `seenSnooze` store the PUT accepts", () => {
     throw new Error("PUT /api/user-state no longer accepts `seenSnooze` — the client pushes snoozes through it");
   }
 });
+
+// --- Netflix-style batch (docs/NETFLIX_FEATURES.md): trick-play, markers,
+// trailer preview, collections, episodes. Phone / TV / web build on these.
+test("contract: /api/trickplay/:mode/:id lists frames", () => {
+  expectFields("trickplay", handlerFor(/app\.get\("\/api\/trickplay\/:mode\(movie\|series\|disk\)\/:id\(\\\\d\{1,17\}\)", \(/),
+    ["interval", "width", "height", "complete", "count", "frames", "url"]);
+});
+test("contract: /api/markers/:mode/:id", () => {
+  expectFields("markers", handlerFor(/app\.get\("\/api\/markers\//),
+    ["introStart", "introEnd", "recapStart", "recapEnd", "creditsStart", "source", "analysed"]);
+});
+test("contract: /api/collections + /api/collections/:id", () => {
+  const src = require("fs").readFileSync(require("path").join(__dirname, "..", "server.js"), "utf8");
+  const tile = /function collectionTile\([\s\S]*?\n\}/.exec(src);
+  assert.ok(tile, "collectionTile not found");
+  expectFields("collection tile", tile[0], ["id", "name", "poster", "backdrop", "count", "first_year", "last_year"]);
+  expectFields("collection detail", handlerFor(/app\.get\("\/api\/collections\/:id/), ["overview", "items", "release_date", "poster"]);
+  expectFields("home", handlerFor(/app\.get\("\/api\/home\//), ["collections", "trailer_key", "preview"]);
+});
+test("contract: /api/episodes/:mode/:id carries stills + per-episode progress", () => {
+  expectFields("episodes", handlerFor(/app\.get\("\/api\/episodes\//),
+    ["seasons", "episodes", "episode_num", "still", "duration_secs", "last_episode", "tmdb_id"]);
+  const src = require("fs").readFileSync(require("path").join(__dirname, "..", "server.js"), "utf8");
+  const prog = /function episodeProgressFor\([\s\S]*?\n\}/.exec(src);
+  assert.ok(prog);
+  expectFields("episode progress", prog[0], ["progress", "watched", "position", "duration", "pct", "updated_at"]);
+});
+test("contract: trailer preview route + detail trailer fields", () => {
+  assert.ok(handlerFor(/app\.get\("\/api\/trailer\/:key\/preview\.mp4"/), "preview route missing");
+  const src = require("fs").readFileSync(require("path").join(__dirname, "..", "server.js"), "utf8");
+  const f = /function trailerFieldsFor\([\s\S]*?\n\}/.exec(src);
+  assert.ok(f);
+  expectFields("trailer fields", f[0], ["trailer", "key", "url", "preview", "cached"]);
+});

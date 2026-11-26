@@ -1600,6 +1600,38 @@ function projectTmdbDetail(mode, detail, baseTitle) {
   };
 }
 
+// Tile `poster` (lib/poster.js): TMDB poster, else a TMDB/https panel icon,
+// else null (the client draws a title card). Never for live channels (their
+// icon is a logo, not a poster). A VOD title with no TMDB entry at all is
+// queued for a background TMDB lookup so its poster shows up next time.
+const { posterUrl } = require("./lib/poster");
+const posterFillTried = new Map(); // "<mode>:<id>" -> ms
+let posterFillQueue = null;        // created lazily (createPrewarmQueue is defined later)
+function tilePoster(mode, s, t) {
+  if (!s || mode === "live") return null;
+  const url = posterUrl(t, s.icon);
+  if (!t && TMDB_API_KEY && (mode === "movie" || mode === "series") && s.id != null) queuePosterFill(mode, s);
+  return url;
+}
+function queuePosterFill(mode, s) {
+  const key = `${mode}:${s.id}`;
+  const now = Date.now();
+  const last = posterFillTried.get(key);
+  if (last && now - last < 6 * 3600_000) return;
+  if (posterFillTried.size > 20_000) posterFillTried.clear();
+  posterFillTried.set(key, now);
+  if (!posterFillQueue) {
+    posterFillQueue = createPrewarmQueue({
+      fetcher: (e) => ensureTmdbForItem(e.mode, e.id, { name: e.name, year: e.year, lang: e.lang }),
+      isCached: (e) => !!tmdbCache[`${e.mode}:${e.id}`],
+      gapMs: 400,
+      cap: 300,
+      breakerThreshold: 10,
+    });
+  }
+  posterFillQueue.enqueue([{ key, mode, id: s.id, name: s.name, year: s.year, lang: isoLangForItem(s) }]);
+}
+
 // Public response shape (same fields, but URLs absolutized + flagged
 // with source/timestamp metadata callers may want).
 function tmdbToResponse(entry) {
@@ -6600,7 +6632,7 @@ function homeGroupKeysOf(catName) {
 // AAC mp4) into DATA_DIR/trailers/ and serves it with Range support. This
 // talks to YouTube only — never the IPTV panel, never the 1-stream
 // admission. See lib/trailer-cache.js and docs/TRAILERS.md.
-const { createTrailerCache, trailerRouteHandler, makeYtDlpDownloader, newestVersion } = require("./lib/trailer-cache");
+const { createTrailerCache, trailerRouteHandler, makeYtDlpDownloader, newestVersion, isValidTrailerKey } = require("./lib/trailer-cache");
 const TRAILER_DIR = path.join(DATA_DIR, "trailers");
 const YTDLP_IMAGE_BIN = process.env.YTDLP_BIN || "/usr/local/bin/yt-dlp";
 // Self-updated copy lives on the data volume so `yt-dlp -U` survives a
@@ -6842,18 +6874,87 @@ function kidCertsForProfile(profile) {
   for (const tier of KIDS_CERT_TIERS) if (age >= tier.minAge) tier.add.forEach((c) => s.add(c));
   return s;
 }
+function trailerAllowKey(key, req) {
+  let idx = trailerKeyIndex();
+  // A key the index has not seen yet (just added by a TMDB fetch/backfill):
+  // rebuild once (at most every 2 s) before refusing, so a tile's
+  // trailer_key never 404s because of index lag.
+  if (!idx.has(key) && Date.now() - trailerKeyIdx.builtAt > 2_000) idx = trailerKeyIndex(true);
+  return trailerKeyAllowed(idx, key, kidCertsForProfile(findProfile(req.profileId)));
+}
 app.get("/api/trailer/:key.mp4", trailerRouteHandler({
   cache: trailerCache,
   available: () => !!ytdlp.bin,
-  allowKey: (key, req) => {
-    let idx = trailerKeyIndex();
-    // A key the index has not seen yet (just added by a TMDB fetch/backfill):
-    // rebuild once (at most every 2 s) before refusing, so a tile's
-    // trailer_key never 404s because of index lag.
-    if (!idx.has(key) && Date.now() - trailerKeyIdx.builtAt > 2_000) idx = trailerKeyIndex(true);
-    return trailerKeyAllowed(idx, key, kidCertsForProfile(findProfile(req.profileId)));
-  },
+  allowKey: trailerAllowKey,
 }));
+
+// Muted preview of a CACHED trailer: the first ~30 s (from 3 s in), video
+// only, stream-copied (no re-encode), moov at the front. Never waits for a
+// download: an uncached trailer answers 404 not_cached at once and is queued
+// for the background prefetch, so a hover/focus preview can retry later.
+const TRAILER_PREVIEW_DIR = path.join(TRAILER_DIR, "preview");
+const trailerPreviewInflight = new Map();
+function trailerFieldsFor(key) {
+  if (!key || !isValidTrailerKey(key)) return { trailer: null };
+  return { trailer: { key, url: `/api/trailer/${key}.mp4`, preview: `/api/trailer/${key}/preview.mp4`, cached: trailerCache.has(key) } };
+}
+function buildTrailerPreview(key, src) {
+  let p = trailerPreviewInflight.get(key);
+  if (p) return p;
+  p = (async () => {
+    fs.mkdirSync(TRAILER_PREVIEW_DIR, { recursive: true });
+    const dest = path.join(TRAILER_PREVIEW_DIR, `${key}.mp4`);
+    const tmp = path.join(TRAILER_PREVIEW_DIR, `.${key}.${process.pid}.tmp.mp4`);
+    const { runFfmpeg } = require("./lib/media-sidecar");
+    const r = await runFfmpeg(spawn, "ffmpeg", [
+      "-nostdin", "-hide_banner", "-v", "error", "-y", "-ss", "3", "-i", src, "-t", "30",
+      "-map", "0:v:0", "-an", "-sn", "-dn", "-c:v", "copy", "-movflags", "+faststart", "-f", "mp4", tmp,
+    ], { timeoutMs: 30_000, maxBytes: 1024 });
+    let ok = false;
+    try { ok = r.ok && fs.statSync(tmp).size > 10_000; } catch { ok = false; }
+    if (!ok) { fs.rmSync(tmp, { force: true }); console.log(`[trailer] preview ${key} failed: ${String(r.error || "").slice(0, 200)}`); return null; }
+    fs.renameSync(tmp, dest);
+    return dest;
+  })().finally(() => trailerPreviewInflight.delete(key));
+  trailerPreviewInflight.set(key, p);
+  return p;
+}
+app.get("/api/trailer/:key/preview.mp4", async (req, res, next) => {
+  try {
+    const key = req.params.key;
+    if (!isValidTrailerKey(key)) return res.status(400).json({ error: "bad_key" });
+    let allowed = false;
+    try { allowed = !!trailerAllowKey(key, req); } catch { allowed = false; }
+    const none = (code) => res.status(404).set({ "Cache-Control": "no-store", ...(code === "not_cached" ? { "Retry-After": "30" } : {}) }).json({ error: code });
+    if (!allowed) return none("trailer_unavailable");
+    const src = path.join(TRAILER_DIR, `${key}.mp4`);
+    if (!trailerCache.has(key)) {
+      if (trailerCache.isNegative(key) || !ytdlp.bin) return none("trailer_unavailable");
+      if (!req.get("x-khouch-internal")) trailerPrefetch.enqueue([{ key, trailerKey: key }]);
+      return none("not_cached");
+    }
+    const dest = path.join(TRAILER_PREVIEW_DIR, `${key}.mp4`);
+    let file = null;
+    try { if (fs.statSync(dest).isFile()) file = dest; } catch { file = null; }
+    if (!file) file = await buildTrailerPreview(key, src);
+    if (!file) return none("trailer_unavailable");
+    let size;
+    try { size = fs.statSync(file).size; } catch { return none("trailer_unavailable"); }
+    res.sendFile(file, {
+      acceptRanges: true, lastModified: false, etag: false, dotfiles: "allow",
+      headers: { "Content-Type": "video/mp4", "Cache-Control": "private, max-age=86400", "ETag": `"${key}-p-${size}"` },
+    }, (err) => { if (err && !res.headersSent) none("trailer_unavailable"); });
+  } catch (e) { next(e); }
+});
+// Previews whose full trailer was evicted go too.
+setInterval(() => {
+  let names = [];
+  try { names = fs.readdirSync(TRAILER_PREVIEW_DIR); } catch { return; }
+  for (const n of names) {
+    const m = /^([A-Za-z0-9_-]{6,20})\.mp4$/.exec(n);
+    if (n.endsWith(".tmp.mp4") || (m && !trailerCache.has(m[1]))) fs.rmSync(path.join(TRAILER_PREVIEW_DIR, n), { force: true });
+  }
+}, 6 * 3600_000).unref?.();
 
 app.get("/api/admin/trailers", (req, res) => {
   if (!requireOwner(req, res)) return;
@@ -6937,7 +7038,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       // upscale. Earlier w185 forced the TV's Coil to decode bitmaps
       // ~40% larger than the tile needs, which the GC measurements
       // pinned as the main jank source on Chromecast silicon.
-      poster: t?.poster_path ? `https://image.tmdb.org/t/p/w342${t.poster_path}` : null,
+      poster: tilePoster(mode, s, t),
       us_cert: cert,
       // Pre-computed group/genre/4K tags. Lets the chip strip on
       // Movies / Series filter rails client-side without re-running
@@ -6958,6 +7059,9 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       // picker instead of playing this id directly.
       isSeriesGroup: s.isSeriesGroup || undefined,
       episodeCount: s.episodeCount || undefined,
+      // YouTube key of the title's TMDB trailer (play /api/trailer/<key>.mp4,
+      // or the muted /api/trailer/<key>/preview.mp4). Omitted when none.
+      trailer_key: (mode !== "live" && t?.trailer_key) || undefined,
     };
   };
   const heroFor = (s) => {
@@ -6969,7 +7073,7 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       icon: s.icon || null,
       year: s.year || null,
       plot: t?.plot || s.plot || null,
-      poster: t?.poster_path ? `https://image.tmdb.org/t/p/w342${t.poster_path}` : null,
+      poster: tilePoster(mode, s, t),
       // w1280 (vs w780) — at the taller hero size, w780 was visibly
       // upscaled on wide monitors. w1280 is the next TMDB step up
       // and is the right size for a 1440p-ish hero with the 1.05
@@ -6980,6 +7084,8 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       us_cert: effCert(t) || null,
       logo: logoUrl(t?.logo),
       isSeriesGroup: s.isSeriesGroup || undefined,
+      trailer_key: (mode !== "live" && t?.trailer_key) || undefined,
+      preview: (mode !== "live" && t?.trailer_key) ? `/api/trailer/${t.trailer_key}/preview.mp4` : undefined,
     };
   };
 
@@ -8146,6 +8252,11 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     .filter(h => h && !HERO_ADULT_CERTS.has(h.us_cert) && !HERO_ADULT_RE.test(h.name || ""))
     .filter(isKidSafe)
     .slice(0, 8);
+  // Warm the hero's trailers so its muted previews are ready (background,
+  // one at a time, yields while anyone is streaming).
+  if (mode !== "live" && !req.get("x-khouch-internal")) {
+    try { trailerPrefetch.enqueue(hero.filter((h) => h.trailer_key).slice(0, 4).map((h) => ({ key: h.trailer_key, trailerKey: h.trailer_key }))); } catch {}
+  }
 
   // Active chip list for this profile + mode. Walk every tile in the
   // built rails, collect their tags, then intersect with the master
@@ -8216,12 +8327,20 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
     }
   } catch {}
 
+  // Collections row (additive top-level field: older clients ignore it).
+  // Tiles here are COLLECTIONS, not titles: open /api/collections/:id.
+  let collections;
+  if (mode === "movie") {
+    try { collections = collectionsRailFor(req, 30); } catch (e) { console.warn(`[home] collections: ${e.message}`); }
+  }
+
   res.json({
     mode,
     ready: ix.ready,
     rails,
     hero,
     chips,
+    collections,
   });
 });
 
@@ -8267,7 +8386,7 @@ app.get("/api/collection/:lang/:mode(movie|series)", (req, res) => {
       name: s.name,
       icon: s.icon || null,
       year: s.year || null,
-      poster: t?.poster_path ? `https://image.tmdb.org/t/p/w342${t.poster_path}` : null,
+      poster: tilePoster(mode, s, t),
       us_cert: effCert(t) || null,
       tags: s.tags || ["other"],
       container: s.container || null,
@@ -9015,7 +9134,7 @@ app.get("/api/search/all", async (req, res, next) => {
         id: s.id,
         name: s.name,
         icon: s.icon || null,
-        poster: t?.poster_path ? `${TMDB_IMG_BASE}/w342${t.poster_path}` : null,
+        poster: tilePoster(mode, s, t),
         year: s.year || null,
         rating: s.rating || null,
         us_cert: s.us_cert || null,
@@ -9446,7 +9565,7 @@ app.get("/api/search/:mode(live|movie|series|disk)", (req, res) => {
       id: s.id,
       name: s.name,
       icon: s.icon || null,
-      poster: t?.poster_path ? `${TMDB_IMG_BASE}/w342${t.poster_path}` : null,
+      poster: tilePoster(mode, s, t),
       category_id: s.category_id,
       category_name: catName.get(String(s.category_id)) || null,
       isSeriesGroup: s.isSeriesGroup || undefined,
@@ -9964,7 +10083,24 @@ app.get("/api/poster/:mode(movie|series|disk)/:id", async (req, res, next) => {
     // On demand: wait briefly (<=1 s) so a title being opened shows its logo the first time;
     // a slower TMDB call finishes in the background and shows on the next fetch.
     await Promise.race([lazyFillLogo(`${mode}:${id}`, entry).catch(() => {}), new Promise((r) => setTimeout(r, 1000))]);
-    res.json(tmdbToResponse(entry));
+    const out = tmdbToResponse(entry);
+    if (out) {
+      // Additive detail fields: collection art/size + trailer preview URLs.
+      if (mode === "movie" && out.collection && Number.isFinite(Number(out.collection.id))) {
+        const col = movieCollectionIndex().get(Number(out.collection.id));
+        const gate = col ? collectionGateFor(req) : null;
+        const n = col ? collectionsLib.visibleMembers(col, gate.pass, gate.prefer).length : 0;
+        out.collection = {
+          ...out.collection,
+          poster: out.collection.poster_path ? `${TMDB_IMG_BASE}/w342${out.collection.poster_path}` : null,
+          backdrop: out.collection.backdrop_path ? `${TMDB_IMG_BASE}/w1280${out.collection.backdrop_path}` : null,
+          count: n,
+          url: n >= 2 ? `/api/collections/${out.collection.id}` : null,
+        };
+      }
+      Object.assign(out, trailerFieldsFor(out.trailer_key));
+    }
+    res.json(out);
   } catch (e) { next(e); }
 });
 
@@ -10005,6 +10141,132 @@ app.get("/api/poster/series/:id/season/:n", async (req, res, next) => {
     tmdbCache[cacheKey] = { fetched_at: Date.now(), stills };
     scheduleTmdbCacheSave();
     res.json({ stills });
+  } catch (e) { next(e); }
+});
+
+// Episodes of a series with TMDB stills and THIS profile's progress, for the
+// series page (additive; /api/series/info/:id is unchanged). Panel series:
+// :id is the series id; disk: the disk series-group id. no-store (progress).
+//   { id, mode, tmdb_id, seasons: [{ season, episodes: [{ id, episode_num,
+//     title, plot, air_date, duration_secs, container, still,
+//     progress: { position, duration, pct, updated_at } | null, watched }] }],
+//     last_episode: { episode_id, season, episode_num } | null }
+async function tmdbSeasonEpisodes(tmdbId, seasonNum) {
+  if (!TMDB_API_KEY || !tmdbId || !Number.isFinite(seasonNum)) return new Map();
+  const d = await Promise.race([tmdb(`/tv/${tmdbId}/season/${seasonNum}`).catch(() => null), new Promise((r) => setTimeout(() => r(null), 6000))]);
+  const out = new Map();
+  for (const e of (d && Array.isArray(d.episodes) ? d.episodes : [])) {
+    if (Number.isFinite(e.episode_number)) out.set(e.episode_number, e);
+  }
+  return out;
+}
+function episodeProgressFor(userState, mode, epId) {
+  const p = userState.progress?.[`${mode}:${epId}`];
+  const watched = Array.isArray(userState.watched) && userState.watched.some((w) => String(w) === String(epId));
+  if (!p || !Number.isFinite(p.p)) return { progress: null, watched };
+  const dur = Number.isFinite(p.d) && p.d > 0 ? p.d : null;
+  return {
+    progress: { position: Math.round(p.p), duration: dur ? Math.round(dur) : null, pct: dur ? Math.min(100, Math.round((p.p / dur) * 100)) : null, updated_at: p.t || null },
+    watched,
+  };
+}
+app.get("/api/episodes/:mode(series|disk)/:id(\\d{1,17})", async (req, res, next) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    const { mode, id } = req.params;
+    const userState = getProfileState(req.profileId);
+    const seasonsOut = [];
+    let tmdbId = null;
+    let lastEpisode = null;
+    if (mode === "disk") {
+      if (!requireOwner(req, res)) return;
+      const ix = getIndexesFor(req.account || currentAccount()).disk;
+      const numId = parseInt(id, 10);
+      const info = ix?.meta?.get(numId);
+      if (!info || !info.isSeriesGroup) return res.status(404).json({ error: "not a series group" });
+      const t = tmdbCache[`disk:${numId}`];
+      if (t && t.source === "tmdb" && t.tmdb_id && t.tmdb_kind === "series") tmdbId = t.tmdb_id;
+      const bySeason = new Map();
+      for (const ep of info.episodes) {
+        if (!bySeason.has(ep.season)) bySeason.set(ep.season, []);
+        bySeason.get(ep.season).push(ep);
+      }
+      for (const [season, eps] of [...bySeason.entries()].sort((a, b) => a[0] - b[0])) {
+        const tm = await tmdbSeasonEpisodes(tmdbId, season);
+        seasonsOut.push({
+          season,
+          episodes: eps.map((ep) => {
+            const te = tm.get(ep.episodeNum);
+            return {
+              id: ep.id, episode_num: ep.episodeNum,
+              title: ep.title || te?.name || `Episode ${ep.episodeNum}`,
+              plot: te?.overview || null, air_date: te?.air_date || null,
+              duration_secs: ep.durationSecs || null, container: ep.container || null,
+              still: te?.still_path ? `${TMDB_IMG_BASE}/w400${te.still_path}` : null,
+              ...episodeProgressFor(userState, "disk", ep.id),
+            };
+          }),
+        });
+      }
+    } else {
+      const item = indexes.series?.byId?.get(parseInt(id, 10));
+      if (!item) return res.status(404).json({ error: "unknown series" });
+      const actx = currentAccount();
+      const params = { series_id: id };
+      const infoKey = xtreamKey(actx, MODES.series.info, params);
+      let info = cache.get(infoKey)?.v || null;
+      if (!info?.episodes) {
+        try { info = await xtream(MODES.series.info, params, { actx, timeout: INFO_PANEL_TIMEOUT_MS }); } catch { info = null; }
+      }
+      // Panel down: the last good copy on disk (same store /info falls back to).
+      if (!info?.episodes) info = (await infoStore.get(infoKey).catch(() => null))?.v || null;
+      if (!info?.episodes || typeof info.episodes !== "object") {
+        res.set("Retry-After", "30");
+        return res.status(503).json({ error: "info_unavailable" });
+      }
+      const t = TMDB_API_KEY ? await Promise.race([
+        ensureTmdbForItem("series", id, { name: item.name, year: item.year, lang: isoLangForItem(item) }).catch(() => null),
+        new Promise((r) => setTimeout(() => r(null), 4000)),
+      ]) : null;
+      if (t && t.source === "tmdb" && t.tmdb_id) tmdbId = t.tmdb_id;
+      const seasons = Object.entries(info.episodes)
+        .filter(([, list]) => Array.isArray(list))
+        .map(([sn, list]) => [Number(sn), list])
+        .sort((a, b) => a[0] - b[0]);
+      for (const [season, list] of seasons) {
+        const tm = await tmdbSeasonEpisodes(tmdbId, season);
+        const stills = {};
+        const episodes = list.map((ep) => {
+          const num = Number(ep.episode_num);
+          const te = tm.get(num);
+          const tStill = te?.still_path ? `${TMDB_IMG_BASE}/w400${te.still_path}` : null;
+          if (tStill) stills[String(ep.id)] = tStill;
+          // The panel's own episode image, if https and not a portrait
+          // poster (some panels put the series poster there).
+          const pi = typeof ep.info?.movie_image === "string" ? ep.info.movie_image.trim() : "";
+          const panelStill = /^https:\/\/[^\s"'<>]+$/i.test(pi) && !/_and_h900|\/w(?:92|154|185|342|500|780)\//i.test(pi) ? pi : null;
+          return {
+            id: ep.id, episode_num: Number.isFinite(num) ? num : null,
+            title: ep.title || te?.name || null,
+            plot: te?.overview || ep.info?.plot || null,
+            air_date: te?.air_date || ep.info?.releasedate || ep.info?.air_date || null,
+            duration_secs: Number(ep.info?.duration_secs) || null,
+            container: ep.container_extension || null,
+            still: tStill || panelStill,
+            ...episodeProgressFor(userState, "series", ep.id),
+          };
+        });
+        // Keep the legacy /api/poster/series/:id/season/:n cache warm too.
+        if (Object.keys(stills).length && Number.isFinite(season)) {
+          const k = `series-season:${id}:${season}`;
+          if (!tmdbCache[k] || Date.now() - (tmdbCache[k].fetched_at || 0) > TMDB_TTL_MS) { tmdbCache[k] = { fetched_at: Date.now(), stills }; scheduleTmdbCacheSave(); }
+        }
+        seasonsOut.push({ season, episodes });
+      }
+      const le = userState.lastEpisode?.[id] || userState.lastEpisode?.[String(parseInt(id, 10))];
+      if (le?.episode_id) lastEpisode = { episode_id: String(le.episode_id), season: le.season ?? null, episode_num: le.episode_num ?? null };
+    }
+    res.json({ id: Number(id), mode, tmdb_id: tmdbId, seasons: seasonsOut, last_episode: lastEpisode });
   } catch (e) { next(e); }
 });
 
@@ -12101,7 +12363,7 @@ app.get("/api/person/credits", async (req, res) => {
           id: s.id,
           name: s.name,
           icon: s.icon || null,
-          poster: t?.poster_path ? `${TMDB_IMG_BASE}/w342${t.poster_path}` : null,
+          poster: tilePoster(mode, s, t),
           year: s.year || (t?.year || null),
           us_cert: s.us_cert || null,
           rating: s.rating || (t?.rating || null),
@@ -12179,7 +12441,7 @@ app.get("/api/similar/:mode/:id", (req, res) => {
       id: s.id,
       name: s.name,
       icon: s.icon || null,
-      poster: t?.poster_path ? `${TMDB_IMG_BASE}/w342${t.poster_path}` : null,
+      poster: tilePoster(mode, s, t),
       year: s.year || (t?.year || null),
       rating: s.rating || (t?.rating || null),
       us_cert: s.us_cert || null,
@@ -12288,6 +12550,111 @@ app.get("/api/similar/:mode/:id", (req, res) => {
   // shared across profiles. TV app's OkHttp cache picks this up.
   res.set("Cache-Control", "private, max-age=600");
   res.json({ ready: true, rails });
+});
+
+// ── Collections (TMDB belongs_to_collection) ───────────────────────────
+// Movie library titles grouped by TMDB collection (lib/collections.js). The
+// grouping is cached per catalog + TMDB cache version; the per-viewer gate
+// (title language, kid certs, camera copies, one variant per title) runs per
+// request. Only collections with >= 2 visible titles are listed.
+const collectionsLib = require("./lib/collections");
+const collectionIdxCache = { byId: null, version: -1, at: 0, idx: new Map() };
+function movieCollectionIndex() {
+  const ix = indexes.movie;
+  if (!ix?.ready) return new Map();
+  const c = collectionIdxCache;
+  const fresh = c.byId === ix.byId && (c.version === tmdbCacheVersion || Date.now() - c.at < 60_000);
+  if (!fresh || !isOwnerAccount(currentAccount())) {
+    const idx = collectionsLib.buildCollectionIndex(ix.byId.values(), (s) => tmdbCache[`movie:${s.id}`]);
+    if (!isOwnerAccount(currentAccount())) return idx; // member panels: not cached (owner-shaped cache)
+    Object.assign(c, { byId: ix.byId, version: tmdbCacheVersion, at: Date.now(), idx });
+  }
+  return c.idx;
+}
+function collectionGateFor(req) {
+  const userState = getProfileState(req.profileId);
+  const profile = findProfile(req.profileId);
+  const modeKeys = (() => {
+    const own = userState.filter?.groups?.movie;
+    if (Array.isArray(own) && own.length) return own;
+    return userState.filter?.groups?.live || [];
+  })();
+  const onboarded = !!userState.filter?.onboarded && modeKeys.length > 0;
+  const titleLangPasses = onboarded ? makeTitleLangFilter(new Set(modeKeys)) : () => true;
+  const isKidBlocked = makeKidsBlocker(profile);
+  const catName = new Map(loadCategoriesFromDiskSync("movie").map((c) => [String(c.category_id), c.category_name]));
+  const played = new Set((userState.recents?.movie || []).map(String));
+  for (const k of Object.keys(userState.progress || {})) if (k.startsWith("movie:")) played.add(k.slice(6));
+  return {
+    pass: (s, t) => titleLangPasses(s.name)
+      && !isKidBlocked({ us_cert: effCert(t) || s.us_cert || null })
+      && !isLowQuality(s, catName.get(String(s.category_id))),
+    // Canonical (non-alternate) copy of a title first.
+    prefer: (s) => (s.isAlt ? 1 : 0),
+    affinity: (vis) => (vis.some((m) => played.has(String(m.s.id))) ? 1 : 0),
+  };
+}
+function collectionTile(e) {
+  const { col, vis } = e;
+  const lead = vis[0];
+  return {
+    id: col.id,
+    name: col.name,
+    poster: col.poster_path ? `${TMDB_IMG_BASE}/w342${col.poster_path}` : (lead ? tilePoster("movie", lead.s, lead.t) : null),
+    backdrop: col.backdrop_path ? `${TMDB_IMG_BASE}/w1280${col.backdrop_path}` : null,
+    count: vis.length,
+    first_year: e.firstYear,
+    last_year: e.lastYear,
+  };
+}
+function collectionsRailFor(req, max = 40) {
+  const gate = collectionGateFor(req);
+  const list = collectionsLib.collectionList(movieCollectionIndex(), gate.pass, { prefer: gate.prefer, affinity: gate.affinity });
+  return { title: "Collections", total: list.length, items: list.slice(0, max).map(collectionTile) };
+}
+app.get("/api/collections", (req, res) => {
+  res.set("Cache-Control", "private, max-age=300");
+  const mode = String(req.query.mode || "movie");
+  if (mode !== "movie") return res.json({ title: "Collections", total: 0, items: [] }); // TMDB collections are movie-only
+  const lim = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
+  res.json(collectionsRailFor(req, lim));
+});
+app.get("/api/collections/:id(\\d{1,10})", async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const col = movieCollectionIndex().get(id);
+    const gate = collectionGateFor(req);
+    const vis = col ? collectionsLib.visibleMembers(col, gate.pass, gate.prefer) : [];
+    if (!col || !vis.length) return res.status(404).json({ error: "not_found" });
+    // Overview from TMDB's collection endpoint (memory-cached 24 h); never
+    // waits more than 2.5 s for it.
+    let overview = null;
+    if (TMDB_API_KEY) {
+      const d = await Promise.race([tmdb(`/collection/${id}`).catch(() => null), new Promise((r) => setTimeout(() => r(null), 2500))]);
+      overview = (d && typeof d.overview === "string" && d.overview.trim()) || null;
+    }
+    const years = vis.map((m) => parseInt(m.t.year || m.s.year, 10)).filter(Number.isFinite);
+    res.set("Cache-Control", "private, max-age=300");
+    res.json({
+      ...collectionTile({ col, vis, firstYear: years.length ? Math.min(...years) : null, lastYear: years.length ? Math.max(...years) : null }),
+      overview,
+      items: vis.map(({ s, t }) => ({
+        id: s.id,
+        name: s.name,
+        icon: s.icon || null,
+        poster: tilePoster("movie", s, t),
+        year: s.year || t.year || null,
+        release_date: t.release_date || null,
+        rating: t.rating || null,
+        us_cert: effCert(t) || s.us_cert || null,
+        tmdb_id: t.tmdb_id || null,
+        category_id: s.category_id,
+        tags: s.tags || [],
+        container: s.container || null,
+        trailer_key: t.trailer_key || null,
+      })),
+    });
+  } catch (e) { next(e); }
 });
 
 // --- Disk library config (SUPERADMIN ONLY) ---
@@ -12681,7 +13048,7 @@ app.get("/api/refine/candidates/:mode(movie|series)", (req, res) => {
       name: s.name,
       icon: s.icon || null,
       year: s.year || null,
-      poster: t?.poster_path ? `https://image.tmdb.org/t/p/w342${t.poster_path}` : null,
+      poster: tilePoster(mode, s, t),
       us_cert: effCert(t) || null,
       tags: s.tags || ["other"],
       container: s.container || null,
@@ -13507,6 +13874,9 @@ async function spawnTranscoder(mode, id, quality, offsetSecs, audio, preset, key
     proc: ffmpeg, key, lastAccess: Date.now(), dir, sourceUrl, mode, id, quality,
     audio, preset, offsetSecs, diskSel, restarts: [], stopping: false, respawning: false,
     discontinuities: new Set(),
+    // Media sidecar (trick-play / markers) reads this transcode's segments;
+    // owner account only (its ids are the ones the sidecar's cache uses).
+    analyze: isOwnerAccount(currentAccount()),
     // Owner keys that fetched this transcoder's manifest/segments (bounded,
     // see noteOwner). /api/transcode/stop with no args stops only these.
     owners: new Set(),
@@ -13842,6 +14212,175 @@ setInterval(() => {
     }
   }
 }, 10_000);
+
+// ===========================================================================
+// MEDIA SIDECAR — trick-play thumbnails + intro/credits markers
+// (lib/media-sidecar.js). It never opens an upstream stream: it reads the
+// HLS segments a viewer's own transcode already wrote (owner account only,
+// so ids are the owner panel's), and Disk-library files while nobody is
+// watching. See docs/NETFLIX_FEATURES.md.
+// ===========================================================================
+const { createTrickplayStore } = require("./lib/trickplay");
+const { createMarkerStore } = require("./lib/marker-store");
+const { createMediaSidecar } = require("./lib/media-sidecar");
+const TRICKPLAY_INTERVAL_SEC = 10;
+const trickplayStore = createTrickplayStore({
+  dir: path.join(DATA_DIR, "trickplay"),
+  maxBytes: (() => { const m = parseFloat(process.env.TRICKPLAY_CACHE_MAX_MB || ""); return (Number.isFinite(m) && m > 0 ? m : 2048) * 1024 ** 2; })(),
+});
+const markerStore = createMarkerStore({ dir: path.join(DATA_DIR, "markers"), log: (m) => console.log(m) });
+
+// Series group (and season) of an episode the owner is watching, from data
+// already in memory: the cached get_series_info (fetched when the series page
+// was opened) or a profile's "last episode" pointer. Disk episodes come from
+// the disk index's series groups.
+function sidecarGroupFor(mode, id) {
+  const sid = String(id);
+  if (mode === "disk") {
+    const meta = getIndexesFor(ownerAccount).disk?.meta;
+    if (!meta) return null;
+    for (const [gid, g] of meta) {
+      if (!g || !g.isSeriesGroup || !Array.isArray(g.episodes)) continue;
+      const ep = g.episodes.find((e) => String(e.id) === sid);
+      if (ep) return { group: `disk:${gid}`, season: ep.season ?? null, dur: ep.durationSecs || null };
+    }
+    return null;
+  }
+  if (mode !== "series") return null;
+  const prefix = `${accountKeyOf(ownerAccount)}\0${MODES.series.info}`;
+  for (const [k, hit] of cache) {
+    if (!k.startsWith(prefix)) continue;
+    const eps = hit?.v?.episodes;
+    if (!eps || typeof eps !== "object") continue;
+    for (const [sn, list] of Object.entries(eps)) {
+      if (!Array.isArray(list)) continue;
+      const ep = list.find((e) => String(e?.id) === sid);
+      if (!ep) continue;
+      let seriesId = null;
+      try { seriesId = JSON.parse(k.slice(prefix.length)).series_id; } catch {}
+      if (seriesId == null) continue;
+      const dur = Number(ep.info?.duration_secs) || null;
+      return { group: `series:${seriesId}`, season: Number(ep.season ?? sn) || null, dur };
+    }
+  }
+  for (const st of profileStates.values()) {
+    for (const [seriesId, le] of Object.entries(st?.lastEpisode || {})) {
+      if (String(le?.episode_id) === sid && /^\d{1,12}$/.test(String(seriesId))) {
+        return { group: `series:${seriesId}`, season: Number(le.season) || null, dur: null };
+      }
+    }
+  }
+  return null;
+}
+
+// Anyone watching anything (panel or disk) within the last minute.
+function sidecarViewerActive() {
+  const now = Date.now();
+  for (const v of streams.values()) if (!v.displaced && now - v.lastSeen < 60_000) return true;
+  for (const t of transcoders.values()) if (now - t.lastAccess < 60_000) return true;
+  return false;
+}
+
+const mediaSidecar = createMediaSidecar({
+  trickplay: trickplayStore,
+  markers: markerStore,
+  interval: TRICKPLAY_INTERVAL_SEC,
+  listTranscodes: () => {
+    const out = [];
+    for (const t of transcoders.values()) {
+      if (!t.analyze || t.mode === "live" || t.stopping) continue;
+      out.push({ entry: t, mode: t.mode, id: t.id, dir: t.dir, offsetSecs: t.offsetSecs || 0 });
+    }
+    return out;
+  },
+  groupFor: sidecarGroupFor,
+  viewerActive: sidecarViewerActive,
+  log: (m) => console.log(m),
+});
+if (process.env.MEDIA_SIDECAR !== "0") {
+  setInterval(() => { try { mediaSidecar.scan(); } catch (e) { console.warn(`[sidecar] scan: ${e.message}`); } }, 5_000).unref?.();
+  setInterval(() => { try { const r = trickplayStore.evict(); if (r.removed) console.log(`[trickplay] evicted ${r.removed} titles`); } catch {} }, 6 * 3600_000).unref?.();
+  // Disk library: queue what is still missing (thumbnails for every file,
+  // fingerprints for series episodes). Jobs run one at a time, only while
+  // nobody watches anything.
+  const queueDiskSidecarJobs = () => {
+    try {
+      const ix = getIndexesFor(ownerAccount).disk;
+      if (!ix?.ready || !ix.meta) return;
+      let n = 0;
+      // Fingerprints first (seconds each), then thumbnails (minutes each).
+      for (const [gid, g] of ix.meta) {
+        if (!g?.isSeriesGroup || !Array.isArray(g.episodes)) continue;
+        for (const ep of g.episodes) {
+          const m = ix.meta.get(ep.id);
+          const rec = markerStore.get(`disk:${ep.id}`);
+          if (!m?.absPath || (rec && rec.head && (rec.tail || !ep.durationSecs))) continue;
+          if (mediaSidecar.enqueueOffline({ kind: "offline-fp", key: `fp:disk:${ep.id}`, mode: "disk", id: String(ep.id), file: m.absPath, dur: ep.durationSecs || m.durationSecs || null, group: `disk:${gid}`, season: ep.season ?? null })) n++;
+        }
+      }
+      for (const [id, m] of ix.meta) {
+        if (!m || m.isSeriesGroup || !m.absPath) continue;
+        if (!trickplayStore.list("disk", id).complete) {
+          if (mediaSidecar.enqueueOffline({ kind: "offline-thumbs", key: `th:disk:${id}`, mode: "disk", id: String(id), file: m.absPath })) n++;
+        }
+      }
+      if (n) console.log(`[sidecar] queued ${n} offline Disk-library jobs`);
+    } catch (e) { console.warn(`[sidecar] disk queue: ${e.message}`); }
+  };
+  setTimeout(queueDiskSidecarJobs, (() => { const n = parseInt(process.env.MEDIA_SIDECAR_DISK_DELAY_MS || "", 10); return Number.isFinite(n) && n >= 0 ? n : 10 * 60_000; })()).unref?.();
+  setInterval(queueDiskSidecarJobs, 60 * 60_000).unref?.();
+}
+
+// Trick-play thumbnails for a title (movie stream id, series EPISODE id, or
+// disk file id). Coverage is partial: only what a transcode produced, or a
+// full offline pass for Disk files (complete: true). Empty `frames` = none.
+app.get("/api/trickplay/:mode(movie|series|disk)/:id(\\d{1,17})", (req, res) => {
+  const { mode, id } = req.params;
+  res.set("Cache-Control", "private, max-age=15");
+  const owner = isOwnerAccount(currentAccount());
+  const l = owner ? trickplayStore.list(mode, id) : { times: [], complete: false, size: null };
+  res.json({
+    mode, id,
+    interval: TRICKPLAY_INTERVAL_SEC,
+    width: l.size?.width || null,
+    height: l.size?.height || null,
+    complete: !!l.complete,
+    count: l.times.length,
+    frames: l.times,
+    url: `/api/trickplay/${mode}/${id}/{t}.jpg`,
+  });
+});
+app.get("/api/trickplay/:mode(movie|series|disk)/:id(\\d{1,17})/:t(\\d{1,6}).jpg", (req, res) => {
+  const { mode, id, t } = req.params;
+  const f = isOwnerAccount(currentAccount()) ? trickplayStore.filePath(mode, id, t) : null;
+  if (!f) return res.status(404).set("Cache-Control", "no-store").json({ error: "no_frame" });
+  res.sendFile(f, { headers: { "Content-Type": "image/jpeg", "Cache-Control": "private, max-age=604800, immutable" }, dotfiles: "allow" });
+});
+
+// Skip-intro / skip-credits markers (seconds into the title). Nulls when not
+// detected or not sure. Recap detection is not implemented (always null).
+app.get("/api/markers/:mode(movie|series|disk)/:id(\\d{1,17})", (req, res) => {
+  const { mode, id } = req.params;
+  res.set("Cache-Control", "private, max-age=60");
+  const rec = isOwnerAccount(currentAccount()) ? markerStore.get(`${mode}:${id}`) : null;
+  const m = rec?.markers || null;
+  res.json({
+    mode, id,
+    introStart: m?.introStart ?? null,
+    introEnd: m?.introEnd ?? null,
+    recapStart: null,
+    recapEnd: null,
+    creditsStart: m?.creditsStart ?? null,
+    source: m && (m.introStart != null || m.creditsStart != null) ? "fingerprint" : null,
+    support: m?.support || { intro: 0, credits: 0 },
+    analysed: { head: !!rec?.head, tail: !!rec?.tail },
+  });
+});
+
+app.get("/api/admin/sidecar", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  res.json({ sidecar: mediaSidecar.stats(), markers: markerStore.stats() });
+});
 
 // Stops transcoders on the client's request (logic in lib/transcode-stop.js):
 //  - { mode, id }: every quality/offset variant of that title. Called by the
