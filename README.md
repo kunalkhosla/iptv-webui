@@ -66,6 +66,10 @@ APP_PASS=...                  # seeds the owner account on first boot (see below
 TMDB_API_KEY=...              # YOUR OWN key — register at themoviedb.org (free, ~2 min). Optional but strongly recommended.
 PROXY_SECRET=...              # strongly recommended; required once you invite a second user
 IPTV_HOST_FALLBACK=http://backup-panel.example   # optional secondary panel
+HA_URL=http://homeassistant.local:8123            # optional: programme-reminder pushes via Home Assistant
+HA_TOKEN=...                                       # optional: HA long-lived token
+HA_NOTIFY_SERVICE=mobile_app_your_phone            # optional: default notify service
+HA_NOTIFY_PROFILES=Alice=mobile_app_alice,Bob=mobile_app_bob   # optional: per-profile notify service
 ```
 
 `IPTV_*` and `APP_*` are used ONLY on first boot to seed the owner
@@ -147,6 +151,22 @@ collections in release order, also `collections` on the movie home payload),
 from transcodes a viewer is already running and from Disk-library files, never
 from an extra panel stream, so coverage is partial. Contract:
 [docs/NETFLIX_FEATURES.md](docs/NETFLIX_FEATURES.md).
+
+## Live buffering rescue
+
+Clients report each live session's stalls, reconnects and time to first frame
+(`POST /api/live/health/:id`); the server keeps a per-copy health score by hour
+of day. When a channel struggles, `GET /api/live/alternates/:id` lists the other
+copies of the same channel (same region prefix, so `UK: ZEE TV` is never offered
+for `IN: ZEE TV`) ranked by that score, and the client switches to the best one
+with a 10 s undo. No synthetic probing. See [docs/LIVE_RESCUE.md](docs/LIVE_RESCUE.md).
+
+## Programme reminders
+
+"Remind me" on a future guide programme (`/api/reminders`, per profile). Two
+minutes before start the server pushes a Home Assistant notification (when
+`HA_URL`/`HA_TOKEN` are set) and open clients show a banner. A reminder never
+opens a stream. See [docs/REMINDERS.md](docs/REMINDERS.md).
 
 ## Native trailers (`/api/trailer/:key.mp4`)
 

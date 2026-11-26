@@ -2789,6 +2789,8 @@ function gracefulShutdown(signal) {
   shuttingDown = true;
   console.log(`[shutdown] ${signal} received, flushing user-state…`);
   flushUserStateSync();
+  flushLiveHealthSync();
+  flushRemindersSync();
   process.exit(0);
 }
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
@@ -3593,6 +3595,9 @@ function projectStream(mode, s, actx = currentAccount()) {
     epg_channel_id: mode === "live"
       ? (s.epg_channel_id ? String(s.epg_channel_id) : "")
       : undefined,
+    // Catch-up flags, kept for when the provider enables archive (0 today).
+    tv_archive: mode === "live" ? (Number(s.tv_archive) || 0) : undefined,
+    tv_archive_duration: mode === "live" ? (Number(s.tv_archive_duration) || 0) : undefined,
     us_cert,
     tmdb_id,
     tags,
@@ -9639,6 +9644,307 @@ app.get("/api/variants/:mode(movie|series)/:id", (req, res) => {
     titleLangPasses: onboarded ? makeTitleLangFilter(new Set(modeKeys)) : () => true,
     ctx: { ...variantLangCtx(onboarded ? modeKeys.filter((k) => LANGUAGE_GROUP_KEYS_SET.has(k)) : []), startedIds: startedIdsFor(userState, mode) },
   }));
+});
+
+// ── Live buffering rescue (docs/LIVE_RESCUE.md) ─────────────────────────────
+// Clients report each live session's stalls / reconnects / time-to-first-
+// frame; the server keeps a per-copy health score by hour of day and, when a
+// client says its channel is struggling, lists the other copies of the same
+// channel (same region prefix) ranked by that score. Metadata only: nothing
+// here ever opens a panel connection.
+const liveRescue = require("./lib/live-rescue");
+const liveHealthFile = path.join(DATA_DIR, "live-health.json");
+const liveHealth = (() => {
+  try {
+    const d = JSON.parse(fs.readFileSync(liveHealthFile, "utf8"));
+    return d && typeof d === "object" ? d : {};
+  } catch { return {}; }
+})();
+let liveHealthSaveTimer = null;
+function scheduleLiveHealthSave() {
+  if (liveHealthSaveTimer) return;
+  liveHealthSaveTimer = setTimeout(async () => {
+    liveHealthSaveTimer = null;
+    try {
+      await fs.promises.writeFile(liveHealthFile + ".tmp", JSON.stringify(liveHealth));
+      await fs.promises.rename(liveHealthFile + ".tmp", liveHealthFile);
+    } catch (e) { console.warn(`save live-health failed: ${e.message}`); }
+  }, 5000);
+}
+function flushLiveHealthSync() {
+  if (!liveHealthSaveTimer) return;
+  clearTimeout(liveHealthSaveTimer);
+  liveHealthSaveTimer = null;
+  try {
+    fs.writeFileSync(liveHealthFile + ".tmp", JSON.stringify(liveHealth));
+    fs.renameSync(liveHealthFile + ".tmp", liveHealthFile);
+  } catch (e) { console.warn(`flush live-health failed: ${e.message}`); }
+}
+// Owner copies keyed by bare id; other accounts get an account prefix.
+function liveHealthKey(actx, id) {
+  if (isOwnerAccount(actx)) return String(id);
+  return `${crypto.createHash("sha1").update(accountKeyOf(actx)).digest("hex").slice(0, 8)}:${id}`;
+}
+const liveGroupCache = new WeakMap(); // byId Map -> { size, groups, keyOfId }
+function liveGroupsFor(ix) {
+  const c = liveGroupCache.get(ix.byId);
+  if (c && c.size === ix.byId.size) return c;
+  const g = { size: ix.byId.size, ...liveRescue.buildGroups(ix.byId.values()) };
+  liveGroupCache.set(ix.byId, g);
+  return g;
+}
+function liveDeadState(id) {
+  const entry = audioCodecCache[`live:${id}`];
+  if (!entry || !entry.dead) return null;
+  return decideLiveHealth({ entry, now: Date.now() }).action === "unavailable" ? "unavailable" : "stale-dead";
+}
+const liveHealthRate = new Map(); // ownerKey -> { n, t }
+app.post("/api/live/health/:id", express.json({ limit: "4kb" }), (req, res) => {
+  const id = String(req.params.id);
+  if (!/^\d{1,12}$/.test(id)) return res.status(400).json({ error: "bad id" });
+  const actx = currentAccount();
+  if (!getIndexesFor(actx).live.byId.has(parseInt(id, 10))) return res.status(404).json({ error: "not in catalog" });
+  const ok = ownerKeyOf(req);
+  const now = Date.now();
+  const rl = liveHealthRate.get(ok);
+  if (rl && now - rl.t < 60e3 && rl.n >= 30) return res.status(429).json({ error: "slow down" });
+  if (!rl || now - rl.t >= 60e3) liveHealthRate.set(ok, { n: 1, t: now }); else rl.n += 1;
+  if (liveHealthRate.size > 500) for (const [k, v] of liveHealthRate) if (now - v.t >= 60e3) liveHealthRate.delete(k);
+  const report = liveRescue.sanitizeReport(req.body);
+  if (!report) return res.json({ ok: true, recorded: false });
+  liveRescue.recordReport(liveHealth, liveHealthKey(actx, id), report, now);
+  scheduleLiveHealthSave();
+  console.log(`[rescue] health live:${id} watched=${Math.round(report.watchedSec)}s stalls=${report.stalls} stallSec=${Math.round(report.stallSec)} reconn=${report.reconnects} ttff=${report.ttffMs == null ? "-" : Math.round(report.ttffMs)}${report.failed ? " failed" : ""}${req.body?.reason ? ` reason=${String(req.body.reason).slice(0, 24).replace(/[^a-z0-9_-]/gi, "")}` : ""}`);
+  res.json({ ok: true, recorded: true });
+});
+app.get("/api/live/alternates/:id", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const idInt = parseInt(req.params.id, 10);
+  if (!Number.isFinite(idInt)) return res.status(400).json({ error: "bad id" });
+  const actx = currentAccount();
+  const ix = getIndexesFor(actx).live;
+  const cur = ix.byId.get(idInt);
+  if (!cur) return res.status(404).json({ error: "not in catalog" });
+  const { groups, keyOfId } = liveGroupsFor(ix);
+  const key = keyOfId.get(String(idInt));
+  const ids = key ? groups.get(key) || [] : [];
+  const now = Date.now();
+  const candidates = ids.map((i) => ix.byId.get(i)).filter(Boolean).map((s) => ({ id: s.id, name: s.name }));
+  const alternates = liveRescue.rankAlternates({
+    currentId: idInt,
+    currentName: cur.name,
+    candidates,
+    health: (i) => liveRescue.scoreFor(liveHealth, liveHealthKey(actx, i), now),
+    deadState: liveDeadState,
+  });
+  const self = liveRescue.scoreFor(liveHealth, liveHealthKey(actx, idInt), now);
+  if (req.query.reason) console.log(`[rescue] alternates live:${idInt} reason=${String(req.query.reason).slice(0, 24).replace(/[^a-z0-9_-]/gi, "")} copies=${ids.length} offered=${alternates.length}${alternates[0] ? ` best=${alternates[0].id}(${alternates[0].score})` : ""}`);
+  res.json({
+    id: idInt,
+    name: cur.name,
+    score: self.score,
+    floor: liveRescue.SCORE_FLOOR,
+    alternates: alternates.map(({ rank, ...a }) => a),
+  });
+});
+
+// ── Programme reminders (docs/REMINDERS.md) ─────────────────────────────────
+// Per-profile, server-side. ~2 min before start the server pushes an HA
+// notification (if configured for the profile) and open clients show a banner
+// from GET /api/reminders `due`. Firing never opens a stream.
+const remindersLib = require("./lib/reminders");
+const remindersFile = path.join(DATA_DIR, "reminders.json");
+const reminderStore = (() => {
+  try {
+    const d = JSON.parse(fs.readFileSync(remindersFile, "utf8"));
+    if (d && Array.isArray(d.reminders)) return d;
+  } catch {}
+  return { reminders: [], seenEpgBuild: 0 };
+})();
+let remindersSaveTimer = null;
+function scheduleRemindersSave() {
+  if (remindersSaveTimer) return;
+  remindersSaveTimer = setTimeout(async () => {
+    remindersSaveTimer = null;
+    try {
+      await fs.promises.writeFile(remindersFile + ".tmp", JSON.stringify(reminderStore));
+      await fs.promises.rename(remindersFile + ".tmp", remindersFile);
+    } catch (e) { console.warn(`save reminders failed: ${e.message}`); }
+  }, 500);
+}
+function flushRemindersSync() {
+  if (!remindersSaveTimer) return;
+  clearTimeout(remindersSaveTimer);
+  remindersSaveTimer = null;
+  try {
+    fs.writeFileSync(remindersFile + ".tmp", JSON.stringify(reminderStore));
+    fs.renameSync(remindersFile + ".tmp", remindersFile);
+  } catch (e) { console.warn(`flush reminders failed: ${e.message}`); }
+}
+// HA push. HA_NOTIFY_PROFILES="Kunal=mobile_app_x,Shuchi=mobile_app_y" maps a
+// profile (nick or id, case-insensitive) to a notify service; anything else
+// falls back to HA_NOTIFY_SERVICE (the account owner's phone). No HA_URL /
+// HA_TOKEN: in-app banners only.
+function haNotifyServiceFor(profile) {
+  const map = String(process.env.HA_NOTIFY_PROFILES || "");
+  const names = [profile?.nick, profile?.id].filter(Boolean).map((s) => String(s).toLowerCase());
+  for (const pair of map.split(",")) {
+    const i = pair.indexOf("=");
+    if (i <= 0) continue;
+    if (names.includes(pair.slice(0, i).trim().toLowerCase())) return pair.slice(i + 1).trim() || null;
+  }
+  return String(process.env.HA_NOTIFY_SERVICE || "").trim() || null;
+}
+async function sendHaNotify(service, title, message, tag) {
+  const base = String(process.env.HA_URL || "").replace(/\/+$/, "");
+  const token = process.env.HA_TOKEN;
+  if (!base || !token || !service || !/^[a-z0-9_]+$/.test(service)) return false;
+  const r = await fetch(`${base}/api/services/notify/${service}`, {
+    method: "POST",
+    signal: AbortSignal.timeout(10_000),
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ title, message, data: { tag, group: "khouch-reminders" } }),
+  });
+  return r.ok;
+}
+// Guide programmes for a channel from the bulk XMLTV index (ms), or null when
+// the channel has no guide data there (reminders on it are kept as set).
+function reminderProgrammes(streamId) {
+  const s = getIndexesFor(ownerAccount).live.byId.get(parseInt(streamId, 10));
+  const chId = s?.epg_channel_id;
+  if (!chId || !epgIndex.has(chId)) return null;
+  return epgIndex.get(chId);
+}
+function liveChannelLabel(name) {
+  return liveRescue.splitPrefix(name).rest.trim() || String(name || "");
+}
+// After each guide rebuild: follow moved programmes, drop vanished ones, and
+// re-home reminders whose channel id left the catalog onto a copy of the same
+// channel (same region + name).
+function revalidateReminders() {
+  if (reminderStore.seenEpgBuild === epgIndexBuiltAt) return;
+  const ix = getIndexesFor(ownerAccount).live;
+  if (!ix.ready || !epgIndexBuiltAt) return;
+  let changed = false;
+  for (const r of reminderStore.reminders) {
+    if (r.status !== "pending" || !r.owner) continue;
+    if (!ix.byId.has(parseInt(r.streamId, 10))) {
+      const want = r.groupKey;
+      const twin = want ? [...ix.byId.values()].find((s) => liveRescue.groupKeyOf(s) === want) : null;
+      if (twin) {
+        r.streamId = String(twin.id);
+        r.note = "Channel moved";
+      } else {
+        r.status = "dropped";
+        r.note = "Channel no longer available";
+        changed = true;
+        continue;
+      }
+      changed = true;
+    }
+    const m = remindersLib.rematch(r, reminderProgrammes(r.streamId));
+    if (m.action === "move") {
+      console.log(`[reminders] ${r.id} moved ${new Date(r.start).toISOString()} -> ${new Date(m.start).toISOString()}`);
+      r.start = m.start; r.stop = m.stop; r.note = "Time changed";
+      changed = true;
+    } else if (m.action === "drop") {
+      console.log(`[reminders] ${r.id} dropped: ${m.note}`);
+      r.status = "dropped"; r.note = m.note;
+      changed = true;
+    }
+  }
+  reminderStore.seenEpgBuild = epgIndexBuiltAt;
+  scheduleRemindersSave();
+  if (changed) console.log("[reminders] revalidated after guide rebuild");
+}
+let remindersTicking = false;
+async function remindersTick() {
+  if (remindersTicking) return;
+  remindersTicking = true;
+  try {
+    try { revalidateReminders(); } catch (e) { console.warn(`[reminders] revalidate failed: ${e.message}`); }
+    const now = Date.now();
+    const { fire, miss } = remindersLib.dueTransitions(reminderStore.reminders, now);
+    for (const r of miss) { r.status = "missed"; r.note = "Server was offline at start time"; }
+    for (const r of fire) {
+      r.status = "fired";
+      r.firedAt = now;
+      const profile = findProfile(r.profileId);
+      const svc = haNotifyServiceFor(profile);
+      const { title, message } = remindersLib.notifyText(r, profile?.nick, now);
+      let pushed = false;
+      try { pushed = await sendHaNotify(svc, title, message, `khouch-reminder-${r.id}`); }
+      catch (e) { console.warn(`[reminders] HA notify failed: ${e.message}`); }
+      console.log(`[reminders] fired ${r.id} profile=${r.profileId} live:${r.streamId} push=${pushed ? svc : "none"}`);
+    }
+    const before = reminderStore.reminders.length;
+    reminderStore.reminders = remindersLib.prune(reminderStore.reminders, now);
+    if (fire.length || miss.length || before !== reminderStore.reminders.length) scheduleRemindersSave();
+  } finally { remindersTicking = false; }
+}
+setInterval(() => { remindersTick().catch(() => {}); }, 20_000).unref?.();
+
+function remindersPayload(profileId) {
+  const now = Date.now();
+  const mine = reminderStore.reminders.filter((r) => r.profileId === profileId).sort((a, b) => a.start - b.start);
+  return {
+    reminders: mine.map((r) => remindersLib.publicView(r, now)),
+    due: remindersLib.dueForProfile(reminderStore.reminders, profileId, now).map((r) => remindersLib.publicView(r, now)),
+  };
+}
+app.get("/api/reminders", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (!req.profileId) return res.json({ reminders: [], due: [] });
+  res.json(remindersPayload(req.profileId));
+});
+app.post("/api/reminders", express.json({ limit: "4kb" }), (req, res) => {
+  if (!req.profileId) return res.status(400).json({ error: "no profile" });
+  const now = Date.now();
+  const v = remindersLib.validateCreate(req.body, now);
+  if (v.error) return res.status(400).json({ error: v.error });
+  const actx = currentAccount();
+  const s = getIndexesFor(actx).live.byId.get(parseInt(v.streamId, 10));
+  if (!s) return res.status(404).json({ error: "not in catalog" });
+  // Snap to the guide's own times when the bulk guide has this airing.
+  if (isOwnerAccount(actx)) {
+    const m = remindersLib.rematch({ title: v.title, start: v.start, stop: v.stop }, reminderProgrammes(v.streamId));
+    if (m.action === "move") { v.start = m.start; v.stop = m.stop; }
+  }
+  const dup = remindersLib.findDuplicate(reminderStore.reminders, req.profileId, v.streamId, v.start, v.title);
+  if (!dup) {
+    if (remindersLib.countActive(reminderStore.reminders, req.profileId) >= remindersLib.MAX_PER_PROFILE) {
+      return res.status(429).json({ error: "too many reminders" });
+    }
+    reminderStore.reminders.push({
+      id: crypto.randomBytes(6).toString("hex"),
+      profileId: req.profileId,
+      owner: isOwnerAccount(actx),
+      streamId: v.streamId,
+      groupKey: liveRescue.groupKeyOf(s),
+      channel: liveChannelLabel(s.name),
+      title: v.title,
+      start: v.start,
+      stop: v.stop,
+      status: "pending",
+      createdAt: now,
+    });
+    scheduleRemindersSave();
+  }
+  res.json(remindersPayload(req.profileId));
+});
+app.delete("/api/reminders/:id", (req, res) => {
+  const i = reminderStore.reminders.findIndex((r) => r.id === req.params.id && r.profileId === req.profileId);
+  if (i < 0) return res.status(404).json({ error: "not found" });
+  reminderStore.reminders.splice(i, 1);
+  scheduleRemindersSave();
+  res.json(remindersPayload(req.profileId));
+});
+// Banner dismissed (OK or close) on one client: stop showing it everywhere.
+app.post("/api/reminders/:id/ack", (req, res) => {
+  const r = reminderStore.reminders.find((x) => x.id === req.params.id && x.profileId === req.profileId);
+  if (!r) return res.status(404).json({ error: "not found" });
+  if (!r.ackedAt) { r.ackedAt = Date.now(); scheduleRemindersSave(); }
+  res.json(remindersPayload(req.profileId));
 });
 
 // EPG: programs for a live channel in a time window. Used by the
