@@ -1054,7 +1054,17 @@ function recordPanelVodInfo(movieId, info, actx = currentAccount(), opts = {}) {
     audio_profile: audio ? audio.profile : null,
     checked_at: Date.now(),
   };
-  if (!isOwnerAccount(actx)) return entry;
+  if (!isOwnerAccount(actx)) {
+    // Member panels: keep the pre-surround behaviour for the 4K verdict only
+    // (video fields, shared keyspace, as before), never audio / misses /
+    // index patches, and never over an owner entry that carries audio.
+    const prev = qualityCache[`movie:${movieId}`];
+    if ((w || h) && !(prev && "audio_channels" in prev)) {
+      qualityCache[`movie:${movieId}`] = { w, h, codec: entry.codec, bitrate: entry.bitrate, is4k: entry.is4k, checked_at: entry.checked_at };
+      scheduleQualityCacheSave(opts.saveDelayMs || 500);
+    }
+    return entry;
+  }
   qualityCache[`movie:${movieId}`] = entry;
   scheduleQualityCacheSave(opts.saveDelayMs || 500);
   if (audio && audioCrawlMisses[`movie:${movieId}`]) {
@@ -1515,8 +1525,9 @@ const surroundCrawler = surroundLib.createAudioCrawler({
       // noCache: a crawl must not pin ~10k info answers in the 24 h memory cache.
       info = await xtream(MODES.movie.info, { vod_id: id }, { actx, timeout: 20_000, noCache: true });
     } catch (e) {
-      // A 4xx / non-JSON answer is about this title, not the panel: a miss.
-      if (/^Panel 4\d\d\b/.test(String(e && e.message)) || (e && e.name === "SyntaxError")) { noteAudioMiss(id); return "none"; }
+      // Only "this title is gone" is a miss; anything else (403 at the
+      // connection cap, 429, HTML maintenance pages) is transient.
+      if (/^Panel (404|410)\b/.test(String(e && e.message))) { noteAudioMiss(id); return "none"; }
       throw e;
     }
     if (!isUsableInfo(info, "movie")) throw new Error("unusable info answer");

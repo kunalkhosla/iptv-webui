@@ -140,3 +140,19 @@ test("crawler: yields while shouldYield, skips an id after 3 failures", async ()
   assert.equal(crawler.stats().skipped, 1);
   assert.ok(probed.includes(8));
 });
+
+test("crawler: a panel-wide outage never skips ids", async () => {
+  let probes = 0;
+  let crawler;
+  crawler = S.createAudioCrawler({
+    candidates: () => [1, 2, 3],
+    isKnown: () => false,
+    probe: async () => { probes++; throw new Error("down"); },
+    sleep: async () => { if (probes >= 12) crawler.stop(); },
+    intervalMs: 1,
+  });
+  crawler.start();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(probes >= 12);
+  assert.equal(crawler.stats().skipped, 0);
+});

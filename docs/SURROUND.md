@@ -63,8 +63,8 @@ four fields when known (omitted otherwise).
 - one `get_vod_info` at a time, `SURROUND_CRAWL_INTERVAL_MS` apart (default
   4000), always against the owner panel; not cached in the 24 h memory cache;
   pauses (15 s polls) while anyone on the owner account is streaming;
-  transient errors back off 60 s -> 15 min, an id failing 3 times is skipped
-  until restart; a 4xx / non-JSON answer counts as a miss. A degraded panel
+  transient errors back off 60 s -> 15 min, an id failing 3 times on an otherwise
+  healthy panel is skipped until restart; only a 404/410 counts as a miss. A degraded panel
   answer (auth reject, empty shell) is never recorded as a miss.
 - quality-cache.json is saved at most once a minute from crawler writes.
 - order: movie tiles a client was just shown without audio info (home rails
