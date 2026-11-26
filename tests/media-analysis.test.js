@@ -67,7 +67,7 @@ test("jpegSize reads SOF dimensions", () => {
   assert.equal(jpegSize(Buffer.from("nope")), null);
 });
 
-test("trickplay store: put/list/filePath/complete/evict", () => {
+test("trickplay store: put/list/filePath/complete/evict", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tp-"));
   try {
     const st = createTrickplayStore({ dir, maxBytes: 300 });
@@ -82,15 +82,20 @@ test("trickplay store: put/list/filePath/complete/evict", () => {
     assert.ok(st.filePath("movie", "12", "20"));
     assert.equal(st.filePath("movie", "12", "21"), null);
     assert.equal(st.filePath("movie", "12", "../../etc/passwd"), null);
-    st.markComplete("movie", "12");
-    assert.equal(st.list("movie", "12").complete, true);
-    // A fresh store reads the same from disk.
-    const st2 = createTrickplayStore({ dir });
-    assert.deepEqual(st2.list("movie", "12").times, [0, 20]);
-    assert.equal(st2.list("movie", "12").complete, true);
-    const r = st.evict(); // 2 x ~221 B > 300 B -> the title goes
+    // Over the cap: a partial title is evicted...
+    let r = await st.evict(); // 2 x ~221 B > 300 B
     assert.equal(r.removed, 1);
     assert.deepEqual(st.list("movie", "12").times, []);
+    // ...a complete one (offline pass) is kept.
+    st.put("disk", "7", 0, fakeJpeg()); st.put("disk", "7", 10, fakeJpeg());
+    st.markComplete("disk", "7");
+    // A fresh store reads the same from disk.
+    const st2 = createTrickplayStore({ dir });
+    assert.deepEqual(st2.list("disk", "7").times, [0, 10]);
+    assert.equal(st2.list("disk", "7").complete, true);
+    r = await st.evict();
+    assert.equal(r.removed, 0);
+    assert.deepEqual(st.list("disk", "7").times, [0, 10]);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
