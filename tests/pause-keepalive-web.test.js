@@ -146,6 +146,21 @@ test("same title re-pause does not reset the clock; background resume keeps the 
   assert.equal(h2.posts.length, 1, "within the budget: beats");
 });
 
+test("spent(): a self-stopped pause is not restarted; play clears it", async () => {
+  const h = harness(() => ({ status: 200, body: { kept: false, reason: "cap" } }));
+  h.ka.paused("movie", 1);
+  await h.advance(0);
+  assert.equal(h.ka.spent(), true);
+  h.ka.stop("background");
+  assert.equal(h.ka.spent(), false, "explicit stop reason replaces the self-stop");
+  const h2 = harness(() => ({ status: 410, body: {} }));
+  h2.ka.paused("movie", 1);
+  await h2.advance(0);
+  assert.equal(h2.ka.spent(), true);
+  h2.ka.stop("play");
+  assert.equal(h2.ka.spent(), false);
+});
+
 test("a stale reply from a previous pause cannot stop the new one", async () => {
   let release;
   const k = K.create({
@@ -171,6 +186,7 @@ test("app.js wiring: pause/play/close/cast/visibility and script order", () => {
   assert.match(APP, /state\.castSession = ctx\.getCurrentSession\(\);\n\s+_pauseKA\.stop\("cast"\);/);
   assert.match(APP, /p\.mode === "live" \|\| state\.castSession/);
   assert.match(APP, /_pauseKA\.stop\("background"\)/);
+  assert.match(APP, /_pauseKA\.spent\(\) \? "spent"/);
   const SRV = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   assert.match(SRV, /rescue-logic\\\.js\|pause-keepalive\\\.js/);
 });

@@ -11,6 +11,7 @@
   const INTERVAL_MS = 60_000;
   const MAX_MS = 60 * 60_000;
   const MODES = new Set(["movie", "series", "disk"]);
+  const SELF_STOPS = new Set(["cap", "displaced", "rejected", "no-session", "not-kept"]);
 
   // deps = { post(target) -> Promise<{status, body}>, now(), setTimer(fn, ms),
   //          clearTimer(handle), intervalMs?, maxMs? }
@@ -25,9 +26,11 @@
 
     function clear() { if (timer != null) { deps.clearTimer(timer); timer = null; } }
 
+    // Always records the reason (even when idle) so a later "play" clears a
+    // stale self-stop ("cap", "displaced", ...) — see spent().
     function stop(reason) {
       clear();
-      if (target) stoppedBy = reason || "stop";
+      stoppedBy = reason || "stop";
       target = null;
       gen++;
     }
@@ -75,8 +78,13 @@
       paused(mode, id, originalPausedAt);
     }
 
+    // The current pause's keep-alive ended itself (cap / server refusal): a
+    // background round-trip must not start a fresh 60-min budget.
+    function spent() { return !target && SELF_STOPS.has(stoppedBy); }
+
     return {
       paused,
+      spent,
       resumeAfterBackground,
       stop,
       get active() { return !!target; },

@@ -7614,7 +7614,7 @@ el.video.addEventListener("pause", () => { elPlayPause.textContent = "▶"; keep
 // A missing pause-keepalive.js (stale cache mid-deploy) must not take the rest
 // of app.js down with it: fall back to a no-op.
 const _pauseKA = typeof KPauseKeepalive === "undefined"
-  ? { paused() {}, stop() {}, resumeAfterBackground() {}, pausedAt: null }
+  ? { paused() {}, stop() {}, resumeAfterBackground() {}, spent() { return true; }, pausedAt: null }
   : KPauseKeepalive.create({
   post: (t) => fetch("/api/stream/heartbeat", {
     method: "POST",
@@ -7645,14 +7645,15 @@ el.video.addEventListener("ended", () => { _pauseKABackgroundedAt = null; _pause
 el.video.addEventListener("emptied", () => { _pauseKABackgroundedAt = null; _pauseKA.stop("emptied"); });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
-    _pauseKABackgroundedAt = _pauseKA.pausedAt;
+    // "spent": this pause's keep-alive already ended itself; don't restart it.
+    _pauseKABackgroundedAt = _pauseKA.spent() ? "spent" : _pauseKA.pausedAt;
     _pauseKA.stop("background");
     return;
   }
   const at = _pauseKABackgroundedAt;
   _pauseKABackgroundedAt = null;
   const t = pauseKeepaliveTarget();
-  if (!t) return;
+  if (!t || at === "spent") return;
   // Same pause: continue inside its budget. Paused while hidden (media key,
   // PiP): a fresh pause starts now.
   if (at != null) _pauseKA.resumeAfterBackground(t.mode, t.id, at);
