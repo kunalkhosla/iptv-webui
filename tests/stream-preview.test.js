@@ -138,6 +138,10 @@ test("previewStartSecs: resume point, else ~10 % (60 s .. 15 min), 5 min when un
   assert.equal(sp.previewStartSecs({ durationSecs: 20000 }), 900);
   assert.equal(sp.previewStartSecs({}), 300);
   assert.equal(sp.previewStartSecs({ progressSecs: 700 }), 700);
+  // Series "continue" pointer at an unstarted next episode: from its start; a real position still wins.
+  assert.equal(sp.previewStartSecs({ durationSecs: 2400, nextEpisode: true }), 0);
+  assert.equal(sp.previewStartSecs({ progressSecs: 30, durationSecs: 2400, nextEpisode: true }), 0);
+  assert.equal(sp.previewStartSecs({ progressSecs: 900, durationSecs: 2400, nextEpisode: true }), 900);
 });
 
 test("pickSeriesEpisode: continue pointer, else S1E1 (specials last), skips bad ids", () => {

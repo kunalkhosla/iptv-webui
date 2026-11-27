@@ -35,7 +35,10 @@ episode). Owner account only. `Cache-Control: no-store`.
 - `start`: the profile's resume point when it is a real one (past 60 s, before
   the last 10 %), else ~10 % in (60 s .. 15 min; 300 s when the length is
   unknown). Series: the profile's continue pointer (`lastEpisode`, which already
-  moves to the next episode when one is finished), else S1E1.
+  moves to the next episode when one is finished), else S1E1; that next
+  episode, not started yet, plays from 0. The TV asks for the stream FIRST
+  (before the trailer) when the title has resume progress; the preview only
+  reads progress and never writes or advances it.
 - Errors: `409 {"error":"busy","reason"}` — `viewer` / `live-viewer` /
   `download` (someone is watching or downloading: clients back off 60 s),
   `provider` (the server is probing / downloading the guide / rebuilding the

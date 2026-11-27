@@ -14415,7 +14415,10 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     }
     if (bailIfStale()) return;
     const prog = userState.progress?.[`${mode}:${streamId}`];
-    const startSecs = streamPreview.previewStartSecs({ progressSecs: prog?.p, durationSecs: durationSecs || prog?.d });
+    // Resume point when the profile has one (movie position, or the series'
+    // in-progress / next episode); read only, a preview never writes progress.
+    const nextEpisode = mode === "series" && seriesId != null && String(userState.lastEpisode?.[seriesId]?.episode_id ?? userState.lastEpisode?.[String(parseInt(seriesId, 10))]?.episode_id ?? "") === String(streamId);
+    const startSecs = streamPreview.previewStartSecs({ progressSecs: prog?.p, durationSecs: durationSecs || prog?.d, nextEpisode });
     // Connection churn: at most one new preview per PREVIEW_MIN_GAP_MS (the
     // request waits out the rest of the gap).
     // Recomputed after each sleep (a preview may have started meanwhile); a
