@@ -72,8 +72,9 @@ connection (lib/stream-preview.js):
   Checked before any panel call, and again right before ffmpeg starts.
 - **Churn**: at most one new preview per 5 s (the request waits out the gap,
   re-checked after each wait; the newest request wins, older waiting ones get
-  `409 superseded`); a request whose client has disconnected never starts
-  ffmpeg; a failed VAAPI run retries in software only if admission still
+  `409 superseded`, even if the newer one then fails); a stale request
+  (disconnected, superseded, or a real play started) gives up before it stops
+  the current preview or preempts Save to Disk, and never starts ffmpeg; a failed VAAPI run retries in software only if admission still
   passes;
   software encodes use 2 threads; a title whose VAAPI decode fails is
   remembered (software next time).
