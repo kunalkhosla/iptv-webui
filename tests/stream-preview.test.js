@@ -187,7 +187,7 @@ test("server wiring: preview never counts as a viewer and anything real stops it
   assert.match(src, /previewViewerActivity\(ownerKeyOf\(req\), "progress"\)/);
   assert.match(src, /if \(pauseKeepalive\.parseHeartbeat\(req\.body\)\.ok\) previewViewerActivity\(ownerKeyOf\(req\), "heartbeat"\)/);
   // A real play during the preview request's awaits makes it give up.
-  assert.match(src, /if \(previewPlayEpoch !== epoch0\) return res\.status\(409\)/);
+  assert.match(src, /if \(previewPlayEpoch !== epoch0\) \{ res\.status\(409\)/);
   // A phone download waits for the preview's ffmpeg to exit first.
   assert.match(src, /const previewGone = stopPreviews\("phone download"\);\n\s*if \(previewGone\) \{ await previewGone; continue; \}/);
   assert.match(src, /streamPreview\.noteSignal\(previewSignals, ok, "live-end", now\)/);
@@ -195,6 +195,20 @@ test("server wiring: preview never counts as a viewer and anything real stops it
   const route = src.slice(src.indexOf('app.get("/api/preview/:mode(movie|series)'), src.indexOf('app.post("/api/preview/stop"'));
   assert.ok(route.length > 500);
   for (const w of ["scheduleUserStateSave", "pushRecent", "recents", "lastEpisode[", "userState.progress["]) assert.ok(!route.includes(w), w);
+  // A stale request (abandoned / superseded / play started) gives up after the
+  // series-info await, after each gap sleep, before stopping the current
+  // preview or preempting Save to Disk, after each replaced-stop, and at claim.
+  const at = (needle, from = 0) => { const i = route.indexOf(needle, from); assert.ok(i >= 0, needle); return i; };
+  const bails = []; for (let i = route.indexOf("if (bailIfStale()) return;"); i >= 0; i = route.indexOf("if (bailIfStale()) return;", i + 1)) bails.push(i);
+  const infoAwait = at("await infoStore.get(infoKey)");
+  const replaced = at('stopPreviews("replaced")');
+  const preempt = at('preemptDiskDownloadsForViewer("preview")');
+  const claim = at("const sid = streamPreview.newSid(");
+  assert.ok(bails.some((b) => b > infoAwait && b < at("for (let gap;")), "after info await");
+  assert.ok(bails.some((b) => b > at("for (let gap;") && b < replaced - 200 && b > infoAwait), "before replaced loop");
+  assert.ok(bails.some((b) => b > replaced && b < preempt), "inside replaced loop");
+  assert.ok(bails.some((b) => b > preempt && b < claim), "before claim");
+  assert.ok(route.includes("seq !== previewReqSeq") && route.includes("previewPlayEpoch !== epoch0"));
   // Media routes are registered before the auth middleware (cookie-less players).
   assert.ok(src.indexOf('app.get("/api/preview/:sid(p[0-9a-f]{16})/index.m3u8"') < src.indexOf("app.use((req, res, next) => {\n  if (PUBLIC_PATHS.has(req.path))"));
 });

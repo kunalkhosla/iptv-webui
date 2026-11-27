@@ -14252,7 +14252,10 @@ function stopPreviews(reason, exceptRequester = null) {
   const running = !!proc && proc.exitCode === null && proc.signalCode === null;
   const exited = running
     ? new Promise((resolve) => {
-      const t = setTimeout(resolve, 2000);
+      const t = setTimeout(() => {
+        console.warn(`[preview] ${p.sid} ffmpeg pid ${proc.pid} did not exit within 2 s of SIGKILL (${reason})`);
+        resolve();
+      }, 2000);
       proc.once("exit", () => { clearTimeout(t); resolve(); });
     })
     : Promise.resolve();
@@ -14374,10 +14377,23 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     if (pre) return res.status(409).json({ error: "busy", reason: pre });
     // The TV moves focus fast: a request it has abandoned (connection closed)
     // or that a newer preview request superseded must not open a connection.
+    // A newer request supersedes this one even if it later fails (404, kid
+    // gate, info_unavailable): acceptable, the latest focus wins.
     const seq = ++previewReqSeq;
     let clientGone = false;
     res.on("close", () => { clientGone = true; });
     const abandoned = () => clientGone || res.writableEnded || !!req.socket?.destroyed;
+    // Stale = abandoned, superseded, or a real play started meanwhile. Checked
+    // after every await and BEFORE anything with side effects (stopping the
+    // current preview, preempting Save to Disk): a stale request must not
+    // kill a newer request's preview on its way to a 409.
+    // -> true when the request is done (response sent or client gone).
+    const bailIfStale = () => {
+      if (abandoned()) return true;
+      if (previewPlayEpoch !== epoch0) { res.status(409).json({ error: "busy", reason: "play" }); return true; }
+      if (seq !== previewReqSeq) { res.status(409).json({ error: "busy", reason: "superseded" }); return true; }
+      return false;
+    };
     const userState = getProfileState(req.profileId);
     let streamId = String(id), ext = String(item.container || "mp4").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp4", durationSecs = null, seriesId = null;
     if (mode === "movie") {
@@ -14396,6 +14412,7 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
       if (!ep) return res.status(503).json({ error: "info_unavailable" });
       streamId = ep.id; ext = ep.ext; durationSecs = ep.durationSecs;
     }
+    if (bailIfStale()) return;
     const prog = userState.progress?.[`${mode}:${streamId}`];
     const startSecs = streamPreview.previewStartSecs({ progressSecs: prog?.p, durationSecs: durationSecs || prog?.d });
     // Connection churn: at most one new preview per PREVIEW_MIN_GAP_MS (the
@@ -14404,12 +14421,16 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     // request superseded while it waited gives up, so the latest focus wins.
     for (let gap; (gap = previewLastStartAt + PREVIEW_MIN_GAP_MS - Date.now()) > 0;) {
       await new Promise((r) => setTimeout(r, gap));
-      if (abandoned()) return;
-      if (seq !== previewReqSeq) return res.status(409).json({ error: "busy", reason: "superseded" });
+      if (bailIfStale()) return;
     }
+    if (bailIfStale()) return;
     // One at a time: this replaces any current preview (ours or another
     // device's); its provider connection must be closed before ours opens.
-    for (let i = 0; i < 3 && activePreview; i++) { const prev = stopPreviews("replaced"); if (prev) await prev; }
+    for (let i = 0; i < 3 && activePreview; i++) {
+      const prev = stopPreviews("replaced");
+      if (prev) await prev;
+      if (bailIfStale()) return; // a newer request may have claimed meanwhile: don't stop ITS preview
+    }
     // Yield the connection like a viewer does: a running Save-to-Disk transfer
     // stops, and its connection must be gone before ours opens.
     if (preemptDiskDownloadsForViewer("preview")) {
@@ -14417,9 +14438,7 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     }
     // Final checks, then claim: no await from here to spawn, so a concurrent
     // request or a real play can't slip in between.
-    if (abandoned()) return;
-    if (previewPlayEpoch !== epoch0) return res.status(409).json({ error: "busy", reason: "play" });
-    if (seq !== previewReqSeq) return res.status(409).json({ error: "busy", reason: "superseded" });
+    if (bailIfStale()) return;
     if (activePreview) return res.status(409).json({ error: "busy", reason: "preview" });
     if ([...streams.keys()].some((k) => diskDlSchedule.isDiskDownloadOwner(k))) return res.status(409).json({ error: "busy", reason: "download" });
     const late = previewBlockedReason(requester);
