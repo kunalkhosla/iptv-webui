@@ -33,6 +33,14 @@ function fakeSpawn(calls) {
   };
 }
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+// Poll until cond() holds (fails after timeoutMs) instead of a fixed delay.
+async function waitFor(cond, timeoutMs = 5000) {
+  const end = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("waitFor: timed out");
+    await wait(10);
+  }
+}
 
 test("piggyback: thumbnails every ~interval and audio for episodes in a known series", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "sc-"));
@@ -51,7 +59,7 @@ test("piggyback: thumbnails every ~interval and audio for episodes in a known se
       groupFor: () => ({ group: "series:5", season: 1 }),
     });
     sc.scan();
-    await wait(300);
+    await waitFor(() => trick.list("series", "77").times.length >= 3 && calls.some((a) => a.includes("s16le")));
     const thumbs = trick.list("series", "77").times;
     // segments at 100,104,...,128 -> thumbnails at 100, 112 (>= 9 s apart), 124
     assert.deepEqual(thumbs, [100, 112, 124]);
@@ -78,9 +86,9 @@ test("offline jobs wait for idle and are cancelled when a viewer starts", async 
     assert.equal(sc.enqueueOffline({ kind: "offline-thumbs", key: "k1", mode: "disk", id: "1", file: "/media/a.mkv" }), false);
     await wait(50);
     assert.equal(calls.length, 0); // viewer active: not started
-    viewer = false; sc.scan(); await wait(50);
+    viewer = false; sc.scan(); await waitFor(() => calls.length >= 1);
     assert.equal(calls.length, 1); // started
-    viewer = true; await wait(1300); // poll notices within ~1 s and kills it
+    viewer = true; await waitFor(() => sc.stats().offlineCancelled >= 1); // poll notices within ~1 s and kills it
     assert.equal(sc.stats().offlineCancelled, 1);
     assert.equal(sc.stats().offlineQueued, 1); // requeued
   } finally { fs.rmSync(root, { recursive: true, force: true }); }

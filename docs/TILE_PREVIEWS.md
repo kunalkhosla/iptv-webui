@@ -40,7 +40,8 @@ episode). Owner account only. `Cache-Control: no-store`.
   `download` (someone is watching or downloading: clients back off 60 s),
   `provider` (the server is probing / downloading the guide / rebuilding the
   catalog), `play` (a real play started while this request waited),
-  `preview` (another preview claimed the slot meanwhile); `403 not_allowed`
+  `preview` (another preview claimed the slot meanwhile), `superseded` (a
+  newer preview request arrived while this one waited); `403 not_allowed`
   (not the owner account, or a kid profile and the title's rating is not in
   its allowed certs; unrated = refused), `404` not in catalog, `429` (> 20 starts a
   minute per device), `503 disabled` (`TILE_STREAM_PREVIEW=0`) or
@@ -62,10 +63,18 @@ connection (lib/stream-preview.js):
   a VOD play request / progress post / pause heartbeat in the last 3 min, or a
   live play request whose session has not ended (live health report) within
   3 h (a progress post / heartbeat never shortens that hold). The asking
-  device's own signals do not count. Nor while the server itself uses the
+  device's own signals count only briefly (a direct play leaves no admission
+  entry, and a preview request can trail that device's own play request): any
+  own play / progress / heartbeat in the last 15 s, or an own live play not yet
+  ended within the last 60 s, blocks it; older own signals are of a play the
+  device has left. Nor while the server itself uses the
   provider (a liveness / codec probe, the xmltv download, a catalog rebuild).
   Checked before any panel call, and again right before ffmpeg starts.
-- **Churn**: at most one new preview per 5 s (the request waits out the gap);
+- **Churn**: at most one new preview per 5 s (the request waits out the gap,
+  re-checked after each wait; the newest request wins, older waiting ones get
+  `409 superseded`); a request whose client has disconnected never starts
+  ffmpeg; a failed VAAPI run retries in software only if admission still
+  passes;
   software encodes use 2 threads; a title whose VAAPI decode fails is
   remembered (software next time).
 - **Never displaces anything**, and is stopped (ffmpeg SIGKILLed, so its
@@ -82,6 +91,7 @@ connection (lib/stream-preview.js):
   preempted when a preview starts (the preview opens only once the transfer's
   connection is gone), and jobs wait while it holds the slot.
 - `GET /api/streams`: preview entries carry `preview: true`, are NOT counted in
-  `active`, and are counted in a new top-level `preview`.
+  `active`, and are counted in a new top-level `preview`. They are not viewer
+  activity for Save to Disk's after-viewer grace either.
 
 Logs: `[preview] <sid> start|stop (<reason>) ...`.

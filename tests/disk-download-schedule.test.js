@@ -61,6 +61,11 @@ test("latestViewerSeen ignores background transfers", () => {
   assert.strictEqual(s.latestViewerSeen(m, 70), 70);
 });
 
+test("latestViewerSeen ignores tile previews", () => {
+  const m = map([["s:a", { lastSeen: 50 }], ["preview:p0123456789abcdef", { lastSeen: 900, preview: true }]]);
+  assert.strictEqual(s.latestViewerSeen(m, 10), 50);
+});
+
 test("owner key classification", () => {
   assert.strictEqual(s.isBackgroundOwner("disk-download:x"), true);
   assert.strictEqual(s.isBackgroundOwner("phone-download:x"), true);

@@ -14227,6 +14227,7 @@ let activePreview = null;             // { sid, requester, mode, id, streamId, a
 let previewPlayEpoch = 0;
 const PREVIEW_MIN_GAP_MS = 5_000;     // provider connection churn: at most one new preview per 5 s
 let previewLastStartAt = 0;
+let previewReqSeq = 0;                // newest admitted-for-processing preview request (latest focus wins)
 try { fs.rmSync(PREVIEW_DIR, { recursive: true, force: true }); } catch {} // crash leftovers
 
 function previewSig(sid) {
@@ -14295,8 +14296,13 @@ function spawnPreviewFfmpeg(p, hw) {
       p.retried = true;
       hwDecodeFailed.add(`${p.mode}:${p.streamId}`);
       console.log(`[preview] ${p.sid} hw run failed, retrying in software: ${err.trim().split("\n").pop()?.slice(0, 160) || code}`);
-      if (registerPreviewSlot(p)) spawnPreviewFfmpeg(p, false);
-      else stopPreviews("busy on retry");
+      // Same gate as a fresh start: a viewer / the server may have taken the
+      // provider since (the slot entry was just dropped).
+      if (previewBlockedReason(p.requester) != null || !registerPreviewSlot(p)) { stopPreviews("busy on retry"); return; }
+      try { spawnPreviewFfmpeg(p, false); } catch (e) {
+        console.log(`[preview] ${p.sid} software retry failed: ${e.message}`);
+        stopPreviews("retry failed");
+      }
       return;
     }
     p.ended = true;
@@ -14366,6 +14372,12 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     // Cheap pre-check before any panel call: someone is watching -> 409 now.
     const pre = previewBlockedReason(requester);
     if (pre) return res.status(409).json({ error: "busy", reason: pre });
+    // The TV moves focus fast: a request it has abandoned (connection closed)
+    // or that a newer preview request superseded must not open a connection.
+    const seq = ++previewReqSeq;
+    let clientGone = false;
+    res.on("close", () => { clientGone = true; });
+    const abandoned = () => clientGone || res.writableEnded || !!req.socket?.destroyed;
     const userState = getProfileState(req.profileId);
     let streamId = String(id), ext = String(item.container || "mp4").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp4", durationSecs = null, seriesId = null;
     if (mode === "movie") {
@@ -14388,8 +14400,13 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     const startSecs = streamPreview.previewStartSecs({ progressSecs: prog?.p, durationSecs: durationSecs || prog?.d });
     // Connection churn: at most one new preview per PREVIEW_MIN_GAP_MS (the
     // request waits out the rest of the gap).
-    const gap = previewLastStartAt + PREVIEW_MIN_GAP_MS - Date.now();
-    if (gap > 0) await new Promise((r) => setTimeout(r, gap));
+    // Recomputed after each sleep (a preview may have started meanwhile); a
+    // request superseded while it waited gives up, so the latest focus wins.
+    for (let gap; (gap = previewLastStartAt + PREVIEW_MIN_GAP_MS - Date.now()) > 0;) {
+      await new Promise((r) => setTimeout(r, gap));
+      if (abandoned()) return;
+      if (seq !== previewReqSeq) return res.status(409).json({ error: "busy", reason: "superseded" });
+    }
     // One at a time: this replaces any current preview (ours or another
     // device's); its provider connection must be closed before ours opens.
     for (let i = 0; i < 3 && activePreview; i++) { const prev = stopPreviews("replaced"); if (prev) await prev; }
@@ -14400,25 +14417,33 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     }
     // Final checks, then claim: no await from here to spawn, so a concurrent
     // request or a real play can't slip in between.
+    if (abandoned()) return;
     if (previewPlayEpoch !== epoch0) return res.status(409).json({ error: "busy", reason: "play" });
+    if (seq !== previewReqSeq) return res.status(409).json({ error: "busy", reason: "superseded" });
     if (activePreview) return res.status(409).json({ error: "busy", reason: "preview" });
     if ([...streams.keys()].some((k) => diskDlSchedule.isDiskDownloadOwner(k))) return res.status(409).json({ error: "busy", reason: "download" });
     const late = previewBlockedReason(requester);
     if (late) return res.status(409).json({ error: "busy", reason: late });
     const sid = streamPreview.newSid((n) => crypto.randomBytes(n).toString("hex"));
+    // `now` is the request's entry time (up to ~40 s of awaits ago): the reaper
+    // must time this preview from its claim.
+    const claimAt = Date.now();
     const p = {
       sid, requester, mode, id: String(id), streamId, accountKey: currentAccountKey(),
-      dir: path.join(PREVIEW_DIR, sid), startSecs, startedAt: now, lastAccess: now,
+      dir: path.join(PREVIEW_DIR, sid), startSecs, startedAt: claimAt, lastAccess: claimAt,
       sourceUrl: streamUrl(mode, streamId, ext, actx),
       audioTrack: cachedAudioPick(mode, streamId) ?? 0,
     };
     if (!registerPreviewSlot(p)) {
-      const adm = streamPreview.decideAdmission({ streams, signals: previewSignals, requester, accountKey: p.accountKey, now, idleGraceMs: LIVE_IDLE_GRACE_MS, isBackgroundOwner: diskDlSchedule.isBackgroundOwner, isDiskDownloadOwner: diskDlSchedule.isDiskDownloadOwner });
+      const adm = streamPreview.decideAdmission({ streams, signals: previewSignals, requester, accountKey: p.accountKey, now: Date.now(), idleGraceMs: LIVE_IDLE_GRACE_MS, isBackgroundOwner: diskDlSchedule.isBackgroundOwner, isDiskDownloadOwner: diskDlSchedule.isDiskDownloadOwner });
       return res.status(409).json({ error: "busy", reason: adm.reason || "viewer" });
     }
     activePreview = p;
     previewLastStartAt = Date.now();
-    spawnPreviewFfmpeg(p, HW_ENCODE && !hwDecodeFailed.has(`${mode}:${streamId}`));
+    try { spawnPreviewFfmpeg(p, HW_ENCODE && !hwDecodeFailed.has(`${mode}:${streamId}`)); } catch (e) {
+      stopPreviews("spawn failed");
+      throw e;
+    }
     console.log(`[preview] ${sid} start ${mode}:${streamId}${seriesId ? ` (series ${seriesId})` : ""} at ${startSecs}s`);
     res.json({
       sid, url: `/api/preview/${sid}/index.m3u8?s=${previewSig(sid)}`,

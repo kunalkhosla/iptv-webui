@@ -54,12 +54,38 @@ test("signals: another device's VOD play / progress / heartbeat blocks for 3 min
   assert.equal(decide(new Map(), sig, "s:tv", 9 * MIN).ok, true);
 });
 
-test("signals: the requester's own signals never block it", () => {
+test("signals: the requester's own older signals don't block it", () => {
+  const sig = new Map();
+  sp.noteSignal(sig, "s:tv", "play-vod", 0);
+  sp.noteSignal(sig, "s:tv2", "play-vod", 0);
+  assert.equal(decide(new Map(), sig, "s:tv", 20_000).ok, false); // tv2's
+  assert.equal(decide(new Map(), new Map([["s:tv", sig.get("s:tv")]]), "s:tv", 20_000).ok, true);
+});
+
+test("signals: the requester's own very recent play blocks it (direct play leaves no streams entry)", () => {
+  const sig = new Map();
+  sp.noteSignal(sig, "s:tv", "play-vod", 0);
+  assert.deepEqual(decide(new Map(), sig, "s:tv", 1000), { ok: false, reason: "viewer" });
+  assert.equal(decide(new Map(), sig, "s:tv", sp.OWN_GRACE_MS - 1).ok, false);
+  assert.equal(decide(new Map(), sig, "s:tv", sp.OWN_GRACE_MS).ok, true);
+  // Own progress / heartbeat counts the same way.
+  sp.noteSignal(sig, "s:tv", "activity", 100_000);
+  assert.equal(decide(new Map(), sig, "s:tv", 105_000).ok, false);
+  assert.equal(decide(new Map(), sig, "s:tv", 100_000 + sp.OWN_GRACE_MS).ok, true);
+});
+
+test("signals: the requester's own un-ended live play blocks it for OWN_LIVE_GRACE_MS", () => {
   const sig = new Map();
   sp.noteSignal(sig, "s:tv", "play-live", 0);
-  sp.noteSignal(sig, "s:tv2", "play-vod", 0);
-  assert.equal(decide(new Map(), sig, "s:tv", 1000).ok, false); // tv2's
-  assert.equal(decide(new Map(), new Map([["s:tv", sig.get("s:tv")]]), "s:tv", 1000).ok, true);
+  assert.deepEqual(decide(new Map(), sig, "s:tv", 1000), { ok: false, reason: "live-viewer" });
+  assert.equal(decide(new Map(), sig, "s:tv", sp.OWN_LIVE_GRACE_MS - 1).ok, false);
+  assert.equal(decide(new Map(), sig, "s:tv", sp.OWN_LIVE_GRACE_MS).ok, true);
+  // Ended (health report past the race window): only the short grace applies.
+  const sig2 = new Map();
+  sp.noteSignal(sig2, "s:tv", "play-live", 0);
+  sp.noteSignal(sig2, "s:tv", "live-end", 11_000);
+  assert.equal(decide(new Map(), sig2, "s:tv", 12_000).ok, false);
+  assert.equal(decide(new Map(), sig2, "s:tv", 20_000).ok, true);
 });
 
 test("signals: a live play on another device blocks until its health report (session end)", () => {
