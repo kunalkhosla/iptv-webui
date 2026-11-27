@@ -14254,9 +14254,9 @@ function stopPreviews(reason, exceptRequester = null) {
     ? new Promise((resolve) => {
       const t = setTimeout(() => {
         console.warn(`[preview] ${p.sid} ffmpeg pid ${proc.pid} did not exit within 2 s of SIGKILL (${reason})`);
-        resolve();
+        resolve(false);
       }, 2000);
-      proc.once("exit", () => { clearTimeout(t); resolve(); });
+      proc.once("exit", () => { clearTimeout(t); resolve(true); });
     })
     : Promise.resolve();
   if (running) { try { proc.kill("SIGKILL"); } catch {} }
@@ -14409,6 +14409,7 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
       if (!info?.episodes) info = (await infoStore.get(infoKey).catch(() => null))?.v || null;
       const le = userState.lastEpisode?.[seriesId] || userState.lastEpisode?.[String(parseInt(seriesId, 10))];
       const ep = streamPreview.pickSeriesEpisode(info, le);
+      if (bailIfStale()) return;
       if (!ep) return res.status(503).json({ error: "info_unavailable" });
       streamId = ep.id; ext = ep.ext; durationSecs = ep.durationSecs;
     }
@@ -14428,7 +14429,8 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     // device's); its provider connection must be closed before ours opens.
     for (let i = 0; i < 3 && activePreview; i++) {
       const prev = stopPreviews("replaced");
-      if (prev) await prev;
+      // Its ffmpeg may still hold the provider connection: never open a second one.
+      if (prev && (await prev) === false) return abandoned() ? undefined : res.status(409).json({ error: "busy", reason: "preview" });
       if (bailIfStale()) return; // a newer request may have claimed meanwhile: don't stop ITS preview
     }
     // Yield the connection like a viewer does: a running Save-to-Disk transfer
