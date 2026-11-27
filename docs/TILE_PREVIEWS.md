@@ -99,3 +99,9 @@ connection (lib/stream-preview.js):
   activity for Save to Disk's after-viewer grace either.
 
 Logs: `[preview] <sid> start|stop (<reason>) ...`.
+
+A stopped preview's ffmpeg is SIGKILLed; until it has exited no new preview
+starts (409 `preview`; a warning is logged if one is stuck over 60 s). A real
+viewer does not wait for that exit on the synchronous `admitStream` paths
+(`/api/proxy`, `/api/transcode`): SIGKILL exit takes milliseconds and the
+viewer wins anyway. `/api/stream` awaits it.
