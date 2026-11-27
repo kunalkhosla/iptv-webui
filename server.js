@@ -14221,6 +14221,8 @@ const PREVIEW_LINGER_MS = 60_000;     // after ffmpeg finished: segments stay th
 const PREVIEW_DIR = path.join(TRANSCODE_DIR, "previews");
 const previewSignals = new Map();     // owner -> latest play/progress/heartbeat (noteSignal)
 const previewStartRate = new Map();   // requester -> { n, t }
+// SIGKILLed preview ffmpegs that have not exited yet (may still hold the provider connection).
+const previewProcsExiting = new Set();
 let activePreview = null;             // { sid, requester, mode, id, streamId, accountKey, dir, proc, ... }
 // Bumped by every real play request: a preview request that was waiting
 // (series info, the previous preview's exit) when one arrived gives up.
@@ -14256,10 +14258,10 @@ function stopPreviews(reason, exceptRequester = null) {
         console.warn(`[preview] ${p.sid} ffmpeg pid ${proc.pid} did not exit within 2 s of SIGKILL (${reason})`);
         resolve(false);
       }, 2000);
-      proc.once("exit", () => { clearTimeout(t); resolve(true); });
+      proc.once("exit", () => { clearTimeout(t); previewProcsExiting.delete(proc); resolve(true); });
     })
     : Promise.resolve();
-  if (running) { try { proc.kill("SIGKILL"); } catch {} }
+  if (running) { previewProcsExiting.add(proc); try { proc.kill("SIGKILL"); } catch {} }
   p.stopped = true;
   setTimeout(() => fs.rm(p.dir, { recursive: true, force: true }, () => {}), 2000).unref?.();
   console.log(`[preview] ${p.sid} stop (${reason}) ${p.mode}:${p.streamId} after ${Math.round((Date.now() - p.startedAt) / 1000)}s`);
@@ -14395,7 +14397,7 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
       return false;
     };
     const userState = getProfileState(req.profileId);
-    let streamId = String(id), ext = String(item.container || "mp4").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp4", durationSecs = null, seriesId = null;
+    let streamId = String(id), ext = String(item.container || "mp4").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp4", durationSecs = null, seriesId = null, le = null;
     if (mode === "movie") {
       durationSecs = panelDurationSecsCached("movie", id) || (Number(tmdbCache[`movie:${id}`]?.runtime) * 60 || null);
     } else {
@@ -14407,7 +14409,7 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
         try { info = await xtream(MODES.series.info, params, { actx, timeout: INFO_PANEL_TIMEOUT_MS }); } catch { info = null; }
       }
       if (!info?.episodes) info = (await infoStore.get(infoKey).catch(() => null))?.v || null;
-      const le = userState.lastEpisode?.[seriesId] || userState.lastEpisode?.[String(parseInt(seriesId, 10))];
+      le = userState.lastEpisode?.[seriesId] || userState.lastEpisode?.[String(parseInt(seriesId, 10))] || null;
       const ep = streamPreview.pickSeriesEpisode(info, le);
       if (bailIfStale()) return;
       if (!ep) return res.status(503).json({ error: "info_unavailable" });
@@ -14417,7 +14419,9 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     const prog = userState.progress?.[`${mode}:${streamId}`];
     // Resume point when the profile has one (movie position, or the series'
     // in-progress / next episode); read only, a preview never writes progress.
-    const nextEpisode = mode === "series" && seriesId != null && String(userState.lastEpisode?.[seriesId]?.episode_id ?? userState.lastEpisode?.[String(parseInt(seriesId, 10))]?.episode_id ?? "") === String(streamId);
+    // Next episode = the continue pointer at an episode with no progress yet (a
+    // nearly finished one keeps its ~10 % start).
+    const nextEpisode = mode === "series" && !prog && le != null && String(le.episode_id ?? "") === String(streamId);
     const startSecs = streamPreview.previewStartSecs({ progressSecs: prog?.p, durationSecs: durationSecs || prog?.d, nextEpisode });
     // Connection churn: at most one new preview per PREVIEW_MIN_GAP_MS (the
     // request waits out the rest of the gap).
@@ -14444,7 +14448,7 @@ app.get("/api/preview/:mode(movie|series)/:id(\\d{1,12})", async (req, res, next
     // Final checks, then claim: no await from here to spawn, so a concurrent
     // request or a real play can't slip in between.
     if (bailIfStale()) return;
-    if (activePreview) return res.status(409).json({ error: "busy", reason: "preview" });
+    if (activePreview || previewProcsExiting.size) return res.status(409).json({ error: "busy", reason: "preview" });
     if ([...streams.keys()].some((k) => diskDlSchedule.isDiskDownloadOwner(k))) return res.status(409).json({ error: "busy", reason: "download" });
     const late = previewBlockedReason(requester);
     if (late) return res.status(409).json({ error: "busy", reason: late });
