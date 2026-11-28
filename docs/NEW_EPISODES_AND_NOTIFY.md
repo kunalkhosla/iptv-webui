@@ -37,7 +37,8 @@ in the catalog, at most 30 per profile, owner panel profiles only.
   failure). A copy fetched in the last 6 h (any detail open counts) is
   reused; a fresh read replaces the in-memory info copy (and the on-disk
   stale-if-error copy when that is older than 6 h). Anything that drops the
-  info cache (panel switch, Refresh) re-runs the crawl 2 min later. `POST /api/admin/check-new-episodes` (owner) runs it now.
+  info cache (panel switch, Refresh) re-runs the crawl once the series index
+  has been rebuilt. `POST /api/admin/check-new-episodes` (owner) runs it now.
 - **Seen mark** (`userState.seriesSeen[seriesId] = { s, e, at }`, server
   owned, never taken from `PUT /api/user-state`): the last (season, episode)
   the panel listed when the profile last **opened** the series

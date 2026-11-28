@@ -3438,7 +3438,13 @@ function assignVariants(mode, actx = currentAccount()) {
   ix.byTmdb = byTmdb;
   catalogGen++;
   // Titles on a Notify-me list may have just arrived (after module init).
-  setImmediate(() => scheduleNotifyMeCheck(`index:${mode}`));
+  setImmediate(() => {
+    scheduleNotifyMeCheck(`index:${mode}`);
+    if (mode === "series" && isOwnerAccount(actx) && ix.ready && newEpCrawlPending) {
+      newEpCrawlPending = false;
+      crawlNewEpisodes("cache-clear");
+    }
+  });
   console.log(`[${mode}] variants: ${grouped} multi-version titles, ${hidden} alternates folded`);
   // Warm the search/detail title groups off the request path.
   scheduleVariantBuild(mode, ix, actx);
@@ -9053,10 +9059,8 @@ app.post("/api/progress/:mode(movie|series|disk)/:id", express.json(), (req, res
   if (mode === "series") {
     // Playing an episode clears the series' "new episode" badge.
     // Progress ticks every few seconds: at most every 10 min per profile + episode.
-    if (newEpisodeTickDue(req.profileId, id)) {
-      const sid = Object.entries(userState.lastEpisode || {}).find(([, le]) => String(le?.episode_id) === String(id))?.[0];
-      if (sid) noteSeriesPlayed(userState, sid);
-    }
+    const sid = Object.entries(userState.lastEpisode || {}).find(([, le]) => String(le?.episode_id) === String(id))?.[0];
+    if (sid && newEpisodeTickDue(req.profileId, sid)) noteSeriesPlayed(userState, sid);
   }
   if (mode === "series" && finished) {
     try { advanceToNextEpisode(userState, id); } catch (e) { console.warn(`[progress] next-episode: ${e.message}`); }
@@ -9201,7 +9205,7 @@ app.put("/api/user-state", express.json({ limit: "256kb" }), (req, res) => {
       else if (inc && cur?.cwRemovedAt && String(inc.episode_id) === String(cur.episode_id)
         && !(Number(inc.when) > cur.cwRemovedAt)) merged[sid] = cur;
       // Server-owned play time survives a client snapshot.
-      else if (inc && typeof inc === "object" && cur?.playedAt && !inc.playedAt) merged[sid] = { ...inc, playedAt: cur.playedAt };
+      else if (inc && typeof inc === "object" && cur?.playedAt) merged[sid] = { ...inc, playedAt: Math.max(cur.playedAt, Number(inc.playedAt) || 0) };
     }
     userState.lastEpisode = merged;
   }
@@ -10459,9 +10463,9 @@ app.post("/api/reminders/:id/ack", (req, res) => {
 
 // The xtream cache (series infos included) was dropped: re-read followed
 // series soon, so new-episode badges don't vanish until the next 6 h crawl.
-function afterInfoCacheClear() {
-  setTimeout(() => crawlNewEpisodes("cache-clear"), 2 * 60e3).unref?.();
-}
+// Runs once the owner's series index has been rebuilt (assignVariants).
+let newEpCrawlPending = false;
+function afterInfoCacheClear() { newEpCrawlPending = true; }
 // ── New episodes (lib/new-episodes.js) ──────────────────────────────────────
 // Series a profile follows (a lastEpisode pointer played in the last 120 days)
 // are re-read from the panel every NEW_EP_REFRESH_MS: get_series_info only,
@@ -10505,9 +10509,9 @@ function noteSeriesPlayed(userState, sid) {
   const info = cachedSeriesInfo(currentAccount(), sid);
   if (info) markSeriesSeen(userState, sid, info);
 }
-const newEpisodeTickAt = new Map(); // "profile|episode" -> ms
-function newEpisodeTickDue(profileId, episodeId) {
-  const k = `${profileId}|${episodeId}`;
+const newEpisodeTickAt = new Map(); // "profile|series" -> ms
+function newEpisodeTickDue(profileId, sid) {
+  const k = `${profileId}|${sid}`;
   const now = Date.now();
   if (now - (newEpisodeTickAt.get(k) || 0) < 10 * 60e3) return false;
   if (newEpisodeTickAt.size > 2000) newEpisodeTickAt.clear();
