@@ -227,6 +227,31 @@ has no TMDB cache entry queues a background TMDB lookup (one at a time,
 400 ms apart, retried at most every 6 h per title), so its poster appears on
 a later load. With `poster: null`, clients draw a generated title card.
 
+## 8. Autoplay next episode (per profile)
+
+Stored on the profile record in `users.json` as `autoplay: { next, stopAfter }`
+(`lib/autoplay.js`), only once someone edits it. Until then the effective value
+follows the profile kind: adults `{ next: true, stopAfter: 3 }` (the old
+behaviour), kid profiles `{ next: true, stopAfter: 2 }`; a profile that turns
+into a kid profile later picks up the kid default.
+
+- `GET /api/profiles` and `GET /api/bootstrap` (`profile`) carry the effective
+  `autoplay: { next, stopAfter, custom }` (`custom` = explicitly set).
+- `PATCH /api/profiles/:id` takes `autoplay: { next?, stopAfter? }` (merged over
+  the effective value; `stopAfter` one of 0 / 1 / 2 / 3 / 5) or `autoplay: null`
+  (back to the default). A bad value is a 400 and nothing changes. The reply
+  carries the new effective `autoplay`. POST /api/profiles accepts the same field.
+- `next: false`: no client plays the next episode on its own. The credits
+  still show the Up Next card (Watch credits / Play now) without a countdown,
+  and the end of an episode stops on the Up Next card. Cast receivers (phone)
+  do not auto-advance either.
+- `stopAfter` N: after N episodes in a row with no input, the next one opens
+  behind "Still watching?" (the N-th consecutive auto-advance waits; 0 = never
+  asks). 3 = the old behaviour.
+- Editing: the web profile editor (Playback: Autoplay next episode + Stop after;
+  sent only when touched, so an untouched profile keeps following its kind),
+  TV Settings > Autoplay and phone Settings > Autoplay (the current profile).
+
 ## Ops
 
 - `GET /api/admin/sidecar` (owner): queue/tracking stats + marker counts.
@@ -275,6 +300,10 @@ by `tests/web-netflix.test.js`); they mirror the Android `:core` objects
 - **Still watching?**: auto-advances (end of episode, credits countdown) are
   counted; any key, click or wheel in the player resets the run, as does a
   manually started title (a re-play of the same title for a codec / quality /
-  audio switch does not count). The 3rd consecutive auto-played episode opens
-  behind the prompt and its stream is not resolved until "Continue watching"
-  (or any key); "Back" / Escape closes the player.
+  audio switch does not count). The profile's `autoplay.stopAfter`-th
+  (section 8; default 3, kids 2, 0 never) consecutive auto-advance opens
+  behind the prompt and its stream is not resolved until
+  "Continue watching" (or any key); "Back" / Escape closes the player.
+- **Autoplay off** (`autoplay.next == false`, `KNf.autoplaySetting`): the
+  credits show the Up Next card without a countdown and the end of an episode
+  stops on it; nothing advances on its own.

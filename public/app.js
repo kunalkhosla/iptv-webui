@@ -4929,7 +4929,7 @@ async function play(mode, item, label, forceExt, useTranscode, diskSel, audioTra
   refreshNextEpisode();
 
   if (state.castSession) { _stillWatching.cancelPendingAutoStart(); recordAsPlayed(); castMedia(state.playing); return; }
-  const needStillPrompt = sameTitle ? false : _stillWatching.onPlayerStart();
+  const needStillPrompt = sameTitle ? false : _stillWatching.onPlayerStart(KNf.autoplaySetting(state.activeProfile).stopAfter);
 
   el.player.hidden = false;
   setPlayerMode(mode === "live" ? "mini" : "theater");
@@ -6629,11 +6629,14 @@ function playNextEpisode() {
 }
 
 const UPNEXT_LEAD_SECS = 20; // show the card in the last N seconds
-function showUpNext(creditsLeft) {
+// creditsLeft = countdown seconds; inCredits without a countdown = autoplay
+// off (the card still offers Watch credits to dismiss it).
+function showUpNext(creditsLeft, inCredits) {
   const next = state.playing && state.playing.nextEpisode;
   if (!next) return;
-  const credits = Number.isFinite(creditsLeft);
-  if (el.playerUpnextLabel) el.playerUpnextLabel.textContent = credits ? `Next episode in ${creditsLeft}s` : "Up Next";
+  const counting = Number.isFinite(creditsLeft);
+  const credits = counting || !!inCredits;
+  if (el.playerUpnextLabel) el.playerUpnextLabel.textContent = counting ? `Next episode in ${creditsLeft}s` : "Up Next";
   if (el.playerUpnextCredits) el.playerUpnextCredits.hidden = !credits;
   el.playerUpnext.classList.toggle("credits", credits);
   el.playerUpnextTitle.textContent = next.label;
@@ -7804,11 +7807,13 @@ function updateScrubBar() {
   const p = state.playing;
   const act = p && p.markers ? KNf.skipAction(p.markers, realPos, denom, !!p.nextEpisode) : null;
   refreshSkipButton(act);
-  if (act && act.kind === "credits" && !p.creditsDismissed) {
+  if (act && act.kind === "credits" && !p.creditsDismissed && !p._endedUpNext) {
     // Counts only while actually playing; the card replaces Up Next.
     const now = performance.now();
     if (!el.video.paused && el.video.readyState >= 3 && p._creditsTick) p.creditsPlayedMs = (p.creditsPlayedMs || 0) + Math.min(1000, now - p._creditsTick);
     p._creditsTick = el.video.paused ? 0 : now;
+    // Autoplay off: the card shows without a countdown and never plays on its own.
+    if (!KNf.autoplaySetting(state.activeProfile).next) { showUpNext(null, true); return; }
     const left = KNf.countdownLeft(p.creditsPlayedMs || 0);
     if (left <= 0) { autoAdvanceToNext(); return; }
     showUpNext(left);
@@ -7822,7 +7827,8 @@ function updateScrubBar() {
   if (isEpisodePlay(p) && p.nextEpisode
       && denom > 0 && realPos >= denom - UPNEXT_LEAD_SECS && realPos < denom) {
     showUpNext();
-  } else if (el.playerUpnext && !el.playerUpnext.hidden) {
+  } else if (el.playerUpnext && !el.playerUpnext.hidden && !(p && p._endedUpNext)) {
+    // Autoplay off: the card shown at the end stays (a late progress / timeupdate is past denom).
     hideUpNext();
   }
 }
@@ -8069,14 +8075,15 @@ if (el.playerUpnextCredits) el.playerUpnextCredits.addEventListener("click", (e)
 function autoAdvanceToNext() {
   const p = state.playing;
   if (!isEpisodePlay(p) || !p.nextEpisode || p._advancing) return;
+  if (!KNf.autoplaySetting(state.activeProfile).next) return;
   p._advancing = true;
   _stillWatching.noteAutoAdvance();
   playNextEpisode();
 }
 
 // ── "Still watching?" (#8) ───────────────────────────────────────────
-// After 3 consecutive auto-played episodes with no input, the next one
-// opens paused behind a prompt and its stream is not resolved until the
+// The profile's stopAfter-th (default 3, kids 2) consecutive auto-advance with
+// no input opens paused behind a prompt and its stream is not resolved until the
 // viewer answers. Any key / click / wheel in the player counts as input.
 const _stillWatching = KNf.createStillWatching(3);
 let _stillResolve = null;
@@ -8945,12 +8952,19 @@ window.addEventListener("popstate", () => applyPath());
 el.grid.addEventListener("scroll", scheduleSaveScroll, { passive: true });
 window.addEventListener("beforeunload", () => { saveScroll(); sendProgress(); stopServerStreams(); });
 el.video.addEventListener("pause", () => sendProgress());
+// Playing again after an autoplay-off end (seek back / replay): the card follows the position again.
+el.video.addEventListener("playing", () => { if (state.playing) state.playing._endedUpNext = false; });
+el.video.addEventListener("seeking", () => { if (state.playing) state.playing._endedUpNext = false; });
 el.video.addEventListener("ended", () => {
   sendProgress();
   // Series autoplay: when an episode finishes and there's a next one,
   // advance to it automatically (mirrors the Android TV behavior).
   // Movies / live fall through and just keep the saved progress.
-  if (isEpisodePlay(state.playing) && state.playing.nextEpisode) autoAdvanceToNext();
+  if (isEpisodePlay(state.playing) && state.playing.nextEpisode) {
+    // Autoplay off: stop on the Up Next card instead.
+    if (KNf.autoplaySetting(state.activeProfile).next) autoAdvanceToNext();
+    else { state.playing._endedUpNext = true; showUpNext(); }
+  }
 });
 // Up-Next "Play now" → skip immediately to the next episode.
 if (el.playerUpnextPlay) el.playerUpnextPlay.addEventListener("click", playNextEpisode);

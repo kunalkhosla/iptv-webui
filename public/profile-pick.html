@@ -312,6 +312,24 @@
     cursor: pointer;
   }
   #kids-age-row { margin-top: 14px; }
+  .autoplay-block { margin-top: 18px; }
+  .ap-stop-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+    font-size: 13px;
+  }
+  .ap-stop-row select {
+    background: var(--bg-3);
+    border: 1px solid var(--line);
+    color: var(--fg);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font: inherit;
+    font-size: 13px;
+  }
+  .ap-stop-row select:disabled { opacity: 0.5; }
   .kids-hint {
     margin: 8px 0 0;
     font-size: 11.5px;
@@ -399,6 +417,24 @@
         <label>Birth year</label>
         <input type="number" id="kids-birth-year" min="1980" placeholder="e.g. 2017" />
         <p class="kids-hint">Birth year is stored so the rating bucket adjusts automatically as the child grows up. Movies and series with US ratings above the current age are hidden (G, PG, PG-13, etc., via TMDB). Items without a TMDB rating are also hidden.</p>
+      </div>
+      <div class="autoplay-block">
+        <label>Playback</label>
+        <label class="kids-row">
+          <input type="checkbox" id="ap-next" />
+          <span>Autoplay next episode</span>
+        </label>
+        <div class="ap-stop-row">
+          <label for="ap-stop" class="kids-row" style="cursor:default">Stop after</label>
+          <select id="ap-stop">
+            <option value="0">Never</option>
+            <option value="1">1 episode</option>
+            <option value="2">2 episodes</option>
+            <option value="3">3 episodes</option>
+            <option value="5">5 episodes</option>
+          </select>
+        </div>
+        <p class="kids-hint">After that many episodes in a row with nobody touching the remote, the next one waits behind "Still watching?".</p>
       </div>
       <div class="add-foot">
         <button id="add-delete" type="button" class="danger" hidden>Delete profile</button>
@@ -509,8 +545,32 @@ function paintPortraitGrid() {
 function syncKidsAgeRow() {
   const on = document.getElementById("kids-on").checked;
   document.getElementById("kids-age-row").hidden = !on;
+  syncAutoplayDefault();
+}
+// Untouched autoplay follows the profile kind the save will produce (kids
+// stop after 2): a kid profile needs a valid birth year.
+function syncAutoplayDefault() {
+  if (autoplayTouched) return;
+  const y = parseInt(document.getElementById("kids-birth-year").value, 10);
+  const kid = document.getElementById("kids-on").checked && Number.isFinite(y) && y >= 1980 && y <= CURRENT_YEAR;
+  setAutoplayFields({ next: true, stopAfter: kid ? 2 : 3 });
 }
 document.getElementById("kids-on").onchange = syncKidsAgeRow;
+document.getElementById("kids-birth-year").oninput = syncAutoplayDefault;
+
+// Autoplay is sent only once edited, so an untouched profile keeps the
+// server's kind-based default (it follows a later kid / adult switch).
+let autoplayTouched = false;
+function setAutoplayFields(a) {
+  document.getElementById("ap-next").checked = a.next !== false;
+  document.getElementById("ap-stop").value = String(Number.isFinite(a.stopAfter) ? a.stopAfter : 3);
+  syncAutoplayRow();
+}
+function syncAutoplayRow() {
+  document.getElementById("ap-stop").disabled = !document.getElementById("ap-next").checked;
+}
+document.getElementById("ap-next").onchange = () => { autoplayTouched = true; syncAutoplayRow(); };
+document.getElementById("ap-stop").onchange = () => { autoplayTouched = true; };
 
 function openAddModal() {
   editingId = null;
@@ -522,6 +582,7 @@ function openAddModal() {
   document.getElementById("add-delete").hidden = true;
   document.getElementById("kids-on").checked = false;
   document.getElementById("kids-birth-year").value = "";
+  autoplayTouched = false;
   syncKidsAgeRow();
   // Start on the first portrait — the typed nickname will re-seed
   // it deterministically below if the user hasn't picked manually.
@@ -542,7 +603,10 @@ function openEditModal(profile) {
   const isKid = Number.isFinite(profile.kidsBirthYear);
   document.getElementById("kids-on").checked = isKid;
   document.getElementById("kids-birth-year").value = isKid ? profile.kidsBirthYear : "";
+  // A custom setting counts as touched: it stays put across a kid toggle.
+  autoplayTouched = !!(profile.autoplay && profile.autoplay.custom);
   syncKidsAgeRow();
+  if (profile.autoplay) setAutoplayFields(profile.autoplay);
   selectedPortrait = TheatrePortraits.resolve(profile);
   paintPortraitGrid();
   document.getElementById("add-modal").hidden = false;
@@ -561,6 +625,12 @@ document.getElementById("add-save").onclick = async () => {
   const kidsBirthYear = validYear ? yearRaw : (editingId ? null : undefined);
   const payload = { nick, avatar: selectedPortrait };
   if (kidsBirthYear !== undefined) payload.kidsBirthYear = kidsBirthYear;
+  if (autoplayTouched) {
+    payload.autoplay = {
+      next: document.getElementById("ap-next").checked,
+      stopAfter: parseInt(document.getElementById("ap-stop").value, 10),
+    };
+  }
   const url = editingId ? `/api/profiles/${encodeURIComponent(editingId)}` : "/api/profiles";
   const method = editingId ? "PATCH" : "POST";
   const r = await fetch(url, {

@@ -7,6 +7,7 @@ const { spawn, spawnSync, execFile } = require("child_process");
 const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 const { AsyncLocalStorage } = require("async_hooks");
+const autoplayPref = require("./lib/autoplay");
 const { redactUrl, redactAllUrls, installConsoleRedaction } = require("./lib/redact");
 // Provider URLs embed credentials; scrub every console line (Axiom ships stdout).
 installConsoleRedaction();
@@ -6117,6 +6118,7 @@ app.get("/api/profiles", (req, res) => {
         nick: p.nick,
         avatar: normalizeAvatar(p.avatar),
         kidsBirthYear: p.kidsBirthYear || null,
+        autoplay: autoplayPref.effective(p),
       })),
   });
 });
@@ -6143,20 +6145,30 @@ app.post("/api/profiles", express.json(), (req, res) => {
   if (!nick) return res.status(400).json({ error: "nick required" });
   const avatar = normalizeAvatar(b.avatar);
   const kidsBirthYear = normalizeBirthYear(b.kidsBirthYear);
+  const rec = { nick, avatar, kidsBirthYear, ownerUserId: req.user.id, createdAt: Date.now() };
+  if (b.autoplay !== undefined && b.autoplay !== null && !autoplayPref.apply(rec, b.autoplay)) {
+    return res.status(400).json({ error: "bad autoplay" });
+  }
   const id = `p${profiles.nextId++}`;
-  profiles.profiles.push({ id, nick, avatar, kidsBirthYear, ownerUserId: req.user.id, createdAt: Date.now() });
+  profiles.profiles.push({ id, ...rec });
   profileStates.set(id, emptyUserState());
   saveProfilesToDisk();
   scheduleUserStateSave();
   res.json({ ok: true, id });
 });
 
-// Update an existing profile's nickname / avatar / kidsBirthYear.
+// Update an existing profile's nickname / avatar / kidsBirthYear / autoplay
+// ({ next, stopAfter }, merged; null = back to the profile-kind default).
 app.patch("/api/profiles/:id", express.json(), (req, res) => {
   const p = findProfile(req.params.id);
   if (!p) return res.status(404).json({ error: "unknown profile" });
   if (p.ownerUserId !== req.user.id) return res.status(404).json({ error: "unknown profile" });
   const b = req.body || {};
+  // Validated up front (nothing changes on a 400), applied after the kid
+  // flag so unspecified fields default from the profile's new kind.
+  if (b.autoplay !== undefined && !autoplayPref.apply({ ...p }, b.autoplay)) {
+    return res.status(400).json({ error: "bad autoplay" });
+  }
   if (typeof b.nick === "string") {
     const nick = b.nick.trim().slice(0, 32);
     if (nick) p.nick = nick;
@@ -6170,8 +6182,9 @@ app.patch("/api/profiles/:id", express.json(), (req, res) => {
     const y = normalizeBirthYear(b.kidsBirthYear);
     if (y !== null) p.kidsBirthYear = y;
   }
+  if (b.autoplay !== undefined) autoplayPref.apply(p, b.autoplay);
   saveProfilesToDisk();
-  res.json({ ok: true });
+  res.json({ ok: true, autoplay: autoplayPref.effective(p) });
 });
 
 // Delete a profile + wipe its state. Refuses if it's the last
@@ -6539,6 +6552,7 @@ app.get("/api/bootstrap", async (req, res, next) => {
         nick: activeProfile.nick,
         avatar: normalizeAvatar(activeProfile.avatar),
         kidsBirthYear: activeProfile.kidsBirthYear || null,
+        autoplay: autoplayPref.effective(activeProfile),
       },
       user: req.user && {
         id: req.user.id,

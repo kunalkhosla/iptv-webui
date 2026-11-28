@@ -94,7 +94,8 @@
 
   // ---- 8. "Still watching?" ----------------------------------------------
   // After LIMIT consecutive auto-played episodes with no user input, the next
-  // one opens paused behind a prompt. One instance per page.
+  // one opens paused behind a prompt. One instance per page. onPlayerStart
+  // takes the profile's limit (autoplay stopAfter; 0 = never ask).
   function createStillWatching(limit) {
     const LIMIT = limit || 3;
     let autoPlays = 0;
@@ -104,16 +105,27 @@
       noteAutoAdvance() { autoPlays++; pending = true; },
       // A player start: true when it must open behind the prompt. A start
       // not caused by an auto-advance (a manual pick) resets the run.
-      onPlayerStart() {
+      onPlayerStart(limitNow) {
+        const lim = Number.isFinite(limitNow) ? limitNow : LIMIT;
         const auto = pending;
         pending = false;
         if (!auto) autoPlays = 0;
-        return auto && autoPlays >= LIMIT;
+        return auto && lim > 0 && autoPlays >= lim;
       },
       cancelPendingAutoStart() { pending = false; },
       onUserInteraction() { autoPlays = 0; },
       count() { return autoPlays; },
       reset() { autoPlays = 0; pending = false; },
+    };
+  }
+
+  // ---- 8b. Autoplay setting (per profile, bootstrap profile.autoplay) ----
+  // Missing / malformed = today's behaviour (autoplay on, ask after 3).
+  function autoplaySetting(profile) {
+    const a = profile && profile.autoplay;
+    return {
+      next: !(a && a.next === false),
+      stopAfter: a && Number.isFinite(a.stopAfter) && a.stopAfter >= 0 ? a.stopAfter : 3,
     };
   }
 
@@ -246,6 +258,7 @@
     CREDITS_COUNTDOWN_SEC, MARKERS_REFETCH_AFTER_MS, markersSupported, skipAction, inCredits,
     countdownLeft, markersWorthRefetch,
     createStillWatching,
+    autoplaySetting,
     TITLE_CARD_PALETTE, displayTitle, paletteIndex, titleCardColors, javaHash,
     PREVIEW_FAIL_RETRY_MS, previewAllowed, previewUrlFor,
     SEEK_STEP_SEC, VOLUME_STEP, playerKeyAction, keySeekTarget,

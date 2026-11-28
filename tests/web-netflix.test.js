@@ -128,7 +128,7 @@ test("web wiring: endpoints and no initials tiles", () => {
   assert.doesNotMatch(APP, /function initials\(/);
   assert.doesNotMatch(APP, /logo-initials/);
   // A re-play of the same title must not reset / trigger "Still watching?".
-  assert.match(APP, /sameTitle \? false : _stillWatching\.onPlayerStart\(\)/);
+  assert.match(APP, /sameTitle \? false : _stillWatching\.onPlayerStart\(/);
   // Auto-advance paths count toward the prompt.
   assert.match(APP, /_stillWatching\.noteAutoAdvance\(\);\n  playNextEpisode\(\);/);
 });
