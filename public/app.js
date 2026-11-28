@@ -513,7 +513,7 @@ async function bootstrap() {
     if (ownerSection) ownerSection.hidden = state.activeUser?.role !== "owner";
     // Notify me is for adult profiles (the server refuses kid profiles).
     const notifyItem = document.getElementById("settings-notify-list");
-    if (notifyItem) notifyItem.hidden = Number.isFinite(state.kidsAge);
+    if (notifyItem) notifyItem.hidden = isKidProfileForNotify();
     notifyMe.items = Array.isArray(d.userState?.notifyMe) ? d.userState.notifyMe.map((e) => ({ ...e, landed: e.landed || null })) : [];
     state.modes.live.categories   = Array.isArray(d.categories.live)   ? d.categories.live   : [];
     state.modes.movie.categories  = Array.isArray(d.categories.movie)  ? d.categories.movie  : [];
@@ -3458,7 +3458,7 @@ async function renderUnifiedSearch(q) {
   // TMDB titles the catalog lacks, after the catalog results (adults only;
   // the server answers [] for kid profiles).
   const appendElsewhere = async () => {
-    if (Number.isFinite(state.kidsAge)) return;
+    if (isKidProfileForNotify()) return;
     try {
       const r = await fetch(`/api/search/elsewhere?q=${encodeURIComponent(q)}`);
       const j = await r.json();
@@ -4049,6 +4049,10 @@ function clearNewEpisodes(id) {
 // on the server (/api/notify-me); a match pushes a notification and shows
 // in the "Now on Khouch" rail.
 const notifyMe = { items: [] };
+// Same rule as the server: any profile with a kid birth year.
+const isKidProfileForNotify = () => Number.isFinite(state.activeProfile?.kidsBirthYear);
+let notifyReq = 0;          // latest openTmdbTitle / openNotifyList (stale responses are dropped)
+let notifyReturnFocus = null;
 async function notifyApi(method, path, body) {
   const r = await fetch(path, {
     method,
@@ -4061,8 +4065,20 @@ async function notifyApi(method, path, body) {
     err.body = j;
     throw err;
   }
-  if (Array.isArray(j.items)) notifyMe.items = j.items;
+  if (Array.isArray(j.items)) { notifyMe.items = j.items; syncNotifyFlags(); }
   return j;
+}
+// "Notifying" flags on tiles already on screen follow the list.
+function syncNotifyFlags() {
+  for (const card of document.querySelectorAll(".tmdb-card[data-nk]")) {
+    const [kind, id] = card.dataset.nk.split(":");
+    const flag = card.querySelector(".notify-flag");
+    if (flag) flag.hidden = !isNotifying(kind, Number(id));
+  }
+}
+function showNotifyModal() {
+  if (el.notifyModal.hidden) notifyReturnFocus = document.activeElement;
+  el.notifyModal.hidden = false;
 }
 const notifyKey = (kind, id) => `${kind}:${id}`;
 const isNotifying = (kind, id) => notifyMe.items.some((e) => notifyKey(e.kind, e.tmdb_id) === notifyKey(kind, id) && !e.landed);
@@ -4070,6 +4086,7 @@ function tmdbCardEl(c) {
   const card = document.createElement("div");
   card.className = "channel poster tmdb-card";
   card.title = `${c.title}${c.year ? ` (${c.year})` : ""} • Not on Khouch yet`;
+  card.dataset.nk = notifyKey(c.kind, c.tmdb_id);
   card.tabIndex = 0;
   const logo = document.createElement("div");
   logo.className = "logo";
@@ -4092,7 +4109,7 @@ function tmdbCardEl(c) {
   sub.className = "card-reason";
   sub.textContent = [c.year, c.character ? `as ${c.character}` : null].filter(Boolean).join(" · ") || "Not on Khouch yet";
   card.append(logo, name, sub);
-  const open = () => openTmdbTitle(c.kind, c.tmdb_id, (on) => { flag.hidden = !on; });
+  const open = () => openTmdbTitle(c.kind, c.tmdb_id);
   card.onclick = open;
   card.onkeydown = (e) => { if (e.key === "Enter") open(); };
   return card;
@@ -4118,19 +4135,21 @@ function openCatalogTitle(mode, id, name) {
   closeNotifyModal();
   if (mode === "series") openSeries(s); else openMovie(s, "movie");
 }
-async function openTmdbTitle(kind, tmdbId, onChange) {
+async function openTmdbTitle(kind, tmdbId) {
+  const req = ++notifyReq;
   el.notifyTitle.textContent = "";
   el.notifyBody.innerHTML = `<p class="rem-empty">Loading…</p>`;
-  el.notifyModal.hidden = false;
+  showNotifyModal();
   let d;
   try {
     const r = await fetch(`/api/tmdb-title/${kind}/${tmdbId}`);
     d = await r.json();
     if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
   } catch (e) {
-    el.notifyBody.innerHTML = `<p class="rem-empty">Couldn't load this title.</p>`;
+    if (req === notifyReq) el.notifyBody.innerHTML = `<p class="rem-empty">Couldn't load this title.</p>`;
     return;
   }
+  if (req !== notifyReq || el.notifyModal.hidden) return;
   el.notifyTitle.textContent = d.year ? `${d.title} (${d.year})` : d.title;
   const meta = [kind === "tv" ? "Series" : "Movie", d.date && d.date > new Date().toISOString().slice(0, 10) ? `Out ${d.date}` : null,
     d.genres?.length ? d.genres.join(", ") : null, d.rating ? `★ ${d.rating}` : null].filter(Boolean).join(" · ");
@@ -4162,6 +4181,7 @@ async function openTmdbTitle(kind, tmdbId, onChange) {
     go.textContent = "Open";
     go.onclick = () => openCatalogTitle(d.in_catalog.mode, d.in_catalog.id, d.title);
     actions.appendChild(go);
+    go.focus();
     return;
   }
   let on = !!d.notify;
@@ -4183,20 +4203,22 @@ async function openTmdbTitle(kind, tmdbId, onChange) {
       else await notifyApi("POST", "/api/notify-me", { tmdb_id: d.tmdb_id, kind, title: d.title, year: d.year, poster: d.poster });
       on = !on;
       paint();
-      onChange?.(on);
     } catch (e) {
       if (e.body?.error === "in_catalog") { openCatalogTitle(e.body.mode, e.body.id, d.title); return; }
       toast(`Couldn't update: ${e.message}`, 3500);
     } finally { btn.disabled = false; }
   };
   actions.appendChild(btn);
+  btn.focus();
 }
 async function openNotifyList() {
+  const req = ++notifyReq;
   el.notifyTitle.textContent = "Notify me";
   el.notifyBody.innerHTML = `<p class="rem-empty">Loading…</p>`;
-  el.notifyModal.hidden = false;
+  showNotifyModal();
   try { await notifyApi("GET", "/api/notify-me"); }
-  catch { el.notifyBody.innerHTML = `<p class="rem-empty">Couldn't load your list.</p>`; return; }
+  catch { if (req === notifyReq) el.notifyBody.innerHTML = `<p class="rem-empty">Couldn't load your list.</p>`; return; }
+  if (req !== notifyReq || el.notifyModal.hidden) return;
   renderNotifyList();
 }
 function renderNotifyList() {
@@ -4237,7 +4259,14 @@ function renderNotifyList() {
     el.notifyBody.appendChild(row);
   }
 }
-function closeNotifyModal() { el.notifyModal.hidden = true; }
+function closeNotifyModal() {
+  if (el.notifyModal.hidden) return;
+  el.notifyModal.hidden = true;
+  notifyReq++;
+  const back = notifyReturnFocus;
+  notifyReturnFocus = null;
+  if (back && document.contains(back)) back.focus?.();
+}
 
 function recordPlayEvent(mode, id) {
   // Update locally so the UI reflects it immediately on the next render,

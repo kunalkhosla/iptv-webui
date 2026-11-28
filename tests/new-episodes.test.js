@@ -33,10 +33,14 @@ test("trackedSeries: recent pointers newest first, old ones dropped", () => {
       200: { episode_id: "6", when: NOW - 200 * D },
       300: { episode_id: "7" },
       abc: { episode_id: "8", when: NOW },
+      400: { episode_id: "9" },
+      500: { episode_id: "10", when: NOW - 3 * D, auto: false, cwRemovedAt: NOW - D },
+      600: { episode_id: "11", when: NOW, cwRemovedAt: NOW - D },
     },
     progress: { "series:7": { p: 100, t: NOW - D } },
   };
-  assert.deepEqual(N.trackedSeries(st, NOW), ["300", "100"]);
+  // 400: no known time; 500: removed from Continue Watching, not played since; 600: played again.
+  assert.deepEqual(N.trackedSeries(st, NOW), ["600", "300", "100"]);
 });
 
 test("newEpisodeMap / railOrder use cached infos and marks", () => {
@@ -58,4 +62,17 @@ test("newEpisodeMap / railOrder use cached infos and marks", () => {
   assert.deepEqual(N.railOrder(map), ["200", "100"]);
   assert.equal(N.badgeLabel(1), "New episode");
   assert.equal(N.badgeLabel(3), "3 new episodes");
+});
+
+test("pruneSeen keeps followed series and caps the rest", () => {
+  const st = { lastEpisode: { 1: { episode_id: "a", when: NOW } }, progress: {} };
+  const seen = { 1: { s: 1, e: 1, at: NOW - 300 * D } };
+  for (let i = 2; i < 2 + N.SEEN_MAX + 5; i++) seen[i] = { s: 1, e: 1, at: NOW - i * 1000 };
+  seen[999] = { s: 1, e: 1, at: NOW - 200 * D };
+  const out = N.pruneSeen(seen, st, NOW);
+  assert.equal(Object.keys(out).length, N.SEEN_MAX);
+  assert.ok(out[1], "followed series kept even when old");
+  assert.ok(!out[999], "old unfollowed mark dropped");
+  const small = { 1: seen[1] };
+  assert.equal(N.pruneSeen(small, st, NOW), small);
 });

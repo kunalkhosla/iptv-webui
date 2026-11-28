@@ -3646,7 +3646,8 @@ async function xtream(action, params = {}, opts = {}) {
   // creds will yield different upstream responses.
   const key = xtreamKey(actx, action, params);
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.t < TTL_MS) return hit.v;
+  // opts.fresh: always ask the panel (still joins a call already in flight).
+  if (!opts.fresh && hit && Date.now() - hit.t < TTL_MS) return hit.v;
   if (inflight.has(key)) return inflight.get(key);
 
   const qs = new URLSearchParams({
@@ -9048,8 +9049,11 @@ app.post("/api/progress/:mode(movie|series|disk)/:id", express.json(), (req, res
   if (mode === "series") {
     // Playing an episode clears the series' "new episode" badge.
     const sid = Object.entries(userState.lastEpisode || {}).find(([, le]) => String(le?.episode_id) === String(id))?.[0];
-    const info = sid && cachedSeriesInfo(currentAccount(), sid);
-    if (info) markSeriesSeen(userState, sid, info);
+    // Progress ticks every few seconds: re-mark at most every 10 min.
+    if (sid && !(Date.now() - (userState.seriesSeen?.[sid]?.at || 0) < 10 * 60e3)) {
+      const info = cachedSeriesInfo(currentAccount(), sid);
+      if (info) markSeriesSeen(userState, sid, info);
+    }
   }
   if (mode === "series" && finished) {
     try { advanceToNextEpisode(userState, id); } catch (e) { console.warn(`[progress] next-episode: ${e.message}`); }
@@ -9111,9 +9115,11 @@ app.delete("/api/user-state/recents/:mode(movie|series|live|disk)/:id", (req, re
     const le = userState.lastEpisode?.[String(idNum)];
     if (le && typeof le === "object") {
       if (le.episode_id != null) delete userState.progress[`series:${le.episode_id}`];
-      // Newer `when`: a client's stale snapshot (auto: true) must not win the
-      // PUT /api/user-state merge and bring the show back.
-      if (le.auto) { clearAutoPointer(le); le.when = Date.now(); }
+      // `cwRemovedAt`: a client's stale snapshot (auto: true) must not win the
+      // PUT /api/user-state merge and bring the show back, and the show is no
+      // longer followed for new episodes.
+      clearAutoPointer(le);
+      le.cwRemovedAt = Date.now();
     }
   }
   scheduleUserStateSave();
@@ -9187,6 +9193,10 @@ app.put("/api/user-state", express.json({ limit: "256kb" }), (req, res) => {
       const inc = merged[sid];
       // (A show the client omitted stays omitted: that is how a client clears history.)
       if (inc && (cur?.when || 0) > (inc?.when || 0)) merged[sid] = cur;
+      // Removed from Continue Watching: only a newer pointer (a new play) brings it back.
+      // (TV pointers carry no `when`: a different episode is a new play.)
+      else if (inc && cur?.cwRemovedAt && String(inc.episode_id) === String(cur.episode_id)
+        && !(Number(inc.when) > cur.cwRemovedAt)) merged[sid] = cur;
     }
     userState.lastEpisode = merged;
   }
@@ -10461,15 +10471,19 @@ function cachedSeriesInfo(actx, sid) {
   return hit && isUsableInfo(hit.v, "series") ? hit.v : null;
 }
 function profileAccount(p) { return getAccountForUser(getUserById(p?.ownerUserId)); }
-function ownerAccountProfiles() { return profiles.profiles.filter((p) => isOwnerAccount(profileAccount(p))); }
+function ownerAccountProfiles() {
+  const users = new Set(accounts.users.map((u) => u.id));
+  return profiles.profiles.filter((p) => (!p.ownerUserId || users.has(p.ownerUserId)) && isOwnerAccount(profileAccount(p)));
+}
 // The profile has now seen every episode listed in `info`.
 function markSeriesSeen(userState, sid, info) {
   const m = newEpisodesLib.markFor(info);
   if (!m) return;
   userState.seriesSeen ||= {};
   const cur = userState.seriesSeen[String(sid)];
-  if (cur && cur.s === m.s && cur.e === m.e) return;
-  userState.seriesSeen[String(sid)] = m;
+  // Only forward: an older (stale) copy must not bring seen episodes back as new.
+  if (cur && (m.s < cur.s || (m.s === cur.s && m.e <= cur.e))) return;
+  userState.seriesSeen = newEpisodesLib.pruneSeen({ ...userState.seriesSeen, [String(sid)]: m }, userState);
   scheduleUserStateSave();
 }
 // First fresh read of a followed series with no mark yet: start counting
@@ -10484,9 +10498,13 @@ function baselineSeriesSeen(sid, info) {
 }
 const newEpisodeCrawl = createPrewarmQueue({
   fetcher: async (e) => {
-    const v = await xtream(MODES.series.info, { series_id: e.sid }, { actx: ownerAccount, noCache: true, timeout: 30_000 });
-    if (!isUsableInfo(v, "series")) throw new Error("no episodes");
-    cache.set(xtreamKey(ownerAccount, MODES.series.info, { series_id: e.sid }), { t: Date.now(), v });
+    const key = xtreamKey(ownerAccount, MODES.series.info, { series_id: e.sid });
+    const v = await xtream(MODES.series.info, { series_id: e.sid }, { actx: ownerAccount, fresh: true, noCache: true, timeout: 30_000 });
+    // An empty shell (series pulled / panel hiccup) keeps the good copy and is
+    // not an error for the queue's breaker.
+    if (!isUsableInfo(v, "series")) return;
+    cache.set(key, { t: Date.now(), v });
+    infoStore.put(key, v, "series").catch(() => {});
     baselineSeriesSeen(e.sid, v);
   },
   isCached: (e) => {
@@ -10501,8 +10519,11 @@ const newEpisodeCrawl = createPrewarmQueue({
 });
 function crawlNewEpisodes(reason = "cron") {
   const sids = new Set();
+  const catalog = getIndexesFor(ownerAccount).series?.byId;
   for (const p of ownerAccountProfiles()) {
-    for (const sid of newEpisodesLib.trackedSeries(getProfileState(p.id))) sids.add(sid);
+    for (const sid of newEpisodesLib.trackedSeries(getProfileState(p.id))) {
+      if (catalog?.has(parseInt(sid, 10))) sids.add(sid);
+    }
   }
   const n = newEpisodeCrawl.enqueue([...sids].map((sid) => ({ key: `newep:${sid}`, sid })));
   console.log(`[new-episodes] (${reason}) ${sids.size} followed series, ${n} queued`);
@@ -10527,8 +10548,11 @@ function catalogLookupFor(actx) {
   const ixs = getIndexesFor(actx);
   return (kind, tmdbId) => {
     const mode = notifyMeLib.modeOfKind(kind);
-    const members = ixs[mode]?.byTmdb?.get(tmdbId);
-    if (!members?.length) return null;
+    // A panel title matched to the other TMDB kind (tmdb_kind) shares the id space only by accident.
+    const want = kind === "tv" ? "series" : "movie";
+    const members = (ixs[mode]?.byTmdb?.get(tmdbId) || [])
+      .filter((m) => (tmdbCache[`${mode}:${m.id}`]?.tmdb_kind || mode) === want);
+    if (!members.length) return null;
     const s = members.find((m) => !m.isAlt) || members[0];
     return { mode, id: s.id };
   };
@@ -10540,6 +10564,7 @@ async function checkNotifyMe(reason = "cron") {
   try {
     const now = Date.now();
     for (const p of profiles.profiles) {
+      if (p.kidsBirthYear) continue;
       const st = getProfileState(p.id);
       if (!Array.isArray(st.notifyMe) || !st.notifyMe.length) continue;
       const actx = profileAccount(p);
@@ -10938,7 +10963,7 @@ app.get("/api/:mode(movie|series)/info/:id", async (req, res, next) => {
     }
     const v = r.v;
     // Opening a series clears its "new episode" badge for this profile.
-    if (mode === "series" && req.profileId && !req.get("x-khouch-internal")) markSeriesSeen(getProfileState(req.profileId), req.params.id, v);
+    if (mode === "series" && req.profileId && !r.stale && !req.get("x-khouch-internal")) markSeriesSeen(getProfileState(req.profileId), req.params.id, v);
     if (r.stale) {
       // Short client cache so a recovered panel is picked up soon.
       res.set({ "Cache-Control": "private, max-age=60", "X-Khouch-Stale": "1" });

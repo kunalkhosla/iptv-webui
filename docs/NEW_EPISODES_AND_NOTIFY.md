@@ -9,10 +9,12 @@ ignore them.
 `DELETE /api/user-state/recents/:mode/:id` (`mode` = movie | series | live | disk)
 removes the title from `recents[mode]` and drops its saved position
 (`progress[mode:id]`). For a **series** (`id` = series id) it also drops the
-position of the episode its `lastEpisode` pointer names and clears the
-pointer's up-next flag (`auto`), bumping `when` so a client's older
-`PUT /api/user-state` snapshot can't bring it back. The pointer itself stays
-(Resume and Recently Watched still know the show). Idempotent; `{ ok: true }`.
+position of the episode its `lastEpisode` pointer names, clears the pointer's
+up-next flag (`auto`) and stamps `cwRemovedAt`: a `PUT /api/user-state`
+carrying the same episode with no newer `when` can't bring it back (a
+different episode is a new play), and the show stops being followed for new
+episodes until it is played again. The pointer itself stays (Resume and
+Recently Watched still know the show). Idempotent; `{ ok: true }`.
 
 Clients: web (the ✕ on each Continue Watching tile), TV (long-press OK on a
 tile: "Remove from Continue Watching"), phone (long-press: the same menu).
@@ -22,21 +24,26 @@ goes to the neighbouring tile, else the next row.
 ## 2. New episodes
 
 Followed series = a `lastEpisode` pointer played in the last 120 days (pointer
-`when`, or that episode's progress `t`), at most 30 per profile, owner panel
-profiles only.
+`when`, or that episode's progress `t`; a pointer with neither is not
+followed, nor one removed from Continue Watching and not played since), still
+in the catalog, at most 30 per profile, owner panel profiles only.
 
 - **Polling**: every 6 h (first run 12 min after boot) each followed series'
   `get_series_info` is re-read through a prewarm queue: API calls only, never
   a stream; one call at a time with a 5 s gap; paused while anyone is
   watching (`streamingNow`); failures back off (20 min per series, 10 min
-  pause after 5 in a row). A copy fetched in the last 6 h (any detail open
-  counts) is reused. `POST /api/admin/check-new-episodes` (owner) runs it now.
+  pause after 5 in a row; an empty answer keeps the good copy and is not a
+  failure). A copy fetched in the last 6 h (any detail open counts) is
+  reused; a fresh read replaces the in-memory and on-disk info copies. `POST /api/admin/check-new-episodes` (owner) runs it now.
 - **Seen mark** (`userState.seriesSeen[seriesId] = { s, e, at }`, server
   owned, never taken from `PUT /api/user-state`): the last (season, episode)
   the panel listed when the profile last **opened** the series
-  (`GET /api/series/info/:id`) or **played** it (`GET /api/stream/series/...
-  ?series=` or a progress post for the pointed episode). The first poll of a
-  followed series without a mark sets it (no flood of "new" on day one).
+  (`GET /api/series/info/:id`, not a stale copy served while the panel
+  fails) or **played** it (`GET /api/stream/series/...
+  ?series=` or a progress post for the pointed episode, at most every
+  10 min). The mark only moves forward. The first poll of a followed series
+  without a mark sets it (no flood of "new" on day one). Marks of series no
+  longer followed are dropped after 120 days (at most 100 kept).
 - **New** = episodes listed after the mark (specials sort first, so a new
   special never counts). Computed at request time from cached infos only.
 
@@ -45,7 +52,8 @@ profiles only.
 - every series tile carries `new_episodes: N` when N > 0 (omitted otherwise);
 - a `"New episodes"` rail (`category_id: "__rail-new-episodes"`, right after
   Continue Watching), newest new episode first (panel `added`), with
-  `pickReason` "New: S2 E5" or "3 new episodes". Kid gates apply.
+  `pickReason` "New: S2 E5" or "3 new episodes". Kid profiles see only tiles
+  with an allowed certificate (the strict hero / Continue Watching rule).
 
 Opening or playing the series clears both (the next home fetch). Clients:
 badge "New episode" / "N new episodes" on series tiles; web also drops the
@@ -79,7 +87,8 @@ Where non-catalog titles surface (adults only):
 
 **Matching**: after every catalog variant pass (index build, TMDB backfill)
 and every 30 min, pending entries are matched against each profile's account
-catalog by TMDB id (`ix.byTmdb`). A match sets `landed` once and:
+catalog by TMDB id (`ix.byTmdb`; a catalog title matched to the other TMDB
+kind never counts). Kid profiles are skipped. A match sets `landed` once and:
 
 - pushes through Home Assistant like programme reminders (docs/REMINDERS.md):
   only owner-account profiles of the owner user, service from
