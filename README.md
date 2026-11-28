@@ -168,6 +168,16 @@ minutes before start the server pushes a Home Assistant notification (when
 `HA_URL`/`HA_TOKEN` are set) and open clients show a banner. A reminder never
 opens a stream. See [docs/REMINDERS.md](docs/REMINDERS.md).
 
+## New episodes and Notify me
+
+Series a profile follows get a "New episode" badge and a "New episodes" home
+rail when the panel adds episodes (polled every 6 h, API calls only, paused
+while anyone watches). "Notify me" on a TMDB title the catalog lacks (search
+and cast pages show them as "Not on Khouch yet") pushes a Home Assistant
+notification and fills a "Now on Khouch" rail once it arrives. One title can be
+removed from Continue Watching on every client. See
+[docs/NEW_EPISODES_AND_NOTIFY.md](docs/NEW_EPISODES_AND_NOTIFY.md).
+
 ## Pause keep-alive
 
 A paused movie / episode / disk title makes no media requests, so the idle
