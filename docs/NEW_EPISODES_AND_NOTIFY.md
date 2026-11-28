@@ -24,7 +24,8 @@ goes to the neighbouring tile, else the next row.
 ## 2. New episodes
 
 Followed series = a `lastEpisode` pointer played in the last 120 days (pointer
-`when`, or that episode's progress `t`; a pointer with neither is not
+`when`, the server's `playedAt` stamp, or that episode's progress `t`; a
+pointer with none of them is not
 followed, nor one removed from Continue Watching and not played since), still
 in the catalog, at most 30 per profile, owner panel profiles only.
 
@@ -34,14 +35,16 @@ in the catalog, at most 30 per profile, owner panel profiles only.
   watching (`streamingNow`); failures back off (20 min per series, 10 min
   pause after 5 in a row; an empty answer keeps the good copy and is not a
   failure). A copy fetched in the last 6 h (any detail open counts) is
-  reused; a fresh read replaces the in-memory and on-disk info copies. `POST /api/admin/check-new-episodes` (owner) runs it now.
+  reused; a fresh read replaces the in-memory info copy (and the on-disk
+  stale-if-error copy when that is older than 6 h). Anything that drops the
+  info cache (panel switch, Refresh) re-runs the crawl 2 min later. `POST /api/admin/check-new-episodes` (owner) runs it now.
 - **Seen mark** (`userState.seriesSeen[seriesId] = { s, e, at }`, server
   owned, never taken from `PUT /api/user-state`): the last (season, episode)
   the panel listed when the profile last **opened** the series
   (`GET /api/series/info/:id`, not a stale copy served while the panel
   fails) or **played** it (`GET /api/stream/series/...
   ?series=` or a progress post for the pointed episode, at most every
-  10 min). The mark only moves forward. The first poll of a followed series
+  10 min; both also stamp the pointer's server-owned `playedAt`). The mark only moves forward. The first poll of a followed series
   without a mark sets it (no flood of "new" on day one). Marks of series no
   longer followed are dropped after 120 days (at most 100 kept).
 - **New** = episodes listed after the mark (specials sort first, so a new
@@ -62,7 +65,8 @@ badge / rail tile at once when the series is opened.
 ## 3. Notify me when it lands on Khouch
 
 Per profile list of TMDB titles the catalog doesn't carry
-(`userState.notifyMe`, server owned). Adult profiles only (kid profiles get
+(`userState.notifyMe`, server owned; `/api/bootstrap` sends it as `[E]`,
+`seriesSeen` is not sent). Adult profiles only (kid profiles get
 403 / empty lists).
 
 - `GET /api/notify-me` -> `{ items: [E] }`

@@ -36,11 +36,12 @@ test("trackedSeries: recent pointers newest first, old ones dropped", () => {
       400: { episode_id: "9" },
       500: { episode_id: "10", when: NOW - 3 * D, auto: false, cwRemovedAt: NOW - D },
       600: { episode_id: "11", when: NOW, cwRemovedAt: NOW - D },
+      700: { episode_id: "12", playedAt: NOW - 4 * D },
     },
     progress: { "series:7": { p: 100, t: NOW - D } },
   };
   // 400: no known time; 500: removed from Continue Watching, not played since; 600: played again.
-  assert.deepEqual(N.trackedSeries(st, NOW), ["600", "300", "100"]);
+  assert.deepEqual(N.trackedSeries(st, NOW), ["600", "300", "100", "700"]);
 });
 
 test("newEpisodeMap / railOrder use cached infos and marks", () => {

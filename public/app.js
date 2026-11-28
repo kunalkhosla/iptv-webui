@@ -2145,6 +2145,7 @@ function renderBrowseChipStrip(mode) {
 function renderRail({ title, items, navId, total, hideable, onSeeAll, blurb, snoozable }) {
   const sec = document.createElement("section");
   sec.className = "rail";
+  if (navId) sec.dataset.rail = String(navId);
 
   const header = document.createElement("div");
   header.className = "rail-header";
@@ -3733,6 +3734,7 @@ function channelCard(s, opts = {}) {
   if (cardMode === "series" && s.new_episodes > 0) {
     const nb = document.createElement("span");
     nb.className = "new-ep-badge";
+    nb.dataset.sid = String(s.id);
     nb.textContent = s.new_episodes > 1 ? `${s.new_episodes} new episodes` : "New episode";
     logo.appendChild(nb);
   }
@@ -4040,7 +4042,18 @@ function clearNewEpisodes(id) {
       if (r.items.length !== before) { r.total = r.items.length; changed = true; }
     }
   }
-  if (changed && state.mode === "series" && state.view !== "grid") renderRails();
+  if (!changed) return;
+  // Patch the page in place (a re-render behind the detail panel would reset
+  // rail scroll and drop the clicked tile).
+  for (const b of document.querySelectorAll(`.new-ep-badge[data-sid="${CSS.escape(String(id))}"]`)) {
+    const card = b.closest(".channel");
+    const rail = card?.closest('.rail[data-rail="__rail-new-episodes"]');
+    b.remove();
+    if (rail) {
+      card.remove();
+      if (!rail.querySelector(".channel")) rail.remove();
+    }
+  }
 }
 
 // ── Notify me when it lands on Khouch ───────────────────────────────

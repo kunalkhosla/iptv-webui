@@ -501,6 +501,7 @@ async function pickPanel(actx = currentAccount()) {
       if (actx.host !== host) {
         console.log(`switched panel: ${actx.host} → ${host}`);
         cache.clear();
+        afterInfoCacheClear();
         // Panel modes only — the local "disk" index isn't panel-derived and
         // must NOT be reset on a panel switch (buildAllIndexes won't rebuild it).
         for (const m of PANEL_MODES) getIndexesFor(actx)[m].ready = false;
@@ -522,6 +523,7 @@ async function switchToHost(host, actx = currentAccount()) {
   console.log(`manual switch: ${actx.host} → ${host}`);
   actx.host = host;
   cache.clear();
+  afterInfoCacheClear();
   await clearDiskIndexes();
   // Panel modes only — never wipe the local "disk" index here (it isn't
   // panel-derived and buildAllIndexes won't rebuild it).
@@ -6586,7 +6588,9 @@ app.get("/api/bootstrap", async (req, res, next) => {
         // This client now sees the current lists — unless it asked for a
         // categories-only refresh (?lite=1) and ignores userState.
         if (!req.query.lite) clearPendingListAdds(pid);
-        return getProfileState(pid);
+        // Server-owned internals stay home; the Notify-me list goes out in its public shape.
+        const { seriesSeen, notifyMe, ...st } = getProfileState(pid);
+        return { ...st, notifyMe: (notifyMe || []).map(notifyMeLib.publicView) };
       })(),
       // Authoritative chip-filter and kids-cert configuration. Both
       // web and Android TV clients consume this — they hold a fallback
@@ -9048,11 +9052,10 @@ app.post("/api/progress/:mode(movie|series|disk)/:id", express.json(), (req, res
   // panel mid-playback: the account allows one connection).
   if (mode === "series") {
     // Playing an episode clears the series' "new episode" badge.
-    const sid = Object.entries(userState.lastEpisode || {}).find(([, le]) => String(le?.episode_id) === String(id))?.[0];
-    // Progress ticks every few seconds: re-mark at most every 10 min.
-    if (sid && !(Date.now() - (userState.seriesSeen?.[sid]?.at || 0) < 10 * 60e3)) {
-      const info = cachedSeriesInfo(currentAccount(), sid);
-      if (info) markSeriesSeen(userState, sid, info);
+    // Progress ticks every few seconds: at most every 10 min per profile + episode.
+    if (newEpisodeTickDue(req.profileId, id)) {
+      const sid = Object.entries(userState.lastEpisode || {}).find(([, le]) => String(le?.episode_id) === String(id))?.[0];
+      if (sid) noteSeriesPlayed(userState, sid);
     }
   }
   if (mode === "series" && finished) {
@@ -9197,6 +9200,8 @@ app.put("/api/user-state", express.json({ limit: "256kb" }), (req, res) => {
       // (TV pointers carry no `when`: a different episode is a new play.)
       else if (inc && cur?.cwRemovedAt && String(inc.episode_id) === String(cur.episode_id)
         && !(Number(inc.when) > cur.cwRemovedAt)) merged[sid] = cur;
+      // Server-owned play time survives a client snapshot.
+      else if (inc && typeof inc === "object" && cur?.playedAt && !inc.playedAt) merged[sid] = { ...inc, playedAt: cur.playedAt };
     }
     userState.lastEpisode = merged;
   }
@@ -10452,6 +10457,11 @@ app.post("/api/reminders/:id/ack", (req, res) => {
   res.json(remindersPayload(req.profileId));
 });
 
+// The xtream cache (series infos included) was dropped: re-read followed
+// series soon, so new-episode badges don't vanish until the next 6 h crawl.
+function afterInfoCacheClear() {
+  setTimeout(() => crawlNewEpisodes("cache-clear"), 2 * 60e3).unref?.();
+}
 // ── New episodes (lib/new-episodes.js) ──────────────────────────────────────
 // Series a profile follows (a lastEpisode pointer played in the last 120 days)
 // are re-read from the panel every NEW_EP_REFRESH_MS: get_series_info only,
@@ -10485,6 +10495,24 @@ function markSeriesSeen(userState, sid, info) {
   if (cur && (m.s < cur.s || (m.s === cur.s && m.e <= cur.e))) return;
   userState.seriesSeen = newEpisodesLib.pruneSeen({ ...userState.seriesSeen, [String(sid)]: m }, userState);
   scheduleUserStateSave();
+}
+// The profile played an episode of [sid]: it is followed (server-owned
+// `playedAt` on its pointer: TV pointers carry no `when`, and a finished last
+// episode leaves no progress) and has seen what the cached info lists.
+function noteSeriesPlayed(userState, sid) {
+  const le = userState.lastEpisode?.[String(sid)];
+  if (le && typeof le === "object") { le.playedAt = Date.now(); scheduleUserStateSave(); }
+  const info = cachedSeriesInfo(currentAccount(), sid);
+  if (info) markSeriesSeen(userState, sid, info);
+}
+const newEpisodeTickAt = new Map(); // "profile|episode" -> ms
+function newEpisodeTickDue(profileId, episodeId) {
+  const k = `${profileId}|${episodeId}`;
+  const now = Date.now();
+  if (now - (newEpisodeTickAt.get(k) || 0) < 10 * 60e3) return false;
+  if (newEpisodeTickAt.size > 2000) newEpisodeTickAt.clear();
+  newEpisodeTickAt.set(k, now);
+  return true;
 }
 // First fresh read of a followed series with no mark yet: start counting
 // from what the panel lists now (no flood of "new" on the first crawl).
@@ -10558,8 +10586,9 @@ function catalogLookupFor(actx) {
   };
 }
 let notifyMeChecking = false;
+let notifyMeRerun = false;
 async function checkNotifyMe(reason = "cron") {
-  if (notifyMeChecking) return;
+  if (notifyMeChecking) { notifyMeRerun = true; return; }
   notifyMeChecking = true;
   try {
     const now = Date.now();
@@ -10583,7 +10612,10 @@ async function checkNotifyMe(reason = "cron") {
         console.log(`[notify-me] (${reason}) landed ${e.kind}:${e.tmdb_id} -> ${e.landed.mode}:${e.landed.id} profile=${p.id} push=${pushed ? svc : "none"}`);
       }
     }
-  } finally { notifyMeChecking = false; }
+  } finally {
+    notifyMeChecking = false;
+    if (notifyMeRerun) { notifyMeRerun = false; scheduleNotifyMeCheck("rerun"); }
+  }
 }
 let notifyMeCheckTimer = null;
 function scheduleNotifyMeCheck(reason) {
@@ -10602,7 +10634,7 @@ function notifyMePayload(profileId) {
 }
 app.get("/api/notify-me", (req, res) => {
   res.set("Cache-Control", "no-store");
-  if (!req.profileId) return res.json({ items: [] });
+  if (!req.profileId || isKidProfile(req.profileId)) return res.json({ items: [] });
   res.json(notifyMePayload(req.profileId));
 });
 app.post("/api/notify-me", express.json({ limit: "4kb" }), (req, res) => {
@@ -13408,7 +13440,7 @@ app.get("/api/person/credits", async (req, res) => {
     const kid = isKidProfile(req.profileId);
     const nm = getProfileState(req.profileId).notifyMe || [];
     const inCat = catalogLookupFor(currentAccount());
-    const flag = (list) => (kid ? [] : (list || []).filter((c) => !inCat(c.kind, c.tmdb_id)).map((c) => ({ ...c, notify: nm.some((e) => e.kind === c.kind && e.tmdb_id === c.tmdb_id && !e.landed) })));
+    const flag = (list) => (kid ? [] : (list || []).filter((c) => !inCat(c.kind, c.tmdb_id)).slice(0, 12).map((c) => ({ ...c, notify: nm.some((e) => e.kind === c.kind && e.tmdb_id === c.tmdb_id && !e.landed) })));
     res.json({ ...payload, elsewhere: { movie: flag(payload.elsewhere?.movie), series: flag(payload.elsewhere?.series) } });
   };
   const cached = personCache.get(cacheKey);
@@ -13496,19 +13528,18 @@ app.get("/api/person/credits", async (req, res) => {
         series: findItems("series", seriesIds),
       },
     };
-    // Credits the catalog doesn't carry: the 12 most popular per kind with a
-    // poster (talk / award shows and self appearances skipped).
-    const inCatalog = catalogLookupFor(currentAccount());
+    // Credits the catalog may not carry: the 30 most popular per kind with a
+    // poster (talk / news shows and self appearances skipped). Shared cache:
+    // the catalog filter (and the cut to 12) runs per request in send().
     const elsewhereOf = (kind) => {
       const seen = new Set();
       return cast
         .filter((c) => c.media_type === kind && c.poster_path && !c.adult
           && !/\b(self|himself|herself|host|narrator)\b/i.test(c.character || "")
-          && !(kind === "tv" && Array.isArray(c.genre_ids) && c.genre_ids.some((g) => g === 10767 || g === 10763))
-          && !inCatalog(kind, c.id))
+          && !(kind === "tv" && Array.isArray(c.genre_ids) && c.genre_ids.some((g) => g === 10767 || g === 10763)))
         .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))
         .filter((c) => !seen.has(c.id) && seen.add(c.id))
-        .slice(0, 12)
+        .slice(0, 30)
         .map((c) => ({ ...tmdbCardOf(kind, c), character: c.character || null }));
     };
     payload.elsewhere = { movie: elsewhereOf("movie"), series: elsewhereOf("tv") };
@@ -16084,10 +16115,7 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
     const userState = getProfileState(req.profileId);
     const seriesId = req.params.mode === "series" && /^\d{1,12}$/.test(String(req.query.series ?? "")) ? String(req.query.series) : null;
     // Playing an episode clears the series' "new episode" badge (cached info only).
-    if (seriesId && req.profileId) {
-      const info = cachedSeriesInfo(currentAccount(), seriesId);
-      if (info) markSeriesSeen(userState, seriesId, info);
-    }
+    if (seriesId && req.profileId) noteSeriesPlayed(userState, seriesId);
     const onboarded = (() => {
       const own = userState.filter?.groups?.[req.params.mode];
       const keys = Array.isArray(own) && own.length ? own : userState.filter?.groups?.live;
@@ -16389,6 +16417,7 @@ app.post("/api/refresh", async (_req, res) => {
   const actx = getOwnerAccount();
   const picked = await pickPanel(actx);
   cache.clear();
+  afterInfoCacheClear();
   await clearDiskIndexes(actx);
   // Panel modes only — "Refresh from panel" must NOT wipe the local disk
   // library (it isn't panel-derived; buildAllIndexes won't rebuild it).
@@ -16525,6 +16554,7 @@ app.put("/api/panel/config", express.json(), async (req, res) => {
   // Wipe in-memory + on-disk caches so we don't serve stale stuff
   // belonging to the previous panel.
   cache.clear();
+  afterInfoCacheClear();
   try { await clearDiskIndexes(actx); } catch {}
   // Panel modes only — a panel-credential change must not wipe the local
   // disk library (it isn't panel-derived; buildAllIndexes skips it).
