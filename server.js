@@ -9198,8 +9198,14 @@ app.put("/api/user-state", express.json({ limit: "256kb" }), (req, res) => {
       // (TV pointers carry no `when`: a different episode is a new play.)
       else if (inc && cur?.cwRemovedAt && String(inc.episode_id) === String(cur.episode_id)
         && !(Number(inc.when) > cur.cwRemovedAt)) merged[sid] = cur;
-      // Server-owned play time survives a client snapshot.
-      else if (inc && typeof inc === "object" && cur?.playedAt) merged[sid] = { ...inc, playedAt: Math.max(cur.playedAt, Math.min(Number(inc.playedAt) || 0, Date.now())) };
+    }
+    // `playedAt` is server-owned: never taken from the client.
+    for (const [sid, le] of Object.entries(merged)) {
+      if (!le || typeof le !== "object") continue;
+      const own = userState.lastEpisode?.[sid]?.playedAt;
+      if (le.playedAt === own) continue;
+      const { playedAt, ...rest } = le;
+      merged[sid] = own ? { ...rest, playedAt: own } : rest;
     }
     userState.lastEpisode = merged;
   }
@@ -10465,7 +10471,9 @@ function afterInfoCacheClear() {
   let tries = 0;
   const tick = () => {
     newEpRecrawlTimer = null;
-    if (!getIndexesFor(ownerAccount).series?.ready && ++tries < 60) {
+    if (!getIndexesFor(ownerAccount).series?.ready) {
+      // Still rebuilding after 2 h: leave it to the 6 h crawl.
+      if (++tries >= 60) return;
       newEpRecrawlTimer = setTimeout(tick, 2 * 60e3);
       newEpRecrawlTimer.unref?.();
       return;
