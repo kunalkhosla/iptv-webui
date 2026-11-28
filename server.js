@@ -604,6 +604,8 @@ const { pickTrailerKey, selectNewTrailers, backfillCandidates, applyReleaseInfo,
 // on the detail endpoint (survives restarts, unlike `cache`).
 const { createInfoStore, getInfoStaleIfError, isUsableInfo } = require("./lib/info-cache");
 const audioTracksLib = require("./lib/audio-tracks");
+const notifyMeLib = require("./lib/notify-me");
+const newEpisodesLib = require("./lib/new-episodes");
 const infoStore = createInfoStore({ dir: path.join(DATA_DIR, "info-cache") });
 const indexFilePath =(mode) => path.join(DATA_DIR, `index-${mode}.json`);
 const categoriesFilePath = (mode) => path.join(DATA_DIR, `categories-${mode}.json`);
@@ -2807,7 +2809,22 @@ function emptyUserState() {
     // panel VOD title's ORIGINAL language has no matching track. null =
     // unset → DEFAULT_AUDIO_LANG_PREFS (hin, eng). See chooseAudioTrack.
     audioLangPrefs: null,
+    // Server-owned (never taken from PUT /api/user-state):
+    // seriesId -> { s, e, at }: last episode listed when this profile last
+    // opened / played the series (lib/new-episodes.js).
+    seriesSeen: {},
+    // "Notify me when it lands on Khouch" list (lib/notify-me.js).
+    notifyMe: [],
   };
+}
+function normalizeSeriesSeen(v) {
+  const out = {};
+  if (!v || typeof v !== "object") return out;
+  for (const [sid, m] of Object.entries(v)) {
+    if (!/^\d{1,12}$/.test(sid) || !m || !Number.isFinite(m.s) || !Number.isFinite(m.e)) continue;
+    out[sid] = { s: m.s, e: m.e, at: Number(m.at) || 0 };
+  }
+  return out;
 }
 // Normalize the on-disk shape into the canonical structure (so old
 // files with missing keys upgrade safely).
@@ -2833,6 +2850,8 @@ function normalizeUserState(d) {
     remoteEnabled: typeof d?.remoteEnabled === "boolean" ? d.remoteEnabled : e.remoteEnabled,
     epgWindowHoursForward: Math.min(Math.max(parseInt(d?.epgWindowHoursForward, 10) || e.epgWindowHoursForward, 1), 24),
     audioLangPrefs: audioTracksLib.normalizeAudioLangPrefs(d?.audioLangPrefs) || e.audioLangPrefs,
+    seriesSeen: normalizeSeriesSeen(d?.seriesSeen),
+    notifyMe: notifyMeLib.normalizeList(d?.notifyMe),
   };
 }
 
@@ -3416,6 +3435,8 @@ function assignVariants(mode, actx = currentAccount()) {
   }
   ix.byTmdb = byTmdb;
   catalogGen++;
+  // Titles on a Notify-me list may have just arrived (after module init).
+  setImmediate(() => scheduleNotifyMeCheck(`index:${mode}`));
   console.log(`[${mode}] variants: ${grouped} multi-version titles, ${hidden} alternates folded`);
   // Warm the search/detail title groups off the request path.
   scheduleVariantBuild(mode, ix, actx);
@@ -7372,6 +7393,8 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
   };
   const isKidBlocked = makeKidsBlocker(activeProfile);
   const ix = indexes[mode];
+  // Followed series with episodes added since this profile last opened / played them.
+  const newEps = mode === "series" ? newEpisodeMapFor(req.profileId) : null;
 
   // Cheap poster URL lookups out of the existing TMDB cache so the
   // client gets a CDN URL inline and never has to fan out a request
@@ -7424,6 +7447,8 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
       // YouTube key of the title's TMDB trailer (play /api/trailer/<key>.mp4,
       // or the muted /api/trailer/<key>/preview.mp4). Omitted when none.
       trailer_key: (mode !== "live" && t?.trailer_key) || undefined,
+      // Series: number of episodes added since this profile last opened / played it.
+      new_episodes: newEps?.get(String(s.id))?.count || undefined,
     };
   };
   const heroFor = (s) => {
@@ -7707,6 +7732,41 @@ app.get("/api/home/:mode(live|movie|series|disk)", (req, res) => {
         total: cwTiles.length,
         items: cwTiles.slice(0, 12),
       });
+    }
+    // New episodes (lib/new-episodes.js): followed series with episodes the
+    // panel added since this profile last opened / played them, newest first.
+    if (newEps?.size) {
+      const neTiles = newEpisodesLib.railOrder(newEps)
+        .map((sid) => {
+          const s = ix.byId.get(parseInt(sid, 10));
+          const tile = s && tileFor(s);
+          if (!tile || !isKidSafe(tile)) return null;
+          const ne = newEps.get(sid);
+          tile.pickReason = ne.count > 1 ? `${ne.count} new episodes` : `New: S${ne.latest.s} E${ne.latest.e}`;
+          return tile;
+        })
+        .filter(Boolean);
+      if (neTiles.length) {
+        rails.push({ title: "New episodes", category_id: "__rail-new-episodes", total: neTiles.length, items: neTiles });
+      }
+    }
+    // Now on Khouch: titles from this profile's Notify-me list that arrived in
+    // the catalog (lib/notify-me.js), newest arrival first.
+    if (mode === "movie" || mode === "series") {
+      const seenNow = new Set();
+      const nowTiles = notifyMeLib.nowOnKhouch(userState.notifyMe, mode)
+        .map((e) => {
+          const raw = ix.byId.get(e.landed.id);
+          const s = raw ? (variantHidden.resolve(raw) || raw) : null;
+          if (!s || seenNow.has(s.id)) return null;
+          seenNow.add(s.id);
+          const tile = tileFor(s, null);
+          if (!tile || isKidBlocked(tile)) return null;
+          tile.pickReason = "You asked to be notified";
+          return tile;
+        })
+        .filter(Boolean);
+      if (nowTiles.length) rails.push({ title: "Now on Khouch", category_id: "__rail-now-on-khouch", total: nowTiles.length, items: nowTiles });
     }
     if (histTiles.length) {
       // __recents = web PSEUDO.RECENTS / Android CategoryScreen: client-side
@@ -8985,6 +9045,12 @@ app.post("/api/progress/:mode(movie|series|disk)/:id", express.json(), (req, res
   // episode, so Continue Watching offers what to watch next instead of replaying
   // the one just finished. Uses the cached series info only (never calls the
   // panel mid-playback: the account allows one connection).
+  if (mode === "series") {
+    // Playing an episode clears the series' "new episode" badge.
+    const sid = Object.entries(userState.lastEpisode || {}).find(([, le]) => String(le?.episode_id) === String(id))?.[0];
+    const info = sid && cachedSeriesInfo(currentAccount(), sid);
+    if (info) markSeriesSeen(userState, sid, info);
+  }
   if (mode === "series" && finished) {
     try { advanceToNextEpisode(userState, id); } catch (e) { console.warn(`[progress] next-episode: ${e.message}`); }
   }
@@ -9038,6 +9104,18 @@ app.delete("/api/user-state/recents/:mode(movie|series|live|disk)/:id", (req, re
   const list = Array.isArray(userState.recents?.[mode]) ? userState.recents[mode] : [];
   userState.recents[mode] = list.filter((x) => x !== idNum);
   delete userState.progress[`${mode}:${idNum}`];
+  // Series: progress is keyed by EPISODE id and an "up next" pointer also
+  // keeps a show in Continue Watching. Drop the pointed episode's position and
+  // the up-next flag (the pointer stays, so Resume / history still know it).
+  if (mode === "series") {
+    const le = userState.lastEpisode?.[String(idNum)];
+    if (le && typeof le === "object") {
+      if (le.episode_id != null) delete userState.progress[`series:${le.episode_id}`];
+      // Newer `when`: a client's stale snapshot (auto: true) must not win the
+      // PUT /api/user-state merge and bring the show back.
+      if (le.auto) { clearAutoPointer(le); le.when = Date.now(); }
+    }
+  }
   scheduleUserStateSave();
   res.json({ ok: true });
 });
@@ -10204,7 +10282,7 @@ function haNotifyServiceFor(r, profile) {
     fallback: process.env.HA_NOTIFY_SERVICE,
   });
 }
-async function sendHaNotify(service, title, message, tag) {
+async function sendHaNotify(service, title, message, tag, group = "khouch-reminders") {
   const base = String(process.env.HA_URL || "").replace(/\/+$/, "");
   const token = process.env.HA_TOKEN;
   if (!base || !token || !service || !/^[a-z0-9_]+$/.test(service)) return false;
@@ -10212,7 +10290,7 @@ async function sendHaNotify(service, title, message, tag) {
     method: "POST",
     signal: AbortSignal.timeout(10_000),
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ title, message, data: { tag, group: "khouch-reminders" } }),
+    body: JSON.stringify({ title, message, data: { tag, group } }),
   });
   if (!r.ok) console.warn(`[reminders] HA notify ${service} -> HTTP ${r.status}`);
   return r.ok;
@@ -10362,6 +10440,226 @@ app.post("/api/reminders/:id/ack", (req, res) => {
   if (!r) return res.status(404).json({ error: "not found" });
   if (!r.ackedAt) { r.ackedAt = Date.now(); scheduleRemindersSave(); }
   res.json(remindersPayload(req.profileId));
+});
+
+// ── New episodes (lib/new-episodes.js) ──────────────────────────────────────
+// Series a profile follows (a lastEpisode pointer played in the last 120 days)
+// are re-read from the panel every NEW_EP_REFRESH_MS: get_series_info only,
+// never a stream, one call at a time with a gap, paused while anyone watches
+// (createPrewarmQueue yields on streamingNow), errors back off. Owner panel
+// only. Home reads the cached infos: a "New episodes" rail + `new_episodes`
+// on series tiles. Opening (GET /api/series/info) or playing the series moves
+// the profile's seen mark to the last listed episode, which clears it.
+const NEW_EP_REFRESH_MS = 6 * 3600e3;
+function cachedSeriesInfoHit(actx, sid) {
+  return cache.get(xtreamKey(actx, MODES.series.info, { series_id: String(sid) }))
+    || cache.get(xtreamKey(actx, MODES.series.info, { series_id: parseInt(sid, 10) }))
+    || null;
+}
+function cachedSeriesInfo(actx, sid) {
+  const hit = cachedSeriesInfoHit(actx, sid);
+  return hit && isUsableInfo(hit.v, "series") ? hit.v : null;
+}
+function profileAccount(p) { return getAccountForUser(getUserById(p?.ownerUserId)); }
+function ownerAccountProfiles() { return profiles.profiles.filter((p) => isOwnerAccount(profileAccount(p))); }
+// The profile has now seen every episode listed in `info`.
+function markSeriesSeen(userState, sid, info) {
+  const m = newEpisodesLib.markFor(info);
+  if (!m) return;
+  userState.seriesSeen ||= {};
+  const cur = userState.seriesSeen[String(sid)];
+  if (cur && cur.s === m.s && cur.e === m.e) return;
+  userState.seriesSeen[String(sid)] = m;
+  scheduleUserStateSave();
+}
+// First fresh read of a followed series with no mark yet: start counting
+// from what the panel lists now (no flood of "new" on the first crawl).
+function baselineSeriesSeen(sid, info) {
+  for (const p of ownerAccountProfiles()) {
+    const st = getProfileState(p.id);
+    if (st.seriesSeen?.[String(sid)]) continue;
+    if (!newEpisodesLib.trackedSeries(st).includes(String(sid))) continue;
+    markSeriesSeen(st, sid, info);
+  }
+}
+const newEpisodeCrawl = createPrewarmQueue({
+  fetcher: async (e) => {
+    const v = await xtream(MODES.series.info, { series_id: e.sid }, { actx: ownerAccount, noCache: true, timeout: 30_000 });
+    if (!isUsableInfo(v, "series")) throw new Error("no episodes");
+    cache.set(xtreamKey(ownerAccount, MODES.series.info, { series_id: e.sid }), { t: Date.now(), v });
+    baselineSeriesSeen(e.sid, v);
+  },
+  isCached: (e) => {
+    const hit = cachedSeriesInfoHit(ownerAccount, e.sid);
+    if (!hit || Date.now() - hit.t >= NEW_EP_REFRESH_MS || !isUsableInfo(hit.v, "series")) return false;
+    baselineSeriesSeen(e.sid, hit.v);
+    return true;
+  },
+  shouldYield: () => streamingNow(null),
+  gapMs: 5000,
+  cap: 300,
+});
+function crawlNewEpisodes(reason = "cron") {
+  const sids = new Set();
+  for (const p of ownerAccountProfiles()) {
+    for (const sid of newEpisodesLib.trackedSeries(getProfileState(p.id))) sids.add(sid);
+  }
+  const n = newEpisodeCrawl.enqueue([...sids].map((sid) => ({ key: `newep:${sid}`, sid })));
+  console.log(`[new-episodes] (${reason}) ${sids.size} followed series, ${n} queued`);
+}
+setTimeout(() => crawlNewEpisodes("boot"), 12 * 60e3).unref?.();
+setInterval(() => crawlNewEpisodes(), NEW_EP_REFRESH_MS).unref?.();
+// { seriesId -> { count, first, latest, recency } } for this profile (cached infos only).
+function newEpisodeMapFor(profileId) {
+  const p = findProfile(profileId);
+  if (!p) return new Map();
+  const actx = profileAccount(p);
+  if (!isOwnerAccount(actx)) return new Map();
+  return newEpisodesLib.newEpisodeMap(getProfileState(profileId), (sid) => cachedSeriesInfo(actx, sid));
+}
+
+// ── "Notify me when it lands on Khouch" (lib/notify-me.js) ──────────────────
+// Per profile, TMDB ids of titles not in the catalog. Matched against each
+// account's catalog tmdb map (ix.byTmdb) after every variant pass (index
+// build / TMDB backfill) and every 30 min. A match: HA push (owner household
+// rule, same as reminders) + the "Now on Khouch" home rail.
+function catalogLookupFor(actx) {
+  const ixs = getIndexesFor(actx);
+  return (kind, tmdbId) => {
+    const mode = notifyMeLib.modeOfKind(kind);
+    const members = ixs[mode]?.byTmdb?.get(tmdbId);
+    if (!members?.length) return null;
+    const s = members.find((m) => !m.isAlt) || members[0];
+    return { mode, id: s.id };
+  };
+}
+let notifyMeChecking = false;
+async function checkNotifyMe(reason = "cron") {
+  if (notifyMeChecking) return;
+  notifyMeChecking = true;
+  try {
+    const now = Date.now();
+    for (const p of profiles.profiles) {
+      const st = getProfileState(p.id);
+      if (!Array.isArray(st.notifyMe) || !st.notifyMe.length) continue;
+      const actx = profileAccount(p);
+      const before = st.notifyMe.length;
+      st.notifyMe = notifyMeLib.prune(st.notifyMe, now);
+      const landed = notifyMeLib.match(st.notifyMe, catalogLookupFor(actx), now);
+      if (landed.length || before !== st.notifyMe.length) scheduleUserStateSave();
+      for (const e of landed) {
+        const svc = haNotifyServiceFor({ owner: isOwnerAccount(actx), profileId: p.id }, p);
+        const { title, message } = notifyMeLib.notifyText(e, p.nick);
+        let pushed = false;
+        if (svc) {
+          try { pushed = await sendHaNotify(svc, title, message, `khouch-notify-${e.kind}-${e.tmdb_id}`, "khouch-notify"); }
+          catch (err) { console.warn(`[notify-me] HA notify failed: ${err.message}`); }
+        }
+        console.log(`[notify-me] (${reason}) landed ${e.kind}:${e.tmdb_id} -> ${e.landed.mode}:${e.landed.id} profile=${p.id} push=${pushed ? svc : "none"}`);
+      }
+    }
+  } finally { notifyMeChecking = false; }
+}
+let notifyMeCheckTimer = null;
+function scheduleNotifyMeCheck(reason) {
+  if (notifyMeCheckTimer) return;
+  notifyMeCheckTimer = setTimeout(() => {
+    notifyMeCheckTimer = null;
+    checkNotifyMe(reason).catch((e) => console.warn(`[notify-me] ${e.message}`));
+  }, 5000);
+  notifyMeCheckTimer.unref?.();
+}
+setInterval(() => scheduleNotifyMeCheck("cron"), 30 * 60e3).unref?.();
+const isKidProfile = (profileId) => !!findProfile(profileId)?.kidsBirthYear;
+function notifyMePayload(profileId) {
+  const st = getProfileState(profileId);
+  return { items: (st.notifyMe || []).map(notifyMeLib.publicView) };
+}
+app.get("/api/notify-me", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (!req.profileId) return res.json({ items: [] });
+  res.json(notifyMePayload(req.profileId));
+});
+app.post("/api/notify-me", express.json({ limit: "4kb" }), (req, res) => {
+  if (!req.profileId) return res.status(400).json({ error: "no profile" });
+  if (isKidProfile(req.profileId)) return res.status(403).json({ error: "not for kid profiles" });
+  const v = notifyMeLib.validateAdd(req.body);
+  if (v.error) return res.status(400).json({ error: v.error });
+  const hit = catalogLookupFor(currentAccount())(v.kind, v.tmdb_id);
+  if (hit) return res.status(409).json({ error: "in_catalog", mode: hit.mode, id: hit.id });
+  const st = getProfileState(req.profileId);
+  const next = notifyMeLib.add(st.notifyMe, v);
+  if (!next) return res.status(429).json({ error: "too many titles" });
+  st.notifyMe = next;
+  scheduleUserStateSave();
+  res.json(notifyMePayload(req.profileId));
+});
+app.delete("/api/notify-me/:kind(movie|tv)/:tmdbId(\\d{1,10})", (req, res) => {
+  if (!req.profileId) return res.status(400).json({ error: "no profile" });
+  const st = getProfileState(req.profileId);
+  st.notifyMe = notifyMeLib.remove(st.notifyMe, req.params.kind, Number(req.params.tmdbId));
+  scheduleUserStateSave();
+  res.json(notifyMePayload(req.profileId));
+});
+
+// A title by TMDB id, for clients showing something the catalog may not have
+// (search "Not on Khouch yet", person credits). `in_catalog` = open that
+// instead; `notify` = on this profile's Notify-me list. Adult profiles only.
+const tmdbCardOf = (kind, r) => {
+  const date = String((kind === "movie" ? r.release_date : r.first_air_date) || "");
+  return {
+    tmdb_id: r.id,
+    kind,
+    title: (kind === "movie" ? r.title : r.name) || r.original_title || r.original_name || "",
+    year: date.slice(0, 4) || null,
+    date: date || null,
+    poster: r.poster_path ? `${TMDB_IMG_BASE}/w342${r.poster_path}` : null,
+    backdrop: r.backdrop_path ? `${TMDB_IMG_BASE}/w1280${r.backdrop_path}` : null,
+    overview: String(r.overview || "").slice(0, 600) || null,
+    rating: Number.isFinite(r.vote_average) && r.vote_count >= 20 ? Math.round(r.vote_average * 10) / 10 : null,
+  };
+};
+app.get("/api/tmdb-title/:kind(movie|tv)/:tmdbId(\\d{1,10})", async (req, res, next) => {
+  try {
+    if (isKidProfile(req.profileId)) return res.status(403).json({ error: "not for kid profiles" });
+    if (!TMDB_API_KEY) return res.status(404).json({ error: "tmdb_unavailable" });
+    const { kind } = req.params;
+    const tmdbId = Number(req.params.tmdbId);
+    const d = await tmdb(`/${kind}/${tmdbId}`);
+    if (!d || !d.id) return res.status(404).json({ error: "not_found" });
+    const card = tmdbCardOf(kind, d);
+    const st = getProfileState(req.profileId);
+    res.set("Cache-Control", "no-store");
+    res.json({
+      ...card,
+      genres: Array.isArray(d.genres) ? d.genres.map((g) => g.name).filter(Boolean).slice(0, 4) : [],
+      runtime: kind === "movie" ? d.runtime || null : (Array.isArray(d.episode_run_time) && d.episode_run_time[0]) || null,
+      seasons: kind === "tv" ? d.number_of_seasons || null : null,
+      in_catalog: catalogLookupFor(currentAccount())(kind, tmdbId),
+      notify: (st.notifyMe || []).some((e) => e.kind === kind && e.tmdb_id === tmdbId && !e.landed),
+    });
+  } catch (e) { next(e); }
+});
+// TMDB search for titles the catalog does not have (movies + shows, top 10).
+app.get("/api/search/elsewhere", async (req, res, next) => {
+  try {
+    const q = String(req.query.q || "").trim().slice(0, 100);
+    if (q.length < 2 || !TMDB_API_KEY || isKidProfile(req.profileId)) return res.json({ q, results: [] });
+    const r = await tmdb("/search/multi", { query: q, include_adult: "false" });
+    const lookup = catalogLookupFor(currentAccount());
+    const st = getProfileState(req.profileId);
+    const results = [];
+    for (const x of r?.results || []) {
+      if (x.media_type !== "movie" && x.media_type !== "tv") continue;
+      if (x.adult || !x.poster_path || lookup(x.media_type, x.id)) continue;
+      const card = tmdbCardOf(x.media_type, x);
+      card.notify = (st.notifyMe || []).some((e) => e.kind === card.kind && e.tmdb_id === card.tmdb_id && !e.landed);
+      results.push(card);
+      if (results.length >= 10) break;
+    }
+    res.set("Cache-Control", "no-store");
+    res.json({ q, results });
+  } catch (e) { next(e); }
 });
 
 // EPG: programs for a live channel in a time window. Used by the
@@ -10639,6 +10937,8 @@ app.get("/api/:mode(movie|series)/info/:id", async (req, res, next) => {
       throw e;
     }
     const v = r.v;
+    // Opening a series clears its "new episode" badge for this profile.
+    if (mode === "series" && req.profileId && !req.get("x-khouch-internal")) markSeriesSeen(getProfileState(req.profileId), req.params.id, v);
     if (r.stale) {
       // Short client cache so a recovered panel is picked up soon.
       res.set({ "Cache-Control": "private, max-age=60", "X-Khouch-Stale": "1" });
@@ -13077,12 +13377,21 @@ app.get("/api/person/credits", async (req, res) => {
   if (!name) return res.status(400).json({ error: "name required" });
   const cacheKey = name.toLowerCase();
 
+  // `elsewhere`: notable credits the catalog lacks (Notify me), adults only,
+  // flagged with this profile's Notify-me state.
+  const send = (payload) => {
+    const kid = isKidProfile(req.profileId);
+    const nm = getProfileState(req.profileId).notifyMe || [];
+    const inCat = catalogLookupFor(currentAccount());
+    const flag = (list) => (kid ? [] : (list || []).filter((c) => !inCat(c.kind, c.tmdb_id)).map((c) => ({ ...c, notify: nm.some((e) => e.kind === c.kind && e.tmdb_id === c.tmdb_id && !e.landed) })));
+    res.json({ ...payload, elsewhere: { movie: flag(payload.elsewhere?.movie), series: flag(payload.elsewhere?.series) } });
+  };
   const cached = personCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < PERSON_CACHE_MS) {
-    return res.json(cached.payload);
+    return send(cached.payload);
   }
   if (!TMDB_API_KEY) {
-    return res.json({ name, person: null, items: { movie: [], series: [] } });
+    return res.json({ name, person: null, items: { movie: [], series: [] }, elsewhere: { movie: [], series: [] } });
   }
 
   try {
@@ -13095,7 +13404,7 @@ app.get("/api/person/credits", async (req, res) => {
     if (!person) {
       const payload = { name, person: null, items: { movie: [], series: [] } };
       personCache.set(cacheKey, { ts: Date.now(), payload });
-      return res.json(payload);
+      return send(payload);
     }
 
     // combined_credits = movie + tv in one call; we still split them
@@ -13162,8 +13471,24 @@ app.get("/api/person/credits", async (req, res) => {
         series: findItems("series", seriesIds),
       },
     };
+    // Credits the catalog doesn't carry: the 12 most popular per kind with a
+    // poster (talk / award shows and self appearances skipped).
+    const inCatalog = catalogLookupFor(currentAccount());
+    const elsewhereOf = (kind) => {
+      const seen = new Set();
+      return cast
+        .filter((c) => c.media_type === kind && c.poster_path && !c.adult
+          && !/\b(self|himself|herself|host|narrator)\b/i.test(c.character || "")
+          && !(kind === "tv" && Array.isArray(c.genre_ids) && c.genre_ids.some((g) => g === 10767 || g === 10763))
+          && !inCatalog(kind, c.id))
+        .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))
+        .filter((c) => !seen.has(c.id) && seen.add(c.id))
+        .slice(0, 12)
+        .map((c) => ({ ...tmdbCardOf(kind, c), character: c.character || null }));
+    };
+    payload.elsewhere = { movie: elsewhereOf("movie"), series: elsewhereOf("tv") };
     personCache.set(cacheKey, { ts: Date.now(), payload });
-    res.json(payload);
+    send(payload);
   } catch (e) {
     res.status(500).json({ error: redactAllUrls(e.message) });
   }
@@ -13784,6 +14109,16 @@ app.post("/api/admin/retry-tmdb-no-matches", (req, res) => {
 app.post("/api/admin/check-streaming-arrivals", (req, res) => {
   if (!requireOwner(req, res)) return;
   checkStreamingArrivals({ reason: "admin" }).catch((e) => console.warn(`[arrivals] ${e.message}`));
+  res.json({ ok: true, started: true });
+});
+app.post("/api/admin/check-new-episodes", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  crawlNewEpisodes("admin");
+  res.json({ ok: true, started: true });
+});
+app.post("/api/admin/check-notify-me", (req, res) => {
+  if (!requireOwner(req, res)) return;
+  checkNotifyMe("admin").catch((e) => console.warn(`[notify-me] ${e.message}`));
   res.json({ ok: true, started: true });
 });
 app.post("/api/admin/backfill-alt-certs", (req, res) => {
@@ -15723,6 +16058,11 @@ app.get("/api/stream/:mode(live|movie|series|disk)/:id.:ext", async (req, res) =
   if (vodMode) {
     const userState = getProfileState(req.profileId);
     const seriesId = req.params.mode === "series" && /^\d{1,12}$/.test(String(req.query.series ?? "")) ? String(req.query.series) : null;
+    // Playing an episode clears the series' "new episode" badge (cached info only).
+    if (seriesId && req.profileId) {
+      const info = cachedSeriesInfo(currentAccount(), seriesId);
+      if (info) markSeriesSeen(userState, seriesId, info);
+    }
     const onboarded = (() => {
       const own = userState.filter?.groups?.[req.params.mode];
       const keys = Array.isArray(own) && own.length ? own : userState.filter?.groups?.live;
