@@ -326,6 +326,9 @@ const el = {
   remindersBtn: document.getElementById("guide-reminders-btn"),
   remindersCount: document.getElementById("guide-reminders-count"),
   remindersModal: document.getElementById("reminders-modal"),
+  notifyModal: document.getElementById("notify-modal"),
+  notifyTitle: document.getElementById("notify-title"),
+  notifyBody: document.getElementById("notify-body"),
   remindersBody: document.getElementById("reminders-body"),
   remindersClose: document.getElementById("reminders-close"),
   reminderBanners: document.getElementById("reminder-banners"),
@@ -508,6 +511,10 @@ async function bootstrap() {
     // Toggle owner-only sections (Invite a friend, etc.) in Settings.
     const ownerSection = document.getElementById("settings-owner-section");
     if (ownerSection) ownerSection.hidden = state.activeUser?.role !== "owner";
+    // Notify me is for adult profiles (the server refuses kid profiles).
+    const notifyItem = document.getElementById("settings-notify-list");
+    if (notifyItem) notifyItem.hidden = Number.isFinite(state.kidsAge);
+    notifyMe.items = Array.isArray(d.userState?.notifyMe) ? d.userState.notifyMe.map((e) => ({ ...e, landed: e.landed || null })) : [];
     state.modes.live.categories   = Array.isArray(d.categories.live)   ? d.categories.live   : [];
     state.modes.movie.categories  = Array.isArray(d.categories.movie)  ? d.categories.movie  : [];
     state.modes.series.categories = Array.isArray(d.categories.series) ? d.categories.series : [];
@@ -1880,6 +1887,7 @@ function renderRails() {
         total: r.total ?? items.length,
         blurb: r.blurb || null,
         snoozable: r.snoozable,
+        hideable: r.title === "Continue Watching",
       }));
       railsShown++;
     }
@@ -2986,6 +2994,8 @@ function closeRemindersModal() { el.remindersModal.hidden = true; }
 el.remindersBtn.addEventListener("click", openRemindersModal);
 el.remindersClose.addEventListener("click", closeRemindersModal);
 el.remindersModal.addEventListener("click", (e) => { if (e.target === el.remindersModal) closeRemindersModal(); });
+document.getElementById("notify-close").addEventListener("click", () => closeNotifyModal());
+el.notifyModal.addEventListener("click", (e) => { if (e.target === el.notifyModal) closeNotifyModal(); });
 
 function reminderBannerText(r) {
   const secs = Number(r.starts_in_secs);
@@ -3445,8 +3455,21 @@ async function renderUnifiedSearch(q) {
   el.searchAllResults.innerHTML = "";
   const diskResults = Array.isArray(data.disk) ? data.disk : [];
   const total = diskResults.length + data.movie.length + data.series.length + data.live.length;
+  // TMDB titles the catalog lacks, after the catalog results (adults only;
+  // the server answers [] for kid profiles).
+  const appendElsewhere = async () => {
+    if (Number.isFinite(state.kidsAge)) return;
+    try {
+      const r = await fetch(`/api/search/elsewhere?q=${encodeURIComponent(q)}`);
+      const j = await r.json();
+      if (el.searchAllTitle.textContent !== `Results for "${q}"` || !j.results?.length) return;
+      el.searchAllResults.querySelector(".empty")?.remove();
+      el.searchAllResults.appendChild(elsewhereSection("Not on Khouch yet", j.results));
+    } catch {}
+  };
   if (!total) {
-    el.searchAllResults.innerHTML = `<div class="empty">No results for "${q}"</div>`;
+    el.searchAllResults.innerHTML = `<div class="empty">No results for "${escapeHtml(q)}"</div>`;
+    appendElsewhere();
     return;
   }
   // When the query matched a TMDB genre name (or alias like
@@ -3487,6 +3510,7 @@ async function renderUnifiedSearch(q) {
   addSection("Movies", data.movie, "movie");
   addSection("Series", data.series, "series");
   addSection("Live", data.live, "live");
+  appendElsewhere();
 }
 
 function renderGrid() {
@@ -3705,6 +3729,14 @@ function channelCard(s, opts = {}) {
     logo.appendChild(badge);
   }
 
+  // New-episode badge (series the profile follows; server field).
+  if (cardMode === "series" && s.new_episodes > 0) {
+    const nb = document.createElement("span");
+    nb.className = "new-ep-badge";
+    nb.textContent = s.new_episodes > 1 ? `${s.new_episodes} new episodes` : "New episode";
+    logo.appendChild(nb);
+  }
+
   // Audio-channel badge — 5.1 / 7.1 marker on titles whose source
   // audio is multi-channel. Server's qualityCache fills in
   // s.audio_channels via the offline probe + lazy /api/movie/info
@@ -3788,7 +3820,8 @@ function channelCard(s, opts = {}) {
 
   if (state.mode === "series") {
     const last = state.lastEpisode[s.id];
-    if (last) {
+    // TV clients write a bare { episode_id } pointer: no season / number to show.
+    if (last && last.season != null && last.episode_num != null) {
       const sub = document.createElement("div");
       sub.className = "sub";
       const epProg = state.progress[`series:${last.episode_id}`];
@@ -3980,10 +4013,231 @@ function removeRecent(mode, id) {
   state.recents[mode] = (state.recents[mode] || []).filter((x) => x !== id);
   delete state.progress[`${mode}:${id}`];
   localStorage.setItem(`recents:${mode}`, JSON.stringify(state.recents[mode]));
+  // The server-built rail is what's on screen: drop the tile there too.
+  for (const r of state.home[mode]?.rails || []) {
+    if (r.title === "Continue Watching") {
+      const before = r.items.length;
+      r.items = r.items.filter((x) => x.id !== id);
+      if (r.items.length !== before && Number.isFinite(r.total)) r.total = Math.max(0, r.total - 1);
+    }
+  }
   fetch(`/api/user-state/recents/${mode}/${encodeURIComponent(id)}`, { method: "DELETE" })
     .catch(() => pushUserState());
   refreshView();
 }
+
+// Opening a series clears its "new episode" badge server-side (the info
+// fetch); mirror it in the home payload so the rail updates at once.
+function clearNewEpisodes(id) {
+  const home = state.home.series;
+  if (!home?.rails) return;
+  let changed = false;
+  for (const r of home.rails) {
+    for (const t of r.items || []) if (t.id === id && t.new_episodes) { delete t.new_episodes; changed = true; }
+    if (r.category_id === "__rail-new-episodes") {
+      const before = r.items.length;
+      r.items = r.items.filter((t) => t.id !== id);
+      if (r.items.length !== before) { r.total = r.items.length; changed = true; }
+    }
+  }
+  if (changed && state.mode === "series" && state.view !== "grid") renderRails();
+}
+
+// ── Notify me when it lands on Khouch ───────────────────────────────
+// TMDB titles the catalog doesn't have (search "Not on Khouch yet", person
+// credits) open a small title card with Notify me. The list is per profile,
+// on the server (/api/notify-me); a match pushes a notification and shows
+// in the "Now on Khouch" rail.
+const notifyMe = { items: [] };
+async function notifyApi(method, path, body) {
+  const r = await fetch(path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const err = new Error(j.error === "too many titles" ? "Your Notify me list is full." : (j.error || `HTTP ${r.status}`));
+    err.body = j;
+    throw err;
+  }
+  if (Array.isArray(j.items)) notifyMe.items = j.items;
+  return j;
+}
+const notifyKey = (kind, id) => `${kind}:${id}`;
+const isNotifying = (kind, id) => notifyMe.items.some((e) => notifyKey(e.kind, e.tmdb_id) === notifyKey(kind, id) && !e.landed);
+function tmdbCardEl(c) {
+  const card = document.createElement("div");
+  card.className = "channel poster tmdb-card";
+  card.title = `${c.title}${c.year ? ` (${c.year})` : ""} • Not on Khouch yet`;
+  card.tabIndex = 0;
+  const logo = document.createElement("div");
+  logo.className = "logo";
+  logo.appendChild(titleCardEl(c.title));
+  if (c.poster) {
+    const img = new Image();
+    img.referrerPolicy = "no-referrer";
+    img.onload = () => { logo.style.backgroundImage = `url("${c.poster}")`; logo.querySelector(".title-card")?.remove(); };
+    img.src = c.poster;
+  }
+  const flag = document.createElement("span");
+  flag.className = "notify-flag";
+  flag.textContent = "Notifying";
+  flag.hidden = !(c.notify || isNotifying(c.kind, c.tmdb_id));
+  logo.appendChild(flag);
+  const name = document.createElement("div");
+  name.className = "name";
+  name.textContent = c.title;
+  const sub = document.createElement("div");
+  sub.className = "card-reason";
+  sub.textContent = [c.year, c.character ? `as ${c.character}` : null].filter(Boolean).join(" · ") || "Not on Khouch yet";
+  card.append(logo, name, sub);
+  const open = () => openTmdbTitle(c.kind, c.tmdb_id, (on) => { flag.hidden = !on; });
+  card.onclick = open;
+  card.onkeydown = (e) => { if (e.key === "Enter") open(); };
+  return card;
+}
+// "Not on Khouch yet" strip for search / person views.
+function elsewhereSection(title, cards) {
+  const sec = document.createElement("div");
+  sec.className = "search-all-section elsewhere-section";
+  const hdr = document.createElement("div");
+  hdr.className = "search-all-section-header";
+  hdr.innerHTML = `<span class="search-all-section-title">${escapeHtml(title)}</span><span class="search-all-section-count">${cards.length}</span>`;
+  const strip = document.createElement("div");
+  strip.className = "search-all-strip";
+  for (const c of cards) strip.appendChild(tmdbCardEl(c));
+  sec.append(hdr, strip);
+  return sec;
+}
+function openCatalogTitle(mode, id, name) {
+  const m = state.modes[mode];
+  let s = (m?.streams || []).find((x) => x.id === id);
+  if (!s && m) for (const list of m.byCat.values()) { s = list.find((x) => x.id === id); if (s) break; }
+  s ||= { id, name: name || "" };
+  closeNotifyModal();
+  if (mode === "series") openSeries(s); else openMovie(s, "movie");
+}
+async function openTmdbTitle(kind, tmdbId, onChange) {
+  el.notifyTitle.textContent = "";
+  el.notifyBody.innerHTML = `<p class="rem-empty">Loading…</p>`;
+  el.notifyModal.hidden = false;
+  let d;
+  try {
+    const r = await fetch(`/api/tmdb-title/${kind}/${tmdbId}`);
+    d = await r.json();
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+  } catch (e) {
+    el.notifyBody.innerHTML = `<p class="rem-empty">Couldn't load this title.</p>`;
+    return;
+  }
+  el.notifyTitle.textContent = d.year ? `${d.title} (${d.year})` : d.title;
+  const meta = [kind === "tv" ? "Series" : "Movie", d.date && d.date > new Date().toISOString().slice(0, 10) ? `Out ${d.date}` : null,
+    d.genres?.length ? d.genres.join(", ") : null, d.rating ? `★ ${d.rating}` : null].filter(Boolean).join(" · ");
+  el.notifyBody.innerHTML = `
+    <div class="tmdb-title">
+      <div class="tmdb-title-poster"></div>
+      <div class="tmdb-title-main">
+        <div class="tmdb-title-meta">${escapeHtml(meta)}</div>
+        <p class="tmdb-title-plot">${escapeHtml(d.overview || "")}</p>
+        <div class="tmdb-title-status"></div>
+        <div class="tmdb-title-actions"></div>
+      </div>
+    </div>`;
+  const posterBox = el.notifyBody.querySelector(".tmdb-title-poster");
+  posterBox.appendChild(titleCardEl(d.title));
+  if (d.poster) {
+    const img = new Image();
+    img.referrerPolicy = "no-referrer";
+    img.onload = () => { posterBox.style.backgroundImage = `url("${d.poster}")`; posterBox.querySelector(".title-card")?.remove(); };
+    img.src = d.poster;
+  }
+  const status = el.notifyBody.querySelector(".tmdb-title-status");
+  const actions = el.notifyBody.querySelector(".tmdb-title-actions");
+  if (d.in_catalog) {
+    status.textContent = "This is on Khouch.";
+    const go = document.createElement("button");
+    go.type = "button";
+    go.className = "notify-btn primary";
+    go.textContent = "Open";
+    go.onclick = () => openCatalogTitle(d.in_catalog.mode, d.in_catalog.id, d.title);
+    actions.appendChild(go);
+    return;
+  }
+  let on = !!d.notify;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "notify-btn primary";
+  const paint = () => {
+    btn.textContent = on ? "Notifying \u2713" : "Notify me";
+    btn.setAttribute("aria-pressed", String(on));
+    status.textContent = on
+      ? "You'll get a notification when it lands on Khouch."
+      : "Not on Khouch yet.";
+  };
+  paint();
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      if (on) await notifyApi("DELETE", `/api/notify-me/${kind}/${tmdbId}`);
+      else await notifyApi("POST", "/api/notify-me", { tmdb_id: d.tmdb_id, kind, title: d.title, year: d.year, poster: d.poster });
+      on = !on;
+      paint();
+      onChange?.(on);
+    } catch (e) {
+      if (e.body?.error === "in_catalog") { openCatalogTitle(e.body.mode, e.body.id, d.title); return; }
+      toast(`Couldn't update: ${e.message}`, 3500);
+    } finally { btn.disabled = false; }
+  };
+  actions.appendChild(btn);
+}
+async function openNotifyList() {
+  el.notifyTitle.textContent = "Notify me";
+  el.notifyBody.innerHTML = `<p class="rem-empty">Loading…</p>`;
+  el.notifyModal.hidden = false;
+  try { await notifyApi("GET", "/api/notify-me"); }
+  catch { el.notifyBody.innerHTML = `<p class="rem-empty">Couldn't load your list.</p>`; return; }
+  renderNotifyList();
+}
+function renderNotifyList() {
+  el.notifyBody.innerHTML = "";
+  if (!notifyMe.items.length) {
+    const p = document.createElement("p");
+    p.className = "rem-empty";
+    p.textContent = "Nothing here yet. Titles Khouch doesn't have show up in search and on cast pages; open one and pick Notify me.";
+    el.notifyBody.appendChild(p);
+    return;
+  }
+  for (const e of notifyMe.items) {
+    const row = document.createElement("div");
+    row.className = "rem-row notify-row" + (e.landed ? " notify-landed" : "");
+    row.innerHTML = `
+      <div class="rem-main">
+        <div class="rem-title">${escapeHtml(e.title)}${e.year ? ` (${escapeHtml(e.year)})` : ""}</div>
+        <div class="rem-status">${e.kind === "tv" ? "Series" : "Movie"} · ${e.landed ? "Now on Khouch" : "Waiting"}</div>
+      </div>`;
+    if (e.landed) {
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "rem-delete";
+      open.textContent = "Open";
+      open.onclick = () => openCatalogTitle(e.landed.mode, e.landed.id, e.title);
+      row.appendChild(open);
+    }
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "rem-delete";
+    del.textContent = "Remove";
+    del.onclick = async () => {
+      del.disabled = true;
+      try { await notifyApi("DELETE", `/api/notify-me/${e.kind}/${e.tmdb_id}`); renderNotifyList(); }
+      catch (err) { del.disabled = false; toast(`Couldn't remove: ${err.message}`, 3500); }
+    };
+    row.appendChild(del);
+    el.notifyBody.appendChild(row);
+  }
+}
+function closeNotifyModal() { el.notifyModal.hidden = true; }
 
 function recordPlayEvent(mode, id) {
   // Update locally so the UI reflects it immediately on the next render,
@@ -5706,6 +5960,7 @@ function closeMovie() {
 async function openSeries(s) {
   saveScroll();
   stopAllPreviews();
+  clearNewEpisodes(s.id);
   // Mirror of openMovie: switch state.mode to "series" so updateUrl
   // builds a `/series/...` path even when the click came from a
   // search-all view or person-credits strip while the user was on
@@ -6226,8 +6481,9 @@ async function openPersonView(name) {
   }
   const movie = data?.items?.movie || [];
   const series = data?.items?.series || [];
+  const elsewhere = [...(data?.elsewhere?.movie || []), ...(data?.elsewhere?.series || [])];
   el.searchAllResults.innerHTML = "";
-  if (!movie.length && !series.length) {
+  if (!movie.length && !series.length && !elsewhere.length) {
     el.searchAllResults.innerHTML =
       `<div class="empty">No titles featuring <b>${escapeHtml(name)}</b> in your catalog.</div>`;
     return;
@@ -6268,6 +6524,7 @@ async function openPersonView(name) {
   };
   addSection("Movies", movie, "movie");
   addSection("Series", series, "series");
+  if (elsewhere.length) el.searchAllResults.appendChild(elsewhereSection("Not on Khouch yet", elsewhere));
 }
 
 function openTrailer(youtubeKey) {
@@ -8517,6 +8774,7 @@ for (const item of el.settingsMenu.querySelectorAll(".settings-item")) {
     closeSettingsMenu();
     if (action === "filter") openFilterModal();
     else if (action === "refine") openRefineModal();
+    else if (action === "notify-list") openNotifyList();
     else if (action === "refresh") el.refresh.click();
     else if (action === "logout") logout();
     else if (action === "panel-config") openPanelConfigModal();
@@ -8825,7 +9083,7 @@ function playerKeyContext(e, inField) {
     inField: inField || !!(ae && ae.isContentEditable),
     modifier: e.metaKey || e.ctrlKey || e.altKey,
     menuOpen: !!(el.playerTracksMenu && !el.playerTracksMenu.hidden) || !el.liveRemote.hidden
-      || !el.refineModal.hidden || !el.remindersModal.hidden || !el.filterModal.hidden || !el.settingsMenu.hidden,
+      || !el.refineModal.hidden || !el.remindersModal.hidden || !el.notifyModal.hidden || !el.filterModal.hidden || !el.settingsMenu.hidden,
     live: state.playing && state.playing.mode === "live",
     casting: !!state.castSession,
   };
@@ -8935,6 +9193,7 @@ document.addEventListener("keydown", (e) => {
   } else if (e.key === "Escape") {
     if (!el.refineModal.hidden) closeRefineModal();
     else if (!el.remindersModal.hidden) closeRemindersModal();
+    else if (!el.notifyModal.hidden) closeNotifyModal();
     else if (!el.filterModal.hidden && !el.filterClose.hidden) closeFilterModal();
     else if (!el.liveRemote.hidden) closeLiveRemote();
     else if (document.activeElement === el.search) {

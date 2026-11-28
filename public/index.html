@@ -146,6 +146,10 @@
       </div>
       <div class="settings-divider"></div>
       <div class="settings-section-title">Profile</div>
+      <button class="settings-item" data-action="notify-list" id="settings-notify-list">
+        <span>Notify me list…</span>
+        <span class="settings-hint">Titles to tell you about when they land</span>
+      </button>
       <button class="settings-item" data-action="switch-profile">
         <span>Switch profile…</span>
         <span class="settings-hint" id="settings-profile-hint"></span>
@@ -478,6 +482,16 @@
       <button id="reminders-close" aria-label="Close">✕</button>
     </div>
     <div id="reminders-body"></div>
+  </div>
+</div>
+
+<div id="notify-modal" hidden>
+  <div class="filter-card">
+    <div class="filter-head">
+      <h2 id="notify-title">Notify me</h2>
+      <button id="notify-close" aria-label="Close">✕</button>
+    </div>
+    <div id="notify-body"></div>
   </div>
 </div>
 
